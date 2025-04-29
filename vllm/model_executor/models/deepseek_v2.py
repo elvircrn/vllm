@@ -170,9 +170,11 @@ class DeepseekV2MoE(nn.Module):
                 # This is a special case to avoid FP16 overflow
                 final_hidden_states = final_hidden_states + shared_output \
                     * (1. / self.routed_scaling_factor)
-        if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(
-                final_hidden_states)
+        # TODO (varun) : This logic is no longer required for DP + EP.
+        # Maybe TP still needs this. Check this!
+        #if self.tp_size > 1:
+        #    final_hidden_states = tensor_model_parallel_all_reduce(
+        #        final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 

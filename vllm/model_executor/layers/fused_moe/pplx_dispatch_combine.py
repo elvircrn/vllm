@@ -120,8 +120,7 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
         #bound_m = get_forward_context().dp_metadata.dp_rank_num_tokens
 
         # This causes a deadlock????
-        #bound_m = torch.tensor([num_tokens], dtype=torch.uint32, device=device)
-        bound_m = None
+        bound_m = torch.tensor([num_tokens], dtype=torch.uint32, device=device)
 
         # TODO: optimize this?
         indices = rank_topk_ids.to(dtype=torch.uint32)
@@ -215,10 +214,8 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
         logger.debug(f"COMBINE START {self.rank}")
 
         # This argument is optional
-        #bound_m = get_forward_context().dp_metadata.dp_rank_num_tokens
-        #num_tokens = fused_expert_output.shape[0]   # M
-        #bound_m = torch.tensor([num_tokens], dtype=torch.uint32, device=device)
-        bound_m = None
+        num_tokens = output.size(0)
+        bound_m = torch.tensor([num_tokens], dtype=torch.uint32, device=device)
 
         assert output.shape[0] <= self.max_num_tokens
         assert output.shape[1] == fused_expert_output.shape[-1]

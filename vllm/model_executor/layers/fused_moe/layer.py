@@ -29,7 +29,7 @@ from vllm.utils import direct_register_custom_op
 
 if current_platform.is_cuda_alike():
     from .dispatch_combine import StandardDispatchCombine
-    from .fused_moe import TritonExperts, BatchedDispatchCombine, BatchedExperts, fused_experts
+    from .fused_moe import TritonExperts, BatchedDispatchCombine, BatchedTritonExperts, BatchedExperts, fused_experts
     from .modular_kernel import FusedMoEModularKernel, FusedMoEQuantizeDispatchCombine
     from .pplx_dispatch_combine import PplxDispatchCombine
 else:
@@ -115,7 +115,8 @@ class AllToAllCache:
         with self._lock:
             instance = self._cache.get(key)
             if instance is None:
-                instance = pplx.AllToAll(**kwargs)
+                # TODO (Varun) : should be intranode !! - but facing issues with process groups - fixit!
+                instance = pplx.AllToAll.internode(**kwargs)
                 self._cache[key] = instance
             return instance
 
@@ -245,9 +246,17 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         block_m = MOE_DP_CHUNK_SIZE * (self.moe.ep_size // self.moe.dp_size)
         #print(f"block_m = {block_m}")
 
+        # TODO (varun) : Set correct quantization schemes
         if isinstance(dispatch_combine, (BatchedDispatchCombine, PplxDispatchCombine)):
-            logger.info("BatchedExperts")
-            experts = BatchedExperts()
+            #logger.info("BatchedExperts")
+            #experts = BatchedExperts()
+            logger.info("BatchedTritonExperts")
+            experts = BatchedTritonExperts(
+                use_fp8_w8a8 = False,
+                use_int8_w8a16 = False,
+                use_int4_w4a16 = False,
+                block_shape = None,
+            )
         else:
             experts = TritonExperts(
                 use_fp8_w8a8 = False,
@@ -638,7 +647,8 @@ class FusedMoE(torch.nn.Module):
                             // moe.block_size
                             * torch.float32.itemsize
                     )
-                )
+                ),
+                
             )
 
             dispatch_combine = PplxDispatchCombine(
@@ -1046,10 +1056,12 @@ class FusedMoE(torch.nn.Module):
                     max=moe_dp_chunk_size_per_rank),
                 dim=0)
 
-            hidden_states = self.naive_multicast(
-                hidden_states, cu_tokens_across_dp_this_iter)
-            router_logits = self.naive_multicast(
-                router_logits, cu_tokens_across_dp_this_iter)
+            # TODO (varun) : This is no longer required when doing DP + EP. Check
+            # if anyother logic needs this.
+            #hidden_states = self.naive_multicast(
+            #    hidden_states, cu_tokens_across_dp_this_iter)
+            #router_logits = self.naive_multicast(
+            #    router_logits, cu_tokens_across_dp_this_iter)
 
             # Matrix multiply.
             final_hidden_states = self.quant_method.apply(
@@ -1071,23 +1083,25 @@ class FusedMoE(torch.nn.Module):
 
             #print(f"final1 = {final_hidden_states.shape}")
 
-            if self.dp_size > 1:
-                start = 0 if self.dp_rank == 0 else (
-                    cu_tokens_across_dp_this_iter[self.dp_rank - 1])
-                end = cu_tokens_across_dp_this_iter[self.dp_rank]
+            # TODO (varun) : This is no longer required when doing DP + EP. Check
+            # if anyother logic needs this.
+            #if self.dp_size > 1:
+            #    start = 0 if self.dp_rank == 0 else (
+            #        cu_tokens_across_dp_this_iter[self.dp_rank - 1])
+            #    end = cu_tokens_across_dp_this_iter[self.dp_rank]
 
-                all_hidden_states = get_dp_group().all_reduce(
-                    final_hidden_states)
-                final_hidden_states = all_hidden_states[start:end, :]
+            #    all_hidden_states = get_dp_group().all_reduce(
+            #        final_hidden_states)
+            #    final_hidden_states = all_hidden_states[start:end, :]
 
-                #print(f"final2 (AR) = {final_hidden_states.shape}")
+            #    #print(f"final2 (AR) = {final_hidden_states.shape}")
 
-            if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
-                # Default set to False. (May have to add shared expert outputs.)
-                final_hidden_states = tensor_model_parallel_all_reduce(
-                    final_hidden_states)
+            #if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
+            #    # Default set to False. (May have to add shared expert outputs.)
+            #    final_hidden_states = tensor_model_parallel_all_reduce(
+            #        final_hidden_states)
 
-                #print(f"final3 (AR) = {final_hidden_states.shape}")
+            #    #print(f"final3 (AR) = {final_hidden_states.shape}")
 
             full_final_hidden_states[chunk_start:chunk_end, :].copy_(
                 final_hidden_states)
@@ -1109,8 +1123,12 @@ class FusedMoE(torch.nn.Module):
                 return min(x + moe_dp_chunk_size_per_rank,
                            full_hidden_states.shape[0])
 
-            chunk_start = update_chunk_bound(chunk_start)
-            chunk_end = update_chunk_bound(chunk_end)
+            if chunk_end == full_hidden_states.shape[0]:
+                # simply redo computation
+                pass
+            else:
+                chunk_start = update_chunk_bound(chunk_start)
+                chunk_end = update_chunk_bound(chunk_end)
 
         #print(f"full final shape {full_final_hidden_states.shape}")
 
@@ -1120,14 +1138,16 @@ class FusedMoE(torch.nn.Module):
                      router_logits: torch.Tensor):
         assert self.quant_method is not None
 
-        if self.dp_size > 1:
-            cu_tokens_across_dp_cpu = get_forward_context(
-            ).dp_metadata.cu_tokens_across_dp_cpu
+        # TODO (varun) : This is no longer required when doing DP + EP. Check
+        # if anyother logic needs this.
+        #if self.dp_size > 1:
+        #    cu_tokens_across_dp_cpu = get_forward_context(
+        #    ).dp_metadata.cu_tokens_across_dp_cpu
 
-            hidden_states = self.naive_multicast(hidden_states,
-                                                 cu_tokens_across_dp_cpu)
-            router_logits = self.naive_multicast(router_logits,
-                                                 cu_tokens_across_dp_cpu)
+        #    hidden_states = self.naive_multicast(hidden_states,
+        #                                         cu_tokens_across_dp_cpu)
+        #    router_logits = self.naive_multicast(router_logits,
+        #                                         cu_tokens_across_dp_cpu)
 
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
@@ -1147,18 +1167,20 @@ class FusedMoE(torch.nn.Module):
             activation=self.activation,
         )
 
-        if self.dp_size > 1:
-            start = 0 if self.dp_rank == 0 else cu_tokens_across_dp_cpu[
-                self.dp_rank - 1]
-            end = cu_tokens_across_dp_cpu[self.dp_rank]
+        # TODO (varun) : This is no longer required when doing DP + EP. Check
+        # if anyother logic needs this.
+        #if self.dp_size > 1:
+        #    start = 0 if self.dp_rank == 0 else cu_tokens_across_dp_cpu[
+        #        self.dp_rank - 1]
+        #    end = cu_tokens_across_dp_cpu[self.dp_rank]
 
-            all_hidden_states = get_dp_group().all_reduce(final_hidden_states)
-            final_hidden_states = all_hidden_states[start:end, :]
+        #    all_hidden_states = get_dp_group().all_reduce(final_hidden_states)
+        #    final_hidden_states = all_hidden_states[start:end, :]
 
-        if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
-            # Default set to False. (May have to add shared expert outputs.)
-            final_hidden_states = tensor_model_parallel_all_reduce(
-                final_hidden_states)
+        #if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
+        #    # Default set to False. (May have to add shared expert outputs.)
+        #    final_hidden_states = tensor_model_parallel_all_reduce(
+        #        final_hidden_states)
 
         return final_hidden_states
 
