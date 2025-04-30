@@ -1042,26 +1042,9 @@ class FusedMoE(torch.nn.Module):
                         full_hidden_states.shape[0])
         full_final_hidden_states = torch.empty_like(full_hidden_states)
 
-        #print(f"ORIGINAL SHAPE {full_hidden_states.shape}")
-        #print(f"moe_dp_chunk_size_per_rank = {moe_dp_chunk_size_per_rank}")
-
-        for iter in range(0, max_tokens_across_dp, moe_dp_chunk_size_per_rank):
+        def process_chunk(chunk_start, chunk_end, skip_result_store = False):
             hidden_states = full_hidden_states[chunk_start:chunk_end, :]
             router_logits = full_router_logits[chunk_start:chunk_end, :]
-
-            #print(f"loop {iter}: {chunk_start}:{chunk_end}, {hidden_states.shape}")
-
-            cu_tokens_across_dp_this_iter = torch.cumsum(
-                num_tokens_remaining_across_dp.clamp(
-                    max=moe_dp_chunk_size_per_rank),
-                dim=0)
-
-            # TODO (varun) : This is no longer required when doing DP + EP. Check
-            # if anyother logic needs this.
-            #hidden_states = self.naive_multicast(
-            #    hidden_states, cu_tokens_across_dp_this_iter)
-            #router_logits = self.naive_multicast(
-            #    router_logits, cu_tokens_across_dp_this_iter)
 
             # Matrix multiply.
             final_hidden_states = self.quant_method.apply(
@@ -1081,56 +1064,20 @@ class FusedMoE(torch.nn.Module):
                 activation=self.activation,
             )
 
-            #print(f"final1 = {final_hidden_states.shape}")
+            if not skip_result_store:
+                full_final_hidden_states[chunk_start:chunk_end, :].copy_(
+                    final_hidden_states)
 
-            # TODO (varun) : This is no longer required when doing DP + EP. Check
-            # if anyother logic needs this.
-            #if self.dp_size > 1:
-            #    start = 0 if self.dp_rank == 0 else (
-            #        cu_tokens_across_dp_this_iter[self.dp_rank - 1])
-            #    end = cu_tokens_across_dp_this_iter[self.dp_rank]
 
-            #    all_hidden_states = get_dp_group().all_reduce(
-            #        final_hidden_states)
-            #    final_hidden_states = all_hidden_states[start:end, :]
+        num_tokens = full_hidden_states.size(0)
+        for chunk_start_ in range(0, max_tokens_across_dp, moe_dp_chunk_size_per_rank):
+            chunk_start = chunk_start_ 
+            chunk_end =  min(chunk_start + moe_dp_chunk_size_per_rank, max_tokens_across_dp)
+            # clamp start and end
+            chunk_start = min(chunk_start, num_tokens - 1)
+            chunk_end = min(chunk_end, num_tokens)
 
-            #    #print(f"final2 (AR) = {final_hidden_states.shape}")
-
-            #if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
-            #    # Default set to False. (May have to add shared expert outputs.)
-            #    final_hidden_states = tensor_model_parallel_all_reduce(
-            #        final_hidden_states)
-
-            #    #print(f"final3 (AR) = {final_hidden_states.shape}")
-
-            full_final_hidden_states[chunk_start:chunk_end, :].copy_(
-                final_hidden_states)
-
-            #print(f"partial final = {full_final_hidden_states.shape}")
-
-            # Update bounds
-            num_tokens_remaining_across_dp = torch.clamp(
-                num_tokens_remaining_across_dp - moe_dp_chunk_size_per_rank,
-                min=0)
-
-            #print(f"num remaining = {num_tokens_remaining_across_dp}")
-
-            # HACK FIX
-            if num_tokens_remaining_across_dp.sum() == 0:
-                break
-
-            def update_chunk_bound(x: int):
-                return min(x + moe_dp_chunk_size_per_rank,
-                           full_hidden_states.shape[0])
-
-            if chunk_end == full_hidden_states.shape[0]:
-                # simply redo computation
-                pass
-            else:
-                chunk_start = update_chunk_bound(chunk_start)
-                chunk_end = update_chunk_bound(chunk_end)
-
-        #print(f"full final shape {full_final_hidden_states.shape}")
+            process_chunk(chunk_start, chunk_end, skip_result_store = chunk_start_ >= num_tokens)
 
         return full_final_hidden_states
 
