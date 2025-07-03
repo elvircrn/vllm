@@ -3917,6 +3917,7 @@ class PassConfig:
     """Whether to enable async TP."""
     enable_flashinfer_allreduce_fusion: bool = False
     """Whether to enable flashinfer allreduce fusion."""
+
     # TODO(luka) better pass enabling system.
 
     def uuid(self):
