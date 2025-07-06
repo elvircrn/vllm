@@ -35,6 +35,9 @@ RMS_OP = torch.ops._C.rms_norm.default
 RMS_ADD_OP = torch.ops._C.fused_add_rms_norm.default
 
 _FI_WORKSPACE_TENSOR = None
+_FI_WORKSPACE_TENSOR_ONE_SHOT = None
+_FI_WORKSPACE_TENSOR_TWO_SHOT = None
+MAX_ONESHOT_TOKEN_NUM = 384
 
 
 class BasePattern:
@@ -164,6 +167,12 @@ if flashinfer_comm is not None:
         trigger_completion_at_end: bool,
         fp32_acc: bool,
     ) -> None:
+        use_oneshot = token_num < MAX_ONESHOT_TOKEN_NUM
+
+        if use_oneshot:
+            workspace_tensor = _FI_WORKSPACE_TENSOR_ONE_SHOT
+        else:
+            workspace_tensor = _FI_WORKSPACE_TENSOR_TWO_SHOT
         flashinfer_comm.trtllm_allreduce_fusion(
             allreduce_in=allreduce_in,
             token_num=token_num,
@@ -175,7 +184,7 @@ if flashinfer_comm is not None:
             world_rank=world_rank,
             world_size=world_size,
             hidden_dim=hidden_dim,
-            workspace_ptrs=_FI_WORKSPACE_TENSOR,
+            workspace_ptrs=workspace_tensor,
             launch_with_pdl=launch_with_pdl,
             use_oneshot=use_oneshot,
             trigger_completion_at_end=trigger_completion_at_end,
@@ -209,16 +218,14 @@ if flashinfer_comm is not None:
         pass
 
     try:
-        direct_register_custom_op(
-            op_name="trtllm_allreduce_fusion",
-            op_func=call_trtllm_allreduce_fusion,
-            mutates_args=[
-                # "workspace_ptrs",
-                "residual_out",
-                "norm_out",
-            ],
-            fake_impl=call_trtllm_allreduce_fusion_fake,
-            dispatch_key=current_platform.dispatch_key)
+        direct_register_custom_op(op_name="trtllm_allreduce_fusion",
+                                  op_func=call_trtllm_allreduce_fusion,
+                                  mutates_args=[
+                                      "residual_out",
+                                      "norm_out",
+                                  ],
+                                  fake_impl=call_trtllm_allreduce_fusion_fake,
+                                  dispatch_key=current_platform.dispatch_key)
         trtllm_allreduce_fusion = torch.ops.vllm.trtllm_allreduce_fusion.default
     except AttributeError as error:
         raise error
@@ -231,24 +238,21 @@ class FlashInferAllReduceFusionParams:
                  rank: int,
                  world_size: int,
                  hidden_dim: int,
-                 workspace_tensor: torch.Tensor,
                  use_fp32_lamport: bool = False):
         self.rank = rank
         self.world_size = world_size
         self.hidden_dim = hidden_dim
         self.use_fp32_lamport = use_fp32_lamport
-        self.workspace_tensor = workspace_tensor
-        self.trigger_completion_at_end = False
-        self.launch_with_pdl = False
-        self.use_oneshot = True
-        self.fp32_acc = False
+        self.trigger_completion_at_end = True
+        self.launch_with_pdl = True
+        self.fp32_acc = True
+        self.use_oneshot = False
 
     def get_trtllm_fusion_kwargs(self):
         return {
             "world_rank": self.rank,
             "world_size": self.world_size,
             "hidden_dim": self.hidden_dim,
-            # "workspace_ptrs": self.workspace_tensor,
             "launch_with_pdl": self.launch_with_pdl,
             "use_oneshot": self.use_oneshot,
             "trigger_completion_at_end": self.trigger_completion_at_end,
@@ -373,25 +377,33 @@ class AllReduceFusionPass(VllmInductorPass):
         hidden_dim = config.model_config.get_hidden_size(
         ) if config.model_config else 4096
         self.group = get_tp_group().device_group
-        max_token_num = config.model_config.max_model_len
         use_fp32_lamport = self.model_dtype == torch.float32
         rank = get_tensor_model_parallel_rank()
-        global _FI_WORKSPACE_TENSOR
-        self.ipc_handles, workspace_tensor = (
+        self.ipc_handles_oneshot, workspace_tensor_oneshot = (
             flashinfer_comm.trtllm_create_ipc_workspace_for_all_reduce_fusion(
-                rank,
-                tp_size,
-                max_token_num,
-                hidden_dim,
+                tp_rank=rank,
+                tp_size=tp_size,
+                max_token_num=4096,
+                hidden_dim=hidden_dim,
                 group=self.group,
                 use_fp32_lamport=use_fp32_lamport,
             ))
-        _FI_WORKSPACE_TENSOR = workspace_tensor
+        self.ipc_handles_twoshot, workspace_tensor_twoshot = (
+            flashinfer_comm.trtllm_create_ipc_workspace_for_all_reduce_fusion(
+                tp_rank=rank,
+                tp_size=tp_size,
+                max_token_num=16384,
+                hidden_dim=hidden_dim,
+                group=self.group,
+                use_fp32_lamport=use_fp32_lamport,
+            ))
+        global _FI_WORKSPACE_TENSOR_ONE_SHOT, _FI_WORKSPACE_TENSOR_TWO_SHOT
+        _FI_WORKSPACE_TENSOR_ONE_SHOT = workspace_tensor_oneshot
+        _FI_WORKSPACE_TENSOR_TWO_SHOT = workspace_tensor_twoshot
         self.allreduce_params = FlashInferAllReduceFusionParams(
             rank=rank,
             world_size=tp_size,
             hidden_dim=hidden_dim,
-            workspace_tensor=workspace_tensor,
             use_fp32_lamport=use_fp32_lamport)
         for epsilon in [1e-5, 1e-6]:
             AllReduceRMSNORMPattern(epsilon, self.model_dtype, self.device,
@@ -415,5 +427,7 @@ class AllReduceFusionPass(VllmInductorPass):
     def __del__(self):
         if self.disabled:
             return
-        flashinfer_comm.trtllm_destroy_ipc_workspace(self.ipc_handles,
+        flashinfer_comm.trtllm_destroy_ipc_workspace(self.ipc_handles_oneshot,
+                                                     self.group)
+        flashinfer_comm.trtllm_destroy_ipc_workspace(self.ipc_handles_twoshot,
                                                      self.group)
