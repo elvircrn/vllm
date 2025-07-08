@@ -157,7 +157,6 @@ if flashinfer_comm is not None:
 
     def call_trtllm_allreduce_fusion(
         allreduce_in: torch.Tensor,
-        token_num: int,
         residual_in: torch.Tensor,
         residual_out: torch.Tensor,
         norm_out: torch.Tensor,
@@ -165,13 +164,13 @@ if flashinfer_comm is not None:
         rms_eps: float,
         world_rank: int,
         world_size: int,
-        hidden_dim: int,
         # workspace_ptrs: torch.Tensor,
         launch_with_pdl: bool,
         use_oneshot: bool,
         trigger_completion_at_end: bool,
         fp32_acc: bool,
     ) -> None:
+        token_num = allreduce_in.shape[0]
         use_oneshot = token_num < MAX_ONESHOT_TOKEN_NUM
 
         workspace_tensor = _FI_WORKSPACE_TENSOR
@@ -185,7 +184,7 @@ if flashinfer_comm is not None:
             rms_eps=rms_eps,
             world_rank=world_rank,
             world_size=world_size,
-            hidden_dim=hidden_dim,
+            hidden_dim=allreduce_in.shape[-1],
             workspace_ptrs=workspace_tensor,
             launch_with_pdl=launch_with_pdl,
             use_oneshot=use_oneshot,
@@ -202,7 +201,6 @@ if flashinfer_comm is not None:
 
     def call_trtllm_allreduce_fusion_fake(
         allreduce_in: torch.Tensor,
-        token_num: int,
         residual_in: torch.Tensor,
         residual_out: torch.Tensor,
         norm_out: torch.Tensor,
@@ -210,7 +208,6 @@ if flashinfer_comm is not None:
         rms_eps: float,
         world_rank: int,
         world_size: int,
-        hidden_dim: int,
         # workspace_ptrs: torch.Tensor,
         launch_with_pdl: bool,
         use_oneshot: bool,
@@ -279,12 +276,10 @@ class FlashInferAllReduceFusionParams:
         self,
         rank: int,
         world_size: int,
-        hidden_dim: int,
         use_fp32_lamport: bool = False,
     ):
         self.rank = rank
         self.world_size = world_size
-        self.hidden_dim = hidden_dim
         self.use_fp32_lamport = use_fp32_lamport
         self.trigger_completion_at_end = True
         self.launch_with_pdl = True
@@ -295,7 +290,6 @@ class FlashInferAllReduceFusionParams:
         return {
             "world_rank": self.rank,
             "world_size": self.world_size,
-            "hidden_dim": self.hidden_dim,
             "launch_with_pdl": self.launch_with_pdl,
             "use_oneshot": self.use_oneshot,
             "trigger_completion_at_end": self.trigger_completion_at_end,
@@ -356,8 +350,6 @@ class AllReduceRMSNORMPattern(BasePattern):
                 residual_out = torch.empty_like(residual_in)
                 trtllm_allreduce_fusion(
                     allreduce_in=input,
-                    token_num=input.numel() //
-                    self.allreduce_params.hidden_dim,
                     residual_in=residual_in,
                     residual_out=residual_out,
                     norm_out=rms_result,
@@ -429,8 +421,6 @@ class AllReduceFusedAddRMSNormPattern(BasePattern):
 
                 trtllm_allreduce_fusion(
                     allreduce_in=input,
-                    token_num=input.numel() //
-                    self.allreduce_params.hidden_dim,
                     residual_in=residual,
                     residual_out=residual_out,
                     norm_out=rms_out,
@@ -500,7 +490,6 @@ class AllReduceFusionPass(VllmInductorPass):
             self.allreduce_params = FlashInferAllReduceFusionParams(
                 rank=rank,
                 world_size=self.tp_size,
-                hidden_dim=self.hidden_dim,
                 use_fp32_lamport=use_fp32_lamport,
             )
         for epsilon in [1e-5, 1e-6]:
