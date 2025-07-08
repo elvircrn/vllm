@@ -170,6 +170,47 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "float epsilon) -> ()");
   ops.impl("fused_add_rms_norm", torch::kCUDA, &fused_add_rms_norm);
 
+  ops.def(
+      "fused_rs_ln_ag_cta(Tensor! input, Tensor! residual, Tensor weight, "
+      "int mcptr, int signal_pads, int rank, int world_size, int MAX_CTAS, "
+      "float epsilon) -> ()");
+  ops.impl("fused_rs_ln_ag_cta", torch::kCUDA, &fused_rs_ln_ag_cta);
+
+  // TokenWeave Artifact Kernels
+  ops.def(
+      "fused_add_rms_norm_cta(Tensor! input, Tensor! residual, Tensor weight, "
+      "int MAX_CTAS, float epsilon) -> ()");
+  ops.impl("fused_add_rms_norm_cta", torch::kCUDA, &fused_add_rms_norm_cta);
+
+  ops.def(
+      "fused_rs_ln_cta(Tensor! input, Tensor! residual, Tensor weight, "
+      "int mcptr, int signal_pads, int rank, int world_size, int MAX_CTAS, "
+      "float epsilon) -> ()");
+  ops.impl("fused_rs_ln_cta", torch::kCUDA, &fused_rs_ln_cta);
+
+  ops.def(
+      "multimem_ar_cta(Tensor input, int mcptr, int signal_pads, "
+      "int rank, int world_size, int MAX_CTAS) -> ()");
+  ops.impl("multimem_ar_cta", torch::kCUDA, &multimem_ar_cta);
+
+  ops.def(
+      "multimem_rs_cta(Tensor input, int mcptr, int signal_pads, "
+      "int rank, int world_size, int MAX_CTAS) -> ()");
+  ops.impl("multimem_rs_cta", torch::kCUDA, &multimem_rs_cta);
+
+  ops.def(
+      "multimem_ag_cta(Tensor input, int mcptr, int signal_pads, "
+      "int rank, int world_size, int MAX_CTAS) -> ()");
+  ops.impl("multimem_ag_cta", torch::kCUDA, &multimem_ag_cta);
+
+  ops.def(
+      "simple_fusion_rs_ln_ag_cta(Tensor! input, Tensor! residual, Tensor "
+      "weight, "
+      "int mcptr, int signal_pads, int rank, int world_size, int MAX_CTAS, "
+      "float epsilon) -> ()");
+  ops.impl("simple_fusion_rs_ln_ag_cta", torch::kCUDA,
+           &simple_fusion_rs_ln_ag_cta);
+
   // Apply repetition penalties to logits in-place
   ops.def(
       "apply_repetition_penalties_(Tensor! logits, Tensor prompt_mask, "

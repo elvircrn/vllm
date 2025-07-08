@@ -92,6 +92,51 @@ void rms_norm(torch::Tensor& out, torch::Tensor& input, torch::Tensor& weight,
 void fused_add_rms_norm(torch::Tensor& input, torch::Tensor& residual,
                         torch::Tensor& weight, double epsilon);
 
+void fused_rs_ln_ag_cta(torch::Tensor& input,     // [..., hidden_size]
+                        torch::Tensor& residual,  // [..., hidden_size]
+                        torch::Tensor& weight,    // [hidden_size]
+                        int64_t mcptr,        // [..., hidden_size] multimem_ptr
+                        int64_t signal_pads,  // [..., hidden_size] signal pads
+                        int64_t rank, int64_t world_size, int64_t MAX_CTAS,
+                        double epsilon);
+
+// Tokenweave Artifact Kernels
+void fused_add_rms_norm_cta(torch::Tensor& input,     // [..., hidden_size]
+                            torch::Tensor& residual,  // [..., hidden_size]
+                            torch::Tensor& weight,    // [hidden_size]
+                            int64_t MAX_CTAS, double epsilon);
+
+void fused_rs_ln_cta(torch::Tensor& input,     // [..., hidden_size]
+                     torch::Tensor& residual,  // [..., hidden_size]
+                     torch::Tensor& weight,    // [hidden_size]
+                     int64_t mcptr,        // [..., hidden_size] multimem_ptr
+                     int64_t signal_pads,  // [..., hidden_size] signal pads
+                     int64_t rank, int64_t world_size, int64_t MAX_CTAS,
+                     double epsilon);
+
+void multimem_ar_cta(torch::Tensor& input,  // [..., hidden_size]
+                     int64_t mcptr,         // [..., hidden_size] multimem_ptr
+                     int64_t signal_pads,   // [..., hidden_size] signal pads
+                     int64_t rank, int64_t world_size, int64_t MAX_CTAS);
+
+void multimem_rs_cta(torch::Tensor& input,  // [..., hidden_size]
+                     int64_t mcptr,         // [..., hidden_size] multimem_ptr
+                     int64_t signal_pads,   // [..., hidden_size] signal pads
+                     int64_t rank, int64_t world_size, int64_t MAX_CTAS);
+
+void multimem_ag_cta(torch::Tensor& input,  // [..., hidden_size]
+                     int64_t mcptr,         // [..., hidden_size] multimem_ptr
+                     int64_t signal_pads,   // [..., hidden_size] signal pads
+                     int64_t rank, int64_t world_size, int64_t MAX_CTAS);
+
+void simple_fusion_rs_ln_ag_cta(
+    torch::Tensor& input,     // [..., hidden_size]
+    torch::Tensor& residual,  // [..., hidden_size]
+    torch::Tensor& weight,    // [hidden_size]
+    int64_t mcptr,            // [..., hidden_size] multimem_ptr
+    int64_t signal_pads,      // [..., hidden_size] signal pads
+    int64_t rank, int64_t world_size, int64_t MAX_CTAS, double epsilon);
+
 void apply_repetition_penalties_(torch::Tensor& logits,
                                  const torch::Tensor& prompt_mask,
                                  const torch::Tensor& output_mask,

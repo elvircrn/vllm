@@ -280,6 +280,59 @@ def fused_add_rms_norm(input: torch.Tensor, residual: torch.Tensor,
     torch.ops._C.fused_add_rms_norm(input, residual, weight, epsilon)
 
 
+# TokenWeave custom ops
+def fused_rs_ln_ag_cta(input: torch.Tensor, residual: torch.Tensor,
+                       weight: torch.Tensor, mcptr: int, signal_pads: int,
+                       rank: int, world_size: int, MAX_CTAS: int,
+                       epsilon: float) -> None:
+    torch.ops._C.fused_rs_ln_ag_cta(input, residual, weight, mcptr,
+                                    signal_pads, rank, world_size, MAX_CTAS,
+                                    epsilon)
+
+
+# TokenWeave custom ops (Needed for the artifact)
+def fused_add_rms_norm_cta(input: torch.Tensor, residual: torch.Tensor,
+                           weight: torch.Tensor, MAX_CTAS: int,
+                           epsilon: float) -> None:
+    torch.ops._C.fused_add_rms_norm_cta(input, residual, weight, MAX_CTAS,
+                                        epsilon)
+
+
+def fused_rs_ln_cta(input: torch.Tensor, residual: torch.Tensor,
+                    weight: torch.Tensor, mcptr: int, signal_pads: int,
+                    rank: int, world_size: int, MAX_CTAS: int,
+                    epsilon: float) -> None:
+    torch.ops._C.fused_rs_ln_cta(input, residual, weight, mcptr, signal_pads,
+                                 rank, world_size, MAX_CTAS, epsilon)
+
+
+def multimem_all_reduce(input: torch.Tensor, mcptr: int, signal_pads: int,
+                        rank: int, world_size: int, MAX_CTAS: int) -> None:
+    torch.ops._C.multimem_ar_cta(input, mcptr, signal_pads, rank, world_size,
+                                 MAX_CTAS)
+
+
+def multimem_reduce_scatter(input: torch.Tensor, mcptr: int, signal_pads: int,
+                            rank: int, world_size: int, MAX_CTAS: int) -> None:
+    torch.ops._C.multimem_rs_cta(input, mcptr, signal_pads, rank, world_size,
+                                 MAX_CTAS)
+
+
+def multimem_all_gather(input: torch.Tensor, mcptr: int, signal_pads: int,
+                        rank: int, world_size: int, MAX_CTAS: int) -> None:
+    torch.ops._C.multimem_ag_cta(input, mcptr, signal_pads, rank, world_size,
+                                 MAX_CTAS)
+
+
+def simple_fusion_rs_ln_ag_cta(input: torch.Tensor, residual: torch.Tensor,
+                               weight: torch.Tensor, mcptr: int,
+                               signal_pads: int, rank: int, world_size: int,
+                               MAX_CTAS: int, epsilon: float) -> None:
+    torch.ops._C.simple_fusion_rs_ln_ag_cta(input, residual, weight, mcptr,
+                                            signal_pads, rank, world_size,
+                                            MAX_CTAS, epsilon)
+
+
 def apply_repetition_penalties_torch(
         logits: torch.Tensor, prompt_mask: torch.Tensor,
         output_mask: torch.Tensor, repetition_penalties: torch.Tensor) -> None:

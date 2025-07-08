@@ -138,7 +138,8 @@ if TYPE_CHECKING:
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: str = "NONE"
     VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16: bool = True
     VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB: Optional[int] = None
-    VLLM_USE_FLASHINFER_ALLREDUCE: Optional[bool] = None
+    VLLM_USE_FLASHINFER_ALLREDUCE: bool = False
+    VLLM_USE_TOKENWEAVE_ALLREDUCE: bool = False
 
 
 def get_default_cache_root():
@@ -959,6 +960,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, vllm will use flashinfer fused allreduce kernels
     "VLLM_USE_FLASHINFER_ALLREDUCE":
     lambda: bool(int(os.getenv("VLLM_USE_FLASHINFER_ALLREDUCE", "0"))),
+
+    # If set, vllm will use tokenweave fused allreduce kernels
+    "VLLM_USE_TOKENWEAVE_ALLREDUCE":
+    lambda: bool(int(os.getenv("VLLM_USE_TOKENWEAVE_ALLREDUCE", "0"))),
 }
 
 # --8<-- [end:env-vars-definition]

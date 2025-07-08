@@ -240,6 +240,8 @@ set(VLLM_EXT_SRC
   "csrc/attention/vertical_slash_index.cu"
   "csrc/pos_encoding_kernels.cu"
   "csrc/activation_kernels.cu"
+  "csrc/tokenweave_fused_kernels.cu"
+  "csrc/tokenweave_artifact_kernels.cu"
   "csrc/layernorm_kernels.cu"
   "csrc/layernorm_quant_kernels.cu"
   "csrc/sampler.cu"
