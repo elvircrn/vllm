@@ -868,34 +868,32 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
 
         self.fused_experts = None  # type: ignore
 
-    def maybe_swap_experts_impl(
+    # TODO: merge with select? move to layer or turn into select_prepare_finalize
+    def maybe_make_prepare_finalize(
         self,
-        moe_parallel_config: FusedMoEParallelConfig,
-    ):
+        moe: FusedMoEConfig,
+    ) -> Optional[FusedMoEPrepareAndFinalize]:
+        moe_parallel_config = moe.parallel_config
         if not self.allow_flashinfer_cutlass:
-            return
+            return super().maybe_make_prepare_finalize(moe)
 
         logger.debug_once("FlashInferExperts")
+
         # default to TP/EP case only
 
-        experts_kwargs: dict[str, Any] = {
-            "use_nvfp4_w4a4": True,
-            "use_dp": moe_parallel_config.dp_size > 1,
-            "ep_rank": moe_parallel_config.ep_rank,
-            "ep_size": moe_parallel_config.ep_size,
-            "tp_rank": moe_parallel_config.tp_rank,
-            "tp_size": moe_parallel_config.tp_size,
-        }
+        use_nvfp4_w4a4 = True
+        use_dp = moe_parallel_config.dp_size > 1
+        # ep_rank = moe_parallel_config.ep_rank
+        # ep_size = moe_parallel_config.ep_size
+        # tp_rank = moe_parallel_config.tp_rank
+        # tp_size = moe_parallel_config.tp_size
+        a1_gscale = layer.w13_input_scale_quant
 
-        from vllm.model_executor.layers.fused_moe.flashinfer_cutlass_moe import (  # noqa: E501
-            FlashInferExperts)
-        experts = FlashInferExperts(**experts_kwargs)
-        self.fused_experts = mk.FusedMoEModularKernel(
-            FlashInferCutlassMoEPrepareAndFinalize(
-                quant_dtype=torch.uint8,
-                #meaning 2x e2m1 packed in one, kernel requirement
-            ),
-            experts,
+        return FlashInferCutlassMoEPrepareAndFinalize(
+            use_dp,
+            a1_gscale,
+            quant_dtype=None, #torch.uint8,
+            #meaning 2x e2m1 packed in one, kernel requirement
         )
 
     # This method update self.fused_experts
@@ -910,11 +908,17 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         experts = None
         all2all_manager = get_ep_group().device_communicator.all2all_manager
         assert all2all_manager is not None
+
         if self.allow_flashinfer_cutlass:
             from vllm.model_executor.layers.fused_moe.flashinfer_cutlass_moe import (  # noqa: E501
                 FlashInferExperts)
             logger.debug_once("Using FlashInferExperts")
             experts = FlashInferExperts(
+                g1_alphas=layer.g1_alphas,
+                g2_alphas=layer.g2_alphas,
+                a1_gscale=layer.w13_input_scale_quant,
+                a2_gscale=layer.w2_input_scale_quant,
+                out_dtype=moe.in_dtype,  # TODO: double check
                 use_nvfp4_w4a4=True,
                 use_dp=moe.moe_parallel_config.dp_size > 1,
                 ep_rank=moe.moe_parallel_config.ep_rank,
@@ -1198,27 +1202,6 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
                 x, layer.w13_weight, layer.w2_weight), (
                     "Flashinfer CUTLASS Fused MoE not applicable!")
 
-            a1_gscale = layer.w13_input_scale_quant
-            a2_gscale = layer.w2_input_scale_quant
-            extra_expert_args = {
-                'g1_alphas': layer.g1_alphas,
-                'g2_alphas': layer.g2_alphas,
-                'out_dtype': x.dtype,
-                # Avoid confusion with a1_scale and a2_scale
-                # where are batch size related.
-                'a1_gscale': a1_gscale,
-                'a2_gscale': a2_gscale,
-            }
-            extra_prepare_args = {
-                'use_dp': layer.dp_size > 1,
-                'local_tokens': x.shape[0],
-                'a1_gscale': a1_gscale,
-            }
-            extra_finalize_args = {
-                'use_dp': layer.dp_size > 1,
-                'local_tokens': x.shape[0],
-            }
-
             out = self.fused_experts(
                 hidden_states=x,
                 w1=layer.w13_weight,
@@ -1232,8 +1215,5 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
                 w1_scale=layer.w13_blockscale_swizzled,
                 w2_scale=layer.w2_blockscale_swizzled,
                 apply_router_weight_on_input=apply_router_weight_on_input,
-                extra_expert_args=extra_expert_args,
-                extra_prepare_args=extra_prepare_args,
-                extra_finalize_args=extra_finalize_args,
             )
         return out
