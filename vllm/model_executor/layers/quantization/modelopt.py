@@ -868,7 +868,6 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
 
         self.fused_experts = None  # type: ignore
 
-    # TODO: merge with select? move to layer or turn into select_prepare_finalize
     def maybe_make_prepare_finalize(
         self,
         moe: FusedMoEConfig,
