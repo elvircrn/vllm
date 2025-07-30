@@ -86,7 +86,8 @@ class FlashInferCutlassMoEPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             quant_config.quant_dtype,
             self.per_channel_quant,
             self.block_shape,
-            is_fp4_scale_swizzled=not self.use_dp  # Swizzling after communication
+            is_fp4_scale_swizzled=not self.
+            use_dp  # Swizzling after communication
         )
         if self.use_dp:
             topk_weights, topk_ids, a1q, a1q_scale = \
@@ -109,6 +110,6 @@ class FlashInferCutlassMoEPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             fused_expert_output = get_dp_group().reduce_scatterv(
                 fused_expert_output,
                 dim=0,
-                sizes=get_local_sizes(local_tokens),
+                sizes=get_local_sizes(self.local_tokens),
             )
         output.copy_(fused_expert_output)
