@@ -410,6 +410,7 @@ class BitsAndBytesMoEMethod(FusedMoEMethodBase):
     """
 
     def __init__(self, quant_config: BitsAndBytesConfig):
+        super().__init__()
         try:
             import bitsandbytes
             if bitsandbytes.__version__ < "0.45.3":
@@ -467,6 +468,7 @@ class BitsAndBytesMoEMethod(FusedMoEMethodBase):
         logical_replica_count: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from vllm.model_executor.layers.fused_moe import fused_experts
+        assert self.fused_experts is None
 
         if enable_eplb:
             raise NotImplementedError(

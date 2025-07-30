@@ -12,7 +12,7 @@ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm._custom_ops import cutlass_scaled_fp4_mm, scaled_fp4_quant
 from vllm.distributed import get_ep_group
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
+from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.flashinfer_cutlass_prepare_finalize import (  # noqa: E501
     FlashInferCutlassMoEPrepareAndFinalize)
 from vllm.model_executor.layers.fused_moe.layer import (
@@ -263,6 +263,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
     """
 
     def __init__(self, quant_config: ModelOptFp8Config):
+        super().__init__()
         self.quant_config = quant_config
         from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
             cutlass_fp8_supported)
@@ -432,6 +433,8 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         logical_to_physical_map: Optional[torch.Tensor] = None,
         logical_replica_count: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        assert self.fused_experts is None
+
         if enable_eplb:
             raise NotImplementedError(
                 "EPLB not supported for `ModelOptFp8MoEMethod` yet.")
@@ -842,6 +845,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
     """
 
     def __init__(self, quant_config: ModelOptNvFp4Config):
+        super().__init__()
         self.quant_config = quant_config
         self.cutlass_nvfp4_supported = cutlass_fp4_supported()
         self.use_marlin = False
@@ -866,12 +870,10 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
                                  " quantization. Please use Blackwell and"
                                  " above.")
 
-        self.fused_experts = None  # type: ignore
-
     def maybe_make_prepare_finalize(
         self,
         moe: FusedMoEConfig,
-    ) -> Optional[FusedMoEPrepareAndFinalize]:
+    ) -> Optional[mk.FusedMoEPrepareAndFinalize]:
         moe_parallel_config = moe.parallel_config
         if not self.allow_flashinfer_cutlass:
             return super().maybe_make_prepare_finalize(moe)
