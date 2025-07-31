@@ -673,11 +673,12 @@ class ModelOptNvFp4Config(QuantizationConfig):
             return ModelOptNvFp4FusedMoE(
                 self,
                 layer.moe_config,
-                g1_alphas=layer.g1_alphas,
-                g2_alphas=layer.g2_alphas,
-                a1_gscale=layer.w13_input_scale_quant,
-                a2_gscale=layer.w2_input_scale_quant,
+                layer,
             )
+        #g1_alphas=layer.g1_alphas,
+        #g2_alphas=layer.g2_alphas,
+        #a1_gscale=layer.w13_input_scale_quant,
+        #a2_gscale=layer.w2_input_scale_quant,
 
         return None
 
@@ -861,20 +862,22 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         self,
         quant_config: ModelOptNvFp4Config,
         moe: FusedMoEConfig,
-        g1_alphas: torch.Tensor,
-        g2_alphas: torch.Tensor,
-        a1_gscale: torch.Tensor,
-        a2_gscale: torch.Tensor,
+        layer: torch.nn.Module,
+        #g1_alphas: torch.Tensor,
+        #g2_alphas: torch.Tensor,
+        #a1_gscale: torch.Tensor,
+        #a2_gscale: torch.Tensor,
     ):
         super().__init__(moe)
         self.quant_config = quant_config
         self.cutlass_nvfp4_supported = cutlass_fp4_supported()
         self.use_marlin = False
         self.allow_flashinfer_cutlass = False
-        self.g1_alphas = g1_alphas
-        self.g2_alphas = g2_alphas
-        self.a1_gscale = a1_gscale
-        self.a2_gscale = a2_gscale
+        self.layer = layer
+        #self.g1_alphas = g1_alphas
+        #self.g2_alphas = g2_alphas
+        #self.a1_gscale = a1_gscale
+        #self.a2_gscale = a2_gscale
 
         if envs.VLLM_USE_FLASHINFER_MOE_FP4:
             if self.cutlass_nvfp4_supported and current_platform.is_cuda() \
@@ -899,19 +902,18 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         self,
         moe: FusedMoEConfig,
     ) -> Optional[mk.FusedMoEPrepareAndFinalize]:
-        moe_parallel_config = moe.parallel_config
         if not self.allow_flashinfer_cutlass:
             return super().maybe_make_prepare_finalize(moe)
 
-        logger.debug_once("FlashInferExperts")
         # default to TP/EP case only
+        use_dp = moe.moe_parallel_config.dp_size > 1
 
-        use_dp = moe_parallel_config.dp_size > 1
+        logger.debug_once("FlashInferCutlassMoEPrepareAndFinalize use_dp=%s", use_dp)
 
         return FlashInferCutlassMoEPrepareAndFinalize(
             use_dp,
-            self.a1_gscale,
-            quant_dtype=None,  #torch.uint8,  # TODO: make sure this works
+            a1_gscale=self.layer.w13_input_scale_quant,
+            quant_dtype="nvfp4",
             #meaning 2x e2m1 packed in one, kernel requirement
         )
 
@@ -927,17 +929,16 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         assert moe is not None
         assert prepare_finalize is not None
         experts = None
-        all2all_manager = get_ep_group().device_communicator.all2all_manager
-        assert all2all_manager is not None
+
         if self.allow_flashinfer_cutlass:
             from vllm.model_executor.layers.fused_moe.flashinfer_cutlass_moe import (  # noqa: E501
                 FlashInferExperts)
             logger.debug_once("Using FlashInferExperts")
             experts = FlashInferExperts(
-                g1_alphas=self.g1_alphas,
-                g2_alphas=self.g2_alphas,
-                a1_gscale=self.w13_input_scale_quant,
-                a2_gscale=self.w2_input_scale_quant,
+                g1_alphas=self.layer.g1_alphas,
+                g2_alphas=self.layer.g2_alphas,
+                a1_gscale=self.layer.w13_input_scale_quant,
+                a2_gscale=self.layer.w2_input_scale_quant,
                 out_dtype=moe.in_dtype,  # TODO: double check
                 use_nvfp4_w4a4=True,
                 use_dp=moe.moe_parallel_config.dp_size > 1,
