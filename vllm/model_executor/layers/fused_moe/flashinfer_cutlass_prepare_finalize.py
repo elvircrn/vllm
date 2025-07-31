@@ -84,6 +84,7 @@ class FlashInferCutlassMoEPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         assert not apply_router_weight_on_input
 
         local_tokens = a1.shape[0]
+        self.local_tokens = local_tokens  # hacky
 
         a1q, a1q_scale = moe_kernel_quantize_input(
             a1,
