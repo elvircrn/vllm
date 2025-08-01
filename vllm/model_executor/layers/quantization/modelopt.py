@@ -675,10 +675,6 @@ class ModelOptNvFp4Config(QuantizationConfig):
                 layer.moe_config,
                 layer,
             )
-        #g1_alphas=layer.g1_alphas,
-        #g2_alphas=layer.g2_alphas,
-        #a1_gscale=layer.w13_input_scale_quant,
-        #a2_gscale=layer.w2_input_scale_quant,
 
         return None
 
@@ -863,10 +859,6 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         quant_config: ModelOptNvFp4Config,
         moe: FusedMoEConfig,
         layer: torch.nn.Module,
-        #g1_alphas: torch.Tensor,
-        #g2_alphas: torch.Tensor,
-        #a1_gscale: torch.Tensor,
-        #a2_gscale: torch.Tensor,
     ):
         super().__init__(moe)
         self.quant_config = quant_config
@@ -874,10 +866,6 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         self.use_marlin = False
         self.allow_flashinfer_cutlass = False
         self.layer = layer
-        #self.g1_alphas = g1_alphas
-        #self.g2_alphas = g2_alphas
-        #self.a1_gscale = a1_gscale
-        #self.a2_gscale = a2_gscale
 
         if envs.VLLM_USE_FLASHINFER_MOE_FP4:
             if self.cutlass_nvfp4_supported and current_platform.is_cuda() \

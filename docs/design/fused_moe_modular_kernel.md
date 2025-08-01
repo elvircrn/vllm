@@ -159,10 +159,17 @@ implementations that input `FusedMoEActivationFormat.Standard` support chunking 
 `FusedMoEPermuteExpertsUnpermute::apply`: Refer to `FusedMoEPermuteExpertsUnpermute` section above.
 
 ### FusedMoEModularKernel Initialization
-`FusedMoEMethodBase` class has 2 methods that are collectively responsible in creating the `FusedMoEModularKernel` object. They are,
+`FusedMoEMethodBase` class has 3 methods that are collectively responsible in creating the `FusedMoEModularKernel` object. They are,
 
+* maybe_make_prepare_finalize,
 * select_gemm_impl, and
 * init_prepare_finalize
+
+#### maybe_make_prepare_finalize
+The `maybe_make_prepare_finalize` method is responsbile for constructing an instance of `FusedMoEPrepareAndFinalize` when appropriate based on the current all2all backend, e.g. when EP + DP is enabled.  The base class method currently constructs all the `FusedMoEPrepareAndFinalize` objects for the EP+DP case.  Derived classes can override this method to construct prepare/finalize objects for different scenarios, e.g. `ModelOptNvFp4FusedMoE` can construct a `FlashInferCutlassMoEPrepareAndFinalize` for the EP+TP case.
+Please refer to the implementations in,
+
+* `ModelOptNvFp4FusedMoE`
 
 #### select_gemm_impl
 The `select_gemm_impl` method is undefined in the base class. It is the responsibility of the derived class to implement a method that constructs a valid/appropriate `FusedMoEPermuteExpertsUnpermute` object.
