@@ -48,6 +48,7 @@ class FlashInferCutlassMoEPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self.num_dispatchers_ = num_dispatchers
         self.use_dp = use_dp
         self.a1_gscale = a1_gscale
+        self.local_tokens = None
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
@@ -79,8 +80,7 @@ class FlashInferCutlassMoEPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         assert not apply_router_weight_on_input
 
-        local_tokens = a1.shape[0]
-        self.local_tokens = local_tokens  # hacky
+        self.local_tokens = a1.shape[0]  # TODO(bnell): hacky
 
         a1q, a1q_scale = moe_kernel_quantize_input(
             a1,
@@ -96,7 +96,7 @@ class FlashInferCutlassMoEPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 get_dp_group().all_gatherv(
                     [topk_weights, topk_ids, a1q, a1q_scale],
                     dim=0,
-                    sizes=get_local_sizes(local_tokens),
+                    sizes=get_local_sizes(self.local_tokens),
                 )
             a1_m, a1_n = a1q.shape
             a1q_scale = nvfp4_block_scale_interleave(a1q_scale)
