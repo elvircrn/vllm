@@ -10,7 +10,6 @@ from torch.nn.parameter import Parameter
 import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm._custom_ops import cutlass_scaled_fp4_mm, scaled_fp4_quant
-from vllm.distributed import get_ep_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.flashinfer_cutlass_prepare_finalize import (  # noqa: E501
@@ -896,7 +895,8 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         # default to TP/EP case only
         use_dp = moe.moe_parallel_config.dp_size > 1
 
-        logger.debug_once("FlashInferCutlassMoEPrepareAndFinalize use_dp=%s", use_dp)
+        logger.debug_once("FlashInferCutlassMoEPrepareAndFinalize use_dp=%s",
+                          use_dp)
 
         return FlashInferCutlassMoEPrepareAndFinalize(
             use_dp,
