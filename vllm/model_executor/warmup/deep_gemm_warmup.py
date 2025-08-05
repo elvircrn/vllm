@@ -6,6 +6,8 @@ DeepGEMM JIT's the kernels. The warmup aims to JIT all the kernels that would
 be used during model execution beforehand.
 """
 
+import typing
+
 import torch
 from tqdm import tqdm
 
@@ -24,7 +26,8 @@ from vllm.utils.deep_gemm import fp8_gemm_nt, m_grouped_fp8_gemm_nt_contiguous
 
 
 def _extract_data_from_linear_base_module(
-        m: torch.nn.Module) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+    m: torch.nn.Module
+) -> tuple[torch.Tensor, torch.Tensor, typing.List[int]]:  # noqa: UP006
     """
     Extract weights, weight scales and quantization block sizes from the given
     LinearBase module.
