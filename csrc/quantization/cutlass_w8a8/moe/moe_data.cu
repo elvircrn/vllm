@@ -252,7 +252,7 @@ __global__ void transpose_a_scales(float* __restrict__ a_scales_t,
 	const uint32_t num_tokens = s_32[1];
 
 	auto a_scales_t_ptr = a_scales_t + expert_offset_scaled;
-	auto a_scales_ptr = a_scales + expert_offset_scaled;
+	auto _a_scales_ptr = a_scales + expert_offset_scaled;
 
   float *s_block_load_ptr = s_block + warp_id * WARP_SIZE + lane_id;
   const float *s_block_write_ptr = s_block + lane_id * WARP_COUNT + warp_id;
@@ -261,6 +261,7 @@ __global__ void transpose_a_scales(float* __restrict__ a_scales_t,
 	uint32_t t_base = 0;
 	auto transpose = [&]() {
 		uint32_t k = lane_id;
+    auto a_scales_ptr = _a_scales_ptr + t * k_scaled + k;
 
 		while (k - lane_id < k_scaled) {
 			auto tile_x = t / WARP_SIZE;
@@ -271,10 +272,10 @@ __global__ void transpose_a_scales(float* __restrict__ a_scales_t,
 
       bool pred = k < k_scaled && t < num_tokens;
 
-      cp_async1_pred(s_block_load_ptr, a_scales_ptr + t * k_scaled + k, pred);
+      cp_async1_pred(s_block_load_ptr, a_scales_ptr, pred);
       cp_async_fence();
       cp_async_wait<0>();
-			__syncthreads();
+			__syncthreads(); // NOTE: Can this be removed? Let's find out...
 
 			if (x < k_scaled && y < num_tokens) {
 				auto a_idx = x * num_tokens + y;
@@ -283,6 +284,7 @@ __global__ void transpose_a_scales(float* __restrict__ a_scales_t,
 
 			__syncthreads();
 			k += WARP_SIZE;
+      a_scales_ptr += WARP_SIZE;
 		}
 
 
