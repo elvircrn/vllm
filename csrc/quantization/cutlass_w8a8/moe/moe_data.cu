@@ -286,7 +286,7 @@ __global__ void transpose_a_scales(float* __restrict__ a_scales_t,
   };
 
   while (t - warp_id < num_tokens) {
-    // All threads are
+    // All threads are able to execute this.
     transpose();
     t_base += WARP_COUNT;
     t += WARP_COUNT;
