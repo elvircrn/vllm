@@ -275,7 +275,7 @@ __global__ void transpose_a_scales(float* __restrict__ a_scales_t,
       cp_async1_pred(s_block_load_ptr, a_scales_ptr, pred);
       cp_async_fence();
       cp_async_wait<0>();
-			__syncthreads(); // NOTE: Can this be removed? Let's find out...
+			__syncthreads();
 
 			if (x < k_scaled && y < num_tokens) {
 				auto a_idx = x * num_tokens + y;
