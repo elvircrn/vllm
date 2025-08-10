@@ -191,8 +191,114 @@ void get_cutlass_pplx_moe_mm_data_caller(torch::Tensor& expert_offsets,
       k);
 }
 
+__device__ inline void cp_async1_pred(void* smem_ptr, const void* glob_ptr,
+                                      bool pred = true) {
+  const int BYTES = 4;
+  uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  asm volatile(
+      "{\n"
+      "   .reg .pred p;\n"
+      "   setp.ne.b32 p, %0, 0;\n"
+      "   @p cp.async.ca.shared.global [%1], [%2], %3;\n"
+      "}\n" ::"r"((int)pred),
+      "r"(smem), "l"(glob_ptr), "n"(BYTES));
+}
+
+// Async copy fence.
+__device__ inline void cp_async_fence() {
+  asm volatile("cp.async.commit_group;\n" ::);
+}
+
+// Wait until at most `n` async copy stages are still pending.
+template <int n>
+__device__ inline void cp_async_wait() {
+  asm volatile("cp.async.wait_group %0;\n" ::"n"(n));
+}
+
+
+
 template<int THREAD_COUNT>
 __global__ void transpose_a_scales(float* __restrict__ a_scales_t,
+		const float* __restrict__ a_scales,
+		const int32_t* __restrict__ expert_offsets,
+		const int32_t* __restrict__ problem_sizes,
+		uint32_t k_scaled) {
+	__shared__ uint32_t s_expert_offset, s_num_tokens;
+	uint32_t expert_idx = blockIdx.x;
+
+	static constexpr uint32_t WARP_SIZE = 32;
+	static constexpr uint32_t WARP_COUNT = THREAD_COUNT / WARP_SIZE;
+
+	__shared__ float s_block[THREAD_COUNT];
+
+
+	if (!threadIdx.x) {
+		s_expert_offset = expert_offsets[expert_idx];
+		s_num_tokens = problem_sizes[expert_idx * 3];
+	}
+
+	__syncthreads();
+
+	uint32_t start_k_scaled = threadIdx.x;
+	uint32_t lane_id = threadIdx.x & 0x1fu;
+	uint32_t warp_id = threadIdx.x / WARP_SIZE;
+	uint32_t step_k_scaled = blockDim.x;
+
+	uint32_t expert_offset_scaled = s_expert_offset * k_scaled;
+	const uint32_t num_tokens = s_num_tokens;
+
+	auto a_scales_t_ptr = a_scales_t + expert_offset_scaled;
+	auto a_scales_ptr = a_scales + expert_offset_scaled;
+
+	auto t = warp_id;
+	uint32_t t_base = 0;
+	auto transpose = [&]() {
+		uint32_t k = lane_id;
+
+		while (k - lane_id < k_scaled) {
+			auto tile_x = t / WARP_SIZE;
+			auto tile_y = k / WARP_SIZE;
+
+			auto x = tile_y * WARP_SIZE + warp_id;
+			auto y = tile_x * WARP_SIZE + lane_id;
+
+      bool pred = k < k_scaled && t < num_tokens;
+
+      // NOTE(elvircrn): Maybe transpose immediately here?
+      cp_async1_pred(s_block + warp_id * WARP_SIZE + lane_id, a_scales_ptr + t * k_scaled + k, pred);
+      cp_async_fence();
+      cp_async_wait<0>();
+			__syncthreads();
+
+			if (x < k_scaled && y < num_tokens) {
+				auto a_idx = x * num_tokens + y;
+				a_scales_t_ptr[a_idx] = s_block[lane_id * WARP_COUNT + warp_id];
+			}
+
+			__syncthreads();
+			k += WARP_SIZE;
+		}
+
+
+	};
+
+	while (t - warp_id < num_tokens) {
+    // All threads are here.
+		transpose();
+		t_base += WARP_COUNT;
+		t += WARP_COUNT;
+	}
+
+	if (t >= num_tokens) {
+		return;
+	}
+
+	transpose();
+}
+
+
+template<int THREAD_COUNT>
+__global__ void transpose_a_scales_smem(float* __restrict__ a_scales_t,
 		const float* __restrict__ a_scales,
 		const int32_t* __restrict__ expert_offsets,
 		const int32_t* __restrict__ problem_sizes,
