@@ -169,6 +169,8 @@ __global__ void per_token_group_quant_8bit_kernel_fused(
       threads_per_group,  // stride in group
       scalar_op_cache);   // scalar handler
 
+  __syncthreads();
+
   local_absmax = GroupReduceMax(local_absmax, half_lane_id);
 
   float y_s = local_absmax / max_8bit;
@@ -188,17 +190,15 @@ __global__ void per_token_group_quant_8bit_kernel_fused(
         auto row_id = c_map[topk * _row_id + i];
         scale_id = row_id * k_scaled + col_id;
         int64_t expert_idx = 0;
-        for (; expert_idx < num_experts - 1 &&
-               (expert_offsets[expert_idx + 1] * k_scaled) <= scale_id;
-             expert_idx++) {
-             }  // -1 or -2
+        if (num_experts > 2) {
+          for (; expert_idx < num_experts - 1 && (expert_offsets[expert_idx + 1] * k_scaled) <= scale_id; expert_idx++) { }
+        }
         auto num_tokens = problem_sizes[3 * expert_idx];
         auto expert_offset_scaled = expert_offsets[expert_idx] * k_scaled;
         int64_t local_id = scale_id - expert_offset_scaled;
         auto t = local_id / k_scaled;  // Untransposed row.
-        auto k = local_id % k_scaled;  // Untransposed column.
         static_cast<float*>(
-            output_s)[expert_offset_scaled + k * num_tokens + t] = y_s;
+            output_s)[expert_offset_scaled + col_id * num_tokens + t] = y_s;
       }
     } else {
       int64_t expert_idx = 0;
@@ -210,13 +210,11 @@ __global__ void per_token_group_quant_8bit_kernel_fused(
       auto expert_offset_scaled = expert_offsets[expert_idx] * k_scaled;
       int64_t local_id = scale_id - expert_offset_scaled;
       auto t = local_id / k_scaled;  // Untransposed row.
-      auto k = local_id % k_scaled;  // Untransposed column.
-      static_cast<float*>(output_s)[expert_offset_scaled + k * num_tokens + t] =
+      static_cast<float*>(output_s)[expert_offset_scaled + col_id * num_tokens + t] =
           y_s;
     }
   }
 
-  __syncthreads();
 
   // quantize shared -> global 8-bit
   auto scalar_op_quant = [&] __device__(DST_DTYPE & dst, const T& src) {

@@ -846,6 +846,7 @@ def run_block_scaled_cutlass_moe_fp8(
                         dtype=torch.int32,
                         device=device)
 
+
     should_fuse = a1q_scale is None and per_act_block
 
     ops.get_cutlass_moe_mm_data(local_topk_ids, expert_offsets, problem_sizes1,
@@ -863,7 +864,6 @@ def run_block_scaled_cutlass_moe_fp8(
             idx_map=c_map if per_act_block else None)
     else:
         a1q_scale = a1q_scale[a_map] if per_act_block else a1q_scale
-    # print(f'local_topk_ids = {local_topk_ids.shape}\na_map = {a_map}\nlocal_topk = {local_topk_ids}\n')
 
     # TODO bring this back when cutlass perf commit is reapplied
     # a1q = ops.shuffle_rows(a1q, a_map)
