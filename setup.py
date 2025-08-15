@@ -59,7 +59,7 @@ MAIN_CUDA_VERSION = "12.8"
 
 
 def is_sccache_available() -> bool:
-    return which("sccache") is not None
+    return False
 
 
 def is_ccache_available() -> bool:

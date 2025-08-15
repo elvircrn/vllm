@@ -148,6 +148,7 @@ void get_cutlass_moe_mm_data_caller(
         static_cast<int32_t*>(expert_offsets.data_ptr()),
         static_cast<int32_t*>(atomic_buffer.data_ptr()), num_experts, swap_ab);
   }
+  // NOTE(elvircrn)
   compute_arg_sorts<<<num_experts, num_threads, 0, stream>>>(
       static_cast<const int32_t*>(topk_ids.data_ptr()),
       static_cast<const int32_t*>(expert_offsets.data_ptr()),
@@ -215,8 +216,11 @@ __device__ inline void cp_async_wait() {
   asm volatile("cp.async.wait_group %0;\n" ::"n"(n));
 }
 
+#define CEILDIV(x, y) (((x) + (y) - 1) / (y))
+
 template <int THREAD_COUNT>
-__global__ void transpose_a_scales(float* __restrict__ a_scales_t,
+__global__ void
+transpose_a_scales(float* __restrict__ a_scales_t,
                                    const float* __restrict__ a_scales,
                                    const int32_t* __restrict__ expert_offsets,
                                    const int32_t* __restrict__ problem_sizes,
@@ -242,9 +246,6 @@ __global__ void transpose_a_scales(float* __restrict__ a_scales_t,
 
   __syncthreads();
 
-  uint32_t start_k_scaled = threadIdx.x;
-  uint32_t step_k_scaled = blockDim.x;
-
   uint32_t expert_offset_scaled = s_32[0] * k_scaled;
   const uint32_t num_tokens = s_32[1];
 
@@ -260,27 +261,27 @@ __global__ void transpose_a_scales(float* __restrict__ a_scales_t,
     uint32_t k = lane_id;
     auto a_scales_ptr = _a_scales_ptr + t * k_scaled + k;
 
-    while (k - lane_id < k_scaled) {
-      auto tile_x = t / WARP_SIZE;
-      auto tile_y = k / WARP_SIZE;
+    auto tile_x = t / WARP_SIZE;
+    auto y = tile_x * WARP_SIZE + lane_id;
+    bool pred_y = y < num_tokens;
 
-      auto x = tile_y * WARP_SIZE + warp_id;
-      auto y = tile_x * WARP_SIZE + lane_id;
+    auto num_k_tiles = CEILDIV(k_scaled, WARP_SIZE);
 
+    auto x = warp_id;
+    for (uint32_t k_tile = 0; k_tile < num_k_tiles; k_tile++, k += WARP_SIZE) {
       bool pred = k < k_scaled && t < num_tokens;
-
       cp_async1_pred(s_block_load_ptr, a_scales_ptr, pred);
       cp_async_fence();
       cp_async_wait<0>();
       __syncthreads();
 
-      if (x < k_scaled && y < num_tokens) {
+      if (x < k_scaled && pred_y) {
         auto a_idx = x * num_tokens + y;
         a_scales_t_ptr[a_idx] = *s_block_write_ptr;
       }
 
       __syncthreads();
-      k += WARP_SIZE;
+      x += WARP_SIZE;
       a_scales_ptr += WARP_SIZE;
     }
   };
@@ -305,6 +306,8 @@ torch::Tensor transpose_cutlass_moe_a_scales_caller(
   const int64_t num_experts = expert_offsets.size(0);
   const int64_t num_tokens = a_scales.size(0);
   const int32_t k_scaled = a_scales.size(1);
+
+  // printf("elvircrn: num_experts = %d num_tokens = %d k_scaled = %d\n", (int) num_experts, (int) num_tokens, (int) k_scaled);
 
   auto options =
       torch::TensorOptions().dtype(a_scales.dtype()).device(a_scales.device());

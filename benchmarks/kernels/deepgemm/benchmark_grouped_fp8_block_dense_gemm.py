@@ -8,7 +8,17 @@ from typing import Optional
 
 # Import DeepGEMM functions
 import torch
-from deep_gemm import calc_diff, ceil_div
+
+def calc_diff(x: torch.Tensor, y: torch.Tensor):
+    x, y = x.double(), y.double()
+    denominator = (x * x + y * y).sum()
+    sim = 2 * (x * y).sum() / denominator
+    return 1 - sim
+
+
+def ceil_div(x: int, y: int) -> int:
+    return (x + y - 1) // y
+
 
 # Import vLLM functions
 from vllm import _custom_ops as ops
@@ -149,9 +159,13 @@ class MOETensors8Bit(MOETensors):
 
         # Get the right scale for tests.
         if per_act_block:
+            # NOTE(elvircrn): Taken.
+            # print('elvircrn: Triton called')
             a_q, a_scale = per_token_group_quant_fp8(moe_tensors_fp16.a,
                                                      block_size[1])
         else:
+            # NOTE(elvircrn): Not taken
+            # print('elvircrn: Other Triton called')
             _, a_scale = ops.scaled_fp8_quant(moe_tensors_fp16.a,
                                               use_per_token_if_dynamic=False)
             a_q, _ = ops.scaled_fp8_quant(moe_tensors_fp16.a,
@@ -250,6 +264,7 @@ def benchmark_shape(e: int,
                                            use_int8_w8a8=False,
                                            use_int8_w8a16=False,
                                            use_int4_w4a16=False,
+                                           use_mxfp4_w4a4=False,
                                            per_act_token_quant=False,
                                            block_shape=[128, 128])
         return m_fused_moe(
@@ -454,8 +469,9 @@ def run_benchmarks(verbose: bool = False):
         (4096, 4096, 7168),
         (4096, 7168, 2048),
     ]
-    num_experts = [8, 40]
-    topks = [1, 6, 8]
+    shapes = shapes[:1]
+    num_experts = [8]
+    topks = [8]
 
     all_results = []
     for e in num_experts:

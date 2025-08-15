@@ -789,7 +789,7 @@ def run_block_scaled_cutlass_moe_fp8(
     assert w2_scale is not None
     assert w1.dtype == torch.float8_e4m3fn
     assert w2.dtype == torch.float8_e4m3fn
-    assert a1q.shape[1] == w1.shape[2], "Hidden size mismatch w1"
+    assert hidden_states.dtype != torch.float8_e4m3fn or a1q.shape[1] == w1.shape[2], "Hidden size mismatch w1"
     assert w1.shape[1] == w2.shape[2] * 2, "Hidden size mismatch w2"
     assert w1.shape[0] == w2.shape[0], "Expert number mismatch"
     assert a1q_scale is None or a1q_scale.dim(
@@ -802,9 +802,14 @@ def run_block_scaled_cutlass_moe_fp8(
     ) == 0 or a2_scale.shape[0] == 1, "Intermediate scale shape mismatch"
     assert out_dtype in [torch.half, torch.bfloat16], "Invalid output dtype"
 
-    M = a1q.shape[0]
+    if hidden_states.dtype == torch.float8_e4m3fn:
+        # Already quantized
+        M = a1q.shape[0]
+        device = a1q.device
+    else:
+        M = a.shape[0]
+        device = a.device
     _, K, N = w2.shape
-    device = a1q.device
 
     assert w1.shape[2] == K
     assert global_num_experts != -1
@@ -828,13 +833,6 @@ def run_block_scaled_cutlass_moe_fp8(
                                  dtype=torch.int32,
                                  device=device)
 
-    if a1q_scale is None:
-        a1q, a1q_scale = _fp8_quantize(
-            a,
-            A_scale=None,
-            per_act_token=False,
-            block_shape=[128, 128] if per_act_block else None)
-
     if expert_map is not None:
         a_map = torch.zeros((local_topk_ids.numel()),
                             dtype=torch.int32,
@@ -848,26 +846,38 @@ def run_block_scaled_cutlass_moe_fp8(
                         dtype=torch.int32,
                         device=device)
 
+
     ops.get_cutlass_moe_mm_data(local_topk_ids, expert_offsets, problem_sizes1,
                                 problem_sizes2, a_map, c_map,
                                 global_num_experts, N, K, None, True)
+
+    if a1q_scale is None:
+        a1q, a1q_scale = _fp8_quantize(
+            a,
+            A_scale=None,
+            per_act_token=False,
+            block_shape=[128, 128] if per_act_block else None,
+            expert_offsets=expert_offsets if per_act_block else None,
+            problem_sizes=problem_sizes1 if per_act_block else None,
+            a_map=a_map if per_act_block else None)
+    else:
+        a1q_scale = a1q_scale[a_map] if per_act_block else a1q_scale
+    # print(f'local_topk_ids = {local_topk_ids.shape}\na_map = {a_map}\nlocal_topk = {local_topk_ids}\n')
 
     # TODO bring this back when cutlass perf commit is reapplied
     # a1q = ops.shuffle_rows(a1q, a_map)
     # a1q_scale = (ops.shuffle_rows(a1q_scale, a_map)
     #              if per_act_block else a1q_scale)
     a1q = _fp8_perm(a1q, a_map)
-    a1q_scale = a1q_scale[a_map] if per_act_block else a1q_scale
-    expert_offsets = expert_offsets[:-1]
 
     c1 = _resize_cache(workspace13, (M * topk, N * 2))
     c2 = _resize_cache(workspace2, (M * topk, N))
     c3 = _resize_cache(workspace13, (M * topk, K))
+    expert_offsets_truncated = expert_offsets[:-1]
 
     if cuda_arch == 90:
         if per_act_block:
-            a1q_scale = ops.transpose_cutlass_moe_a_scales(
-                a1q_scale, expert_offsets, problem_sizes1)
+            pass
         else:
             a1q_scale = a1q_scale.repeat(a1q.shape[1] // 128, a1q.shape[0])
     elif not per_act_block:
@@ -876,7 +886,8 @@ def run_block_scaled_cutlass_moe_fp8(
     if expert_map is not None:
         c1.fill_(0)
 
-    blockwise_mm_kernel(c1, a1q, w1, a1q_scale, w1_scale, expert_offsets,
+    # TODO(elvircrn):
+    blockwise_mm_kernel(c1, a1q, w1, a1q_scale, w1_scale, expert_offsets_truncated,
                         problem_sizes1, ab_strides1, ab_strides1, c_strides1,
                         per_act_block)
 
@@ -887,12 +898,13 @@ def run_block_scaled_cutlass_moe_fp8(
         A_scale=None,
         per_act_token=False,
         block_shape=[128, 128] if per_act_block else None,
+        expert_offsets=expert_offsets if per_act_block else None,
+        problem_sizes=problem_sizes2 if per_act_block else None
     )
 
     if cuda_arch == 90:
         if per_act_block:
-            a2q_scale = ops.transpose_cutlass_moe_a_scales(
-                a2q_scale, expert_offsets, problem_sizes2)
+            pass
         else:
             a2q_scale = a2q_scale.repeat(a2q.shape[1] // 128, a2q.shape[0])
     elif not per_act_block:
@@ -901,7 +913,7 @@ def run_block_scaled_cutlass_moe_fp8(
     if expert_map is not None:
         c3.fill_(0)
 
-    blockwise_mm_kernel(c3, a2q, w2, a2q_scale, w2_scale, expert_offsets,
+    blockwise_mm_kernel(c3, a2q, w2, a2q_scale, w2_scale, expert_offsets_truncated,
                         problem_sizes2, ab_strides2, ab_strides2, c_strides2,
                         per_act_block)
 
@@ -1108,4 +1120,5 @@ def block_scaled_cutlass_moe_fp8(
         a1_scale=a1_scale,
         a2_scale=a2_scale,
         apply_router_weight_on_input=apply_router_weight_on_input,
+        extra_prepare_args={"skip_quant": True}
     )

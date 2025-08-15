@@ -304,7 +304,7 @@ void scaled_fp4_experts_quant(
 void per_token_group_quant_fp8(const torch::Tensor& input,
                                torch::Tensor& output_q, torch::Tensor& output_s,
                                int64_t group_size, double eps, double fp8_min,
-                               double fp8_max, bool scale_ue8m0);
+                               double fp8_max, bool scale_ue8m0, bool transpose, const torch::Tensor& expert_offsets, const torch::Tensor &problem_sizes, bool reorder, const torch::Tensor &a_map);
 
 void per_token_group_quant_int8(const torch::Tensor& input,
                                 torch::Tensor& output_q,

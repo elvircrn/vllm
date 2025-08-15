@@ -685,6 +685,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if self.block_quant:
             assert self.quant_config.activation_scheme == "dynamic"
             if current_platform.is_fp8_fnuz():
+                # NOTE(elvircrn): Do this branch get called on hopper?
                 w13_weight, w13_weight_scale_inv, w13_input_scale = \
                     normalize_e4m3fn_to_e4m3fnuz(
                         layer.w13_weight, layer.w13_weight_scale_inv,
@@ -1030,7 +1031,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.c_strides1,
                 layer.c_strides2,
                 activation,
-                layer.w13_input_scale,
+                layer.w13_input_scale, # NOTE(elvircrn): Can we transpose this?
                 layer.w2_input_scale,
                 expert_map,
                 apply_router_weight_on_input,

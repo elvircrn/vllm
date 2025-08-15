@@ -60,6 +60,7 @@ struct cutlass_3x_gemm_fp8_blockwise {
   using TileShape = Shape<TileSizeM, GroupSizeN, GroupSizeK>;
 
   using KernelSchedule = cutlass::gemm::
+  // NOTE(elvircrn): I guess this needs to be configured?
       KernelTmaWarpSpecializedCooperativeFP8BlockScaledSubGroupMAccum<
           GroupSizeM_>;
   using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecializedCooperative;
