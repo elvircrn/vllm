@@ -379,7 +379,7 @@ def per_token_group_quant_fp8(
     use_ue8m0: Optional[bool] = None,
     expert_offsets: Optional[torch.Tensor] = None,
     problem_sizes: Optional[torch.Tensor] = None,
-    a_map: Optional[torch.Tensor] = None
+    idx_map: Optional[torch.Tensor] = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Function to perform per-token-group quantization on an input tensor `x`.
     It converts the tensor values into signed float8 values and returns the
@@ -421,8 +421,8 @@ def per_token_group_quant_fp8(
         x_s = torch.empty(shape, device=x.device,
                           dtype=torch.float32).permute(-1, -2)
     else:
-        if a_map is None: shape = x.shape[:-1] + (x.shape[-1] // group_size, )
-        else: shape = a_map.shape[:1] + (x.shape[-1] // group_size, )
+        if idx_map is None: shape = x.shape[:-1] + (x.shape[-1] // group_size, )
+        else: shape = idx_map.shape[:1] + (x.shape[-1] // group_size, )
         x_s = torch.empty(shape, device=x.device, dtype=torch.float32)
 
     # prefer CUDA kernel if available
@@ -430,9 +430,9 @@ def per_token_group_quant_fp8(
         # NOTE(elvircrn): This gets called. column_major_scales = False
         # print(f'torch.ops._C.static_scaled_fp8_quant: {column_major_scales}')
         transpose = expert_offsets != None
-        reorder = a_map != None
+        reorder = idx_map != None
         torch.ops._C.per_token_group_fp8_quant(x, x_q, x_s, group_size, eps,
-                                               fp8_min, fp8_max, use_ue8m0, transpose, expert_offsets, problem_sizes, reorder, a_map)
+                                               fp8_min, fp8_max, use_ue8m0, transpose, expert_offsets, problem_sizes, reorder, idx_map)
         return x_q, x_s
 
     # NOTE(elvircrn): Not called.

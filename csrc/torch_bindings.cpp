@@ -489,7 +489,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "                        Tensor! input_permutation, "
       "                        Tensor! output_permutation, int num_experts, "
       "                        int n, int k, Tensor? blockscale_offsets, "
-      "                        bool force_no_swap) -> ()",
+      "                        bool force_no_swap, bool should_fuse) -> ()",
       {stride_tag});
   ops.impl("get_cutlass_moe_mm_data", torch::kCUDA, &get_cutlass_moe_mm_data);
 

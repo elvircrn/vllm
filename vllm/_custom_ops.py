@@ -875,7 +875,8 @@ def get_cutlass_moe_mm_data(topk_ids: torch.Tensor,
                             n: int,
                             k: int,
                             blockscale_offsets: Optional[torch.Tensor] = None,
-                            force_no_swap: bool = False):
+                            force_no_swap: bool = False,
+                            should_fuse: bool = False):
     """
     Prepare data necessary to perform CUTLASS grouped matrix multiplications
     used in CUTLASS-based fused MoE.
@@ -902,7 +903,7 @@ def get_cutlass_moe_mm_data(topk_ids: torch.Tensor,
     return torch.ops._C.get_cutlass_moe_mm_data(
         topk_ids, expert_offsets, problem_sizes1, problem_sizes2,
         input_permutation, output_permutation, num_experts, n, k,
-        blockscale_offsets, force_no_swap)
+        blockscale_offsets, force_no_swap, should_fuse)
 
 
 def shuffle_rows(input_tensor: torch.Tensor, dst2src_map: torch.Tensor):

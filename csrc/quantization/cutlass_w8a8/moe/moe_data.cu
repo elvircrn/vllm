@@ -76,6 +76,7 @@ __global__ void compute_expert_blockscale_offsets(
   }
 }
 
+template<int SHOULD_FUSE>
 __global__ void compute_arg_sorts(const int32_t* __restrict__ topk_ids,
                                   const int32_t* __restrict__ expert_offsets,
                                   int32_t* input_permutation,
@@ -110,7 +111,7 @@ void get_cutlass_moe_mm_data_caller(
     torch::Tensor& input_permutation, torch::Tensor& output_permutation,
     const int64_t num_experts, const int64_t n, const int64_t k,
     const std::optional<torch::Tensor>& blockscale_offsets,
-    bool force_no_swap) {
+    bool force_no_swap, bool should_fuse) {
   auto stream = at::cuda::getCurrentCUDAStream(topk_ids.device().index());
   auto options_int32 =
       torch::TensorOptions().dtype(torch::kInt32).device(topk_ids.device());
@@ -148,14 +149,26 @@ void get_cutlass_moe_mm_data_caller(
         static_cast<int32_t*>(expert_offsets.data_ptr()),
         static_cast<int32_t*>(atomic_buffer.data_ptr()), num_experts, swap_ab);
   }
-  // NOTE(elvircrn)
-  compute_arg_sorts<<<num_experts, num_threads, 0, stream>>>(
-      static_cast<const int32_t*>(topk_ids.data_ptr()),
-      static_cast<const int32_t*>(expert_offsets.data_ptr()),
-      static_cast<int32_t*>(input_permutation.data_ptr()),
-      static_cast<int32_t*>(output_permutation.data_ptr()),
-      static_cast<int32_t*>(atomic_buffer.data_ptr()), topk_ids.numel(),
-      topk_ids.size(1));
+
+  if (should_fuse) {
+    // NOTE(elvircrn)
+    compute_arg_sorts<true><<<num_experts, num_threads, 0, stream>>>(
+        static_cast<const int32_t*>(topk_ids.data_ptr()),
+        static_cast<const int32_t*>(expert_offsets.data_ptr()),
+        static_cast<int32_t*>(input_permutation.data_ptr()),
+        static_cast<int32_t*>(output_permutation.data_ptr()),
+        static_cast<int32_t*>(atomic_buffer.data_ptr()), topk_ids.numel(),
+        topk_ids.size(1));
+  } else {
+    // NOTE(elvircrn)
+    compute_arg_sorts<false><<<num_experts, num_threads, 0, stream>>>(
+        static_cast<const int32_t*>(topk_ids.data_ptr()),
+        static_cast<const int32_t*>(expert_offsets.data_ptr()),
+        static_cast<int32_t*>(input_permutation.data_ptr()),
+        static_cast<int32_t*>(output_permutation.data_ptr()),
+        static_cast<int32_t*>(atomic_buffer.data_ptr()), topk_ids.numel(),
+        topk_ids.size(1));
+  }
 }
 
 __global__ void compute_pplx_data(int32_t* expert_offsets,

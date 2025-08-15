@@ -116,7 +116,7 @@ def _fp8_quantize(
     block_shape: Optional[list[int]] = None,
     expert_offsets=None,
     problem_sizes=None,
-    a_map=None
+    idx_map=None
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Perform fp8 quantization on the inputs.  If a block_shape
@@ -135,7 +135,7 @@ def _fp8_quantize(
         assert len(block_shape) == 2
         _, block_k = block_shape[0], block_shape[1]
         # print('per_token_group_quant_fp8') # Called
-        A, A_scale = per_token_group_quant_fp8(A, block_k, expert_offsets=expert_offsets, problem_sizes=problem_sizes, a_map=a_map)
+        A, A_scale = per_token_group_quant_fp8(A, block_k, expert_offsets=expert_offsets, problem_sizes=problem_sizes, idx_map=idx_map)
         assert cdiv(A.size(-1), block_k) == A_scale.size(-1)
 
     return A, A_scale

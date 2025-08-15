@@ -846,10 +846,11 @@ def run_block_scaled_cutlass_moe_fp8(
                         dtype=torch.int32,
                         device=device)
 
+    should_fuse = a1q_scale is None and per_act_block
 
     ops.get_cutlass_moe_mm_data(local_topk_ids, expert_offsets, problem_sizes1,
                                 problem_sizes2, a_map, c_map,
-                                global_num_experts, N, K, None, True)
+                                global_num_experts, N, K, None, True, should_fuse)
 
     if a1q_scale is None:
         a1q, a1q_scale = _fp8_quantize(
@@ -859,7 +860,7 @@ def run_block_scaled_cutlass_moe_fp8(
             block_shape=[128, 128] if per_act_block else None,
             expert_offsets=expert_offsets if per_act_block else None,
             problem_sizes=problem_sizes1 if per_act_block else None,
-            a_map=a_map if per_act_block else None)
+            idx_map=c_map if per_act_block else None)
     else:
         a1q_scale = a1q_scale[a_map] if per_act_block else a1q_scale
     # print(f'local_topk_ids = {local_topk_ids.shape}\na_map = {a_map}\nlocal_topk = {local_topk_ids}\n')
@@ -886,7 +887,6 @@ def run_block_scaled_cutlass_moe_fp8(
     if expert_map is not None:
         c1.fill_(0)
 
-    # TODO(elvircrn):
     blockwise_mm_kernel(c1, a1q, w1, a1q_scale, w1_scale, expert_offsets_truncated,
                         problem_sizes1, ab_strides1, ab_strides1, c_strides1,
                         per_act_block)

@@ -126,7 +126,7 @@ __global__ void per_token_group_quant_8bit_kernel_fused(
     const int num_groups, const int groups_per_block, const float eps,
     const float min_8bit, const float max_8bit, int64_t num_experts,
     int32_t* expert_offsets, int32_t* problem_sizes, bool reorder,
-    int32_t* a_map, const int scale_num_rows, int topk, int a_rows) {
+    int32_t* c_map, const int scale_num_rows, int topk, int a_rows) {
   static constexpr int threads_per_group = 16;
   const int64_t local_group_id = threadIdx.x / threads_per_group;
   const int half_lane_id = threadIdx.x % threads_per_group;
@@ -184,23 +184,21 @@ __global__ void per_token_group_quant_8bit_kernel_fused(
     auto col_id = scale_id % k_scaled;
 
     if (reorder) {
-      for (int i = 0; i < a_rows; i++) {
-        if (a_map[i] == _row_id) {
-          auto row_id = i;
-          scale_id = row_id * k_scaled + col_id;
-          int64_t expert_idx = 0;
-          for (; expert_idx < num_experts - 1 &&
-                 (expert_offsets[expert_idx + 1] * k_scaled) <= scale_id;
-               expert_idx++) {
-          }  // -1 or -2
-          auto num_tokens = problem_sizes[3 * expert_idx];
-          auto expert_offset_scaled = expert_offsets[expert_idx] * k_scaled;
-          int64_t local_id = scale_id - expert_offset_scaled;
-          auto t = local_id / k_scaled;  // Untransposed row.
-          auto k = local_id % k_scaled;  // Untransposed column.
-          static_cast<float*>(
-              output_s)[expert_offset_scaled + k * num_tokens + t] = y_s;
-        }
+      for (int i = 0; i < topk; i++) {
+        auto row_id = c_map[topk * _row_id + i];
+        scale_id = row_id * k_scaled + col_id;
+        int64_t expert_idx = 0;
+        for (; expert_idx < num_experts - 1 &&
+               (expert_offsets[expert_idx + 1] * k_scaled) <= scale_id;
+             expert_idx++) {
+             }  // -1 or -2
+        auto num_tokens = problem_sizes[3 * expert_idx];
+        auto expert_offset_scaled = expert_offsets[expert_idx] * k_scaled;
+        int64_t local_id = scale_id - expert_offset_scaled;
+        auto t = local_id / k_scaled;  // Untransposed row.
+        auto k = local_id % k_scaled;  // Untransposed column.
+        static_cast<float*>(
+            output_s)[expert_offset_scaled + k * num_tokens + t] = y_s;
       }
     } else {
       int64_t expert_idx = 0;
