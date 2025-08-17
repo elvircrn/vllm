@@ -869,7 +869,6 @@ def run_block_scaled_cutlass_moe_fp8(
     # a1q = ops.shuffle_rows(a1q, a_map)
     # a1q_scale = (ops.shuffle_rows(a1q_scale, a_map)
     #              if per_act_block else a1q_scale)
-    a1q = _fp8_perm(a1q, a_map)
 
     c1 = _resize_cache(workspace13, (M * topk, N * 2))
     c2 = _resize_cache(workspace2, (M * topk, N))

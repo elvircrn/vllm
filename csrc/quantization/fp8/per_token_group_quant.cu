@@ -126,7 +126,7 @@ __global__ void per_token_group_quant_8bit_kernel_fused(
     const int num_groups, const int groups_per_block, const float eps,
     const float min_8bit, const float max_8bit, int64_t num_experts,
     int32_t* expert_offsets, int32_t* problem_sizes, bool reorder,
-    int32_t* c_map, const int scale_num_rows, int topk, int a_rows) {
+    int32_t* c_map, const int scale_num_rows, int topk, int a_cols) {
   static constexpr int threads_per_group = 16;
   const int64_t local_group_id = threadIdx.x / threads_per_group;
   const int half_lane_id = threadIdx.x % threads_per_group;
@@ -200,18 +200,14 @@ __global__ void per_token_group_quant_8bit_kernel_fused(
     dst = DST_DTYPE(q);
   };
 
-  if (false) {
-    auto _row_id = scale_id / k_scaled;
+  if (reorder) {
+    auto _row_id = block_group_offset / a_cols;
 
     for (int i = 0; i < topk; i++) {
       auto row_id = c_map[topk * _row_id + i];
 
-      const int64_t block_group_id = row_id * groups_per_block;
-      const int64_t global_group_id = block_group_id + local_group_id;
-      const int64_t block_group_offset = global_group_id * group_size;
-
       DST_DTYPE* group_output =
- static_cast<DST_DTYPE*>(output_q) + block_group_offset;
+ static_cast<DST_DTYPE*>(output_q) + (row_id * a_cols + (block_group_offset % a_cols));
       vllm::vectorize_with_alignment<vec_size>(
           smem_group,         // in (shared)
           group_output,       // out (global quant tensor)
@@ -231,7 +227,6 @@ __global__ void per_token_group_quant_8bit_kernel_fused(
         threads_per_group,  // stride
         scalar_op_quant);   // scalar handler
   }
-
 
 
   if (half_lane_id == 0) {
@@ -415,7 +410,7 @@ void per_token_group_quant_8bit_fused(
   const int scale_stride = output_s.stride(1);
   const int64_t num_experts = expert_offsets.size(0);
 
-  int topk = output_s.size(0) / output_q.size(0);
+  int topk = c_map.size(0) / input.size(0);
 
 #define LAUNCH_KERNEL(T, DST_DTYPE)                                           \
   do {                                                                        \
@@ -435,7 +430,7 @@ void per_token_group_quant_8bit_fused(
               (int32_t*)expert_offsets.data_ptr(),                            \
               (int32_t*)problem_sizes.data_ptr(), reorder,                    \
               reorder ? (int32_t*)c_map.data_ptr() : nullptr, scale_num_rows, \
-              topk, (int32_t)output_s.size(0));                               \
+              topk, (int32_t)output_q.size(1));                               \
     } else {                                                                  \
       per_token_group_quant_8bit_kernel_fused<T, DST_DTYPE, false, false>     \
           <<<grid, block, smem_bytes, stream>>>(                              \
@@ -446,7 +441,7 @@ void per_token_group_quant_8bit_fused(
               (int32_t*)expert_offsets.data_ptr(),                            \
               (int32_t*)problem_sizes.data_ptr(), reorder,                    \
               reorder ? (int32_t*)c_map.data_ptr() : nullptr, scale_num_rows, \
-              topk, (int32_t)output_s.size(0));                               \
+              topk, (int32_t)output_q.size(1));                               \
     }                                                                         \
   } while (0)
 

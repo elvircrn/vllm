@@ -414,8 +414,8 @@ def per_token_group_quant_fp8(
     x_q = out_q
     if x_q is None:
         x_q_shape = x.shape
-        # if idx_map is not None:
-        #     x_q_shape = idx_map.shape[:1] + x_q_shape[1:]
+        if idx_map is not None:
+            x_q_shape = idx_map.shape[:1] + x_q_shape[1:]
         x_q = torch.empty(x_q_shape, device=x.device, dtype=dtype)
 
     # Allocate the scale tensor in either row- or column-major format.
