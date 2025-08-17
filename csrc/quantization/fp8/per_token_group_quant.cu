@@ -143,8 +143,6 @@ __global__ void per_token_group_quant_8bit_kernel_fused(
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
 
   const T* group_input = input + block_group_offset;
-  DST_DTYPE* group_output =
-      static_cast<DST_DTYPE*>(output_q) + block_group_offset;
 
   // shared memory to cache each group's data to avoid double DRAM reads.
   extern __shared__ __align__(16) char smem_raw[];
@@ -153,6 +151,7 @@ __global__ void per_token_group_quant_8bit_kernel_fused(
 
   __shared__ int32_t s_expert_offsets[41];
   __shared__ int32_t s_problem_sizes[40];
+  __shared__ int32_t s_c_map[40];
 
   if (num_experts > 2) {
     for (int i = threadIdx.x; i < num_experts - 1; i += blockDim.x) {
@@ -167,8 +166,10 @@ __global__ void per_token_group_quant_8bit_kernel_fused(
     s_problem_sizes[0] = problem_sizes[0];
   }
 
+  auto k_scaled = scale_num_rows;
+  auto _row_id = scale_id / k_scaled;
+
   constexpr int vec_size = 16 / sizeof(T);
-  using vec_t = vllm::vec_n_t<T, vec_size>;
 
   // copy global -> shared & compute absmax
   auto scalar_op_cache = [&] __device__(T & dst, const T& src) {
@@ -194,11 +195,46 @@ __global__ void per_token_group_quant_8bit_kernel_fused(
     y_s = exp2f(ceilf(log2f(fmaxf(fabsf(y_s), 1e-10f))));
   }
 
+  // quantize shared -> global 8-bit
+  auto scalar_op_quant = [&] __device__(DST_DTYPE & dst, const T& src) {
+    float q = fminf(fmaxf(static_cast<float>(src) / y_s, min_8bit), max_8bit);
+    dst = DST_DTYPE(q);
+  };
+
+  if (false) {
+    for (int i = 0; i < topk; i++) {
+      auto row_id = c_map[topk * _row_id + i];
+
+      const int64_t block_group_id = row_id * groups_per_block;
+      const int64_t global_group_id = block_group_id + local_group_id;
+      const int64_t block_group_offset = global_group_id * group_size;
+
+      DST_DTYPE* group_output =
+ static_cast<DST_DTYPE*>(output_q) + block_group_offset;
+      vllm::vectorize_with_alignment<vec_size>(
+          smem_group,         // in (shared)
+          group_output,       // out (global quant tensor)
+          group_size,         // elements
+          half_lane_id,       // tid
+          threads_per_group,  // stride
+          scalar_op_quant);   // scalar handler
+    }
+  } else {
+    DST_DTYPE* group_output =
+     static_cast<DST_DTYPE*>(output_q) + block_group_offset;
+    vllm::vectorize_with_alignment<vec_size>(
+        smem_group,         // in (shared)
+        group_output,       // out (global quant tensor)
+        group_size,         // elements
+        half_lane_id,       // tid
+        threads_per_group,  // stride
+        scalar_op_quant);   // scalar handler
+  }
+
+
+
   if (half_lane_id == 0) {
     // Here we find the expert matching elem_id.
-    auto k_scaled = scale_num_rows;
-
-    auto _row_id = scale_id / k_scaled;
     auto col_id = scale_id % k_scaled;
 
     if (reorder) {
@@ -214,7 +250,7 @@ __global__ void per_token_group_quant_8bit_kernel_fused(
           for (; expert_idx < num_experts - 1 &&
                  (s_expert_offsets[expert_idx + 1] * k_scaled) <= scale_id;
                expert_idx++) {
-          }
+               }
           expert_offset_scaled = s_expert_offsets[expert_idx] * k_scaled;
         }
         auto num_tokens = s_problem_sizes[expert_idx];
@@ -231,7 +267,7 @@ __global__ void per_token_group_quant_8bit_kernel_fused(
         for (; expert_idx < num_experts - 1 &&
                (s_expert_offsets[expert_idx + 1] * k_scaled) <= scale_id;
              expert_idx++) {
-        }
+             }
         expert_offset_scaled = s_expert_offsets[expert_idx] * k_scaled;
       }
       auto num_tokens = s_problem_sizes[expert_idx];
@@ -241,20 +277,6 @@ __global__ void per_token_group_quant_8bit_kernel_fused(
           output_s)[expert_offset_scaled + col_id * num_tokens + t] = y_s;
     }
   }
-
-  // quantize shared -> global 8-bit
-  auto scalar_op_quant = [&] __device__(DST_DTYPE & dst, const T& src) {
-    float q = fminf(fmaxf(static_cast<float>(src) / y_s, min_8bit), max_8bit);
-    dst = DST_DTYPE(q);
-  };
-
-  vllm::vectorize_with_alignment<vec_size>(
-      smem_group,         // in (shared)
-      group_output,       // out (global quant tensor)
-      group_size,         // elements
-      half_lane_id,       // tid
-      threads_per_group,  // stride
-      scalar_op_quant);   // scalar handler
 }
 
 void per_token_group_quant_8bit(const torch::Tensor& input,
@@ -355,7 +377,7 @@ void per_token_group_quant_8bit_fused(
     // TODO(elvircrn): Removed to fused parameter.
     double max_8bit, bool fused, const torch::Tensor& expert_offsets,
     const torch::Tensor& problem_sizes, bool reorder,
-    const torch::Tensor& a_map, bool scale_ue8m0) {
+    const torch::Tensor& c_map, bool scale_ue8m0) {
   TORCH_CHECK(input.is_contiguous());
   TORCH_CHECK(output_q.is_contiguous());
 
@@ -410,7 +432,7 @@ void per_token_group_quant_8bit_fused(
               (float)max_8bit, num_experts,                                   \
               (int32_t*)expert_offsets.data_ptr(),                            \
               (int32_t*)problem_sizes.data_ptr(), reorder,                    \
-              reorder ? (int32_t*)a_map.data_ptr() : nullptr, scale_num_rows, \
+              reorder ? (int32_t*)c_map.data_ptr() : nullptr, scale_num_rows, \
               topk, (int32_t)output_s.size(0));                               \
     } else {                                                                  \
       per_token_group_quant_8bit_kernel_fused<T, DST_DTYPE, false, false>     \
@@ -421,7 +443,7 @@ void per_token_group_quant_8bit_fused(
               (float)max_8bit, num_experts,                                   \
               (int32_t*)expert_offsets.data_ptr(),                            \
               (int32_t*)problem_sizes.data_ptr(), reorder,                    \
-              reorder ? (int32_t*)a_map.data_ptr() : nullptr, scale_num_rows, \
+              reorder ? (int32_t*)c_map.data_ptr() : nullptr, scale_num_rows, \
               topk, (int32_t)output_s.size(0));                               \
     }                                                                         \
   } while (0)
@@ -444,11 +466,11 @@ void per_token_group_quant_fp8(const torch::Tensor& input,
                                double fp8_max, bool scale_ue8m0, bool fused,
                                const torch::Tensor& expert_offsets,
                                const torch::Tensor& problem_sizes, bool reorder,
-                               const torch::Tensor& a_map) {
+                               const torch::Tensor& c_map) {
   if (fused) {
     per_token_group_quant_8bit_fused(
         input, output_q, output_s, group_size, eps, fp8_min, fp8_max, fused,
-        expert_offsets, problem_sizes, reorder, a_map, scale_ue8m0);
+        expert_offsets, problem_sizes, reorder, c_map, scale_ue8m0);
   } else {
     per_token_group_quant_8bit(input, output_q, output_s, group_size, eps,
                                fp8_min, fp8_max, scale_ue8m0);
