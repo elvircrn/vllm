@@ -133,7 +133,7 @@ __global__ void per_token_group_quant_8bit_kernel_fused(
 
   const int64_t block_group_id = blockIdx.x * groups_per_block;
   const int64_t global_group_id = block_group_id + local_group_id;
-  int64_t scale_id = blockIdx.x * (blockDim.x / threads_per_group) +
+  int32_t scale_id = blockIdx.x * (blockDim.x / threads_per_group) +
                      (threadIdx.x / threads_per_group);
   const int64_t block_group_offset = global_group_id * group_size;
 
@@ -149,25 +149,24 @@ __global__ void per_token_group_quant_8bit_kernel_fused(
   T* smem = reinterpret_cast<T*>(smem_raw);
   T* smem_group = smem + local_group_id * group_size;
 
-  __shared__ int32_t s_expert_offsets[41];
+  __shared__ int32_t s_expert_offsets_scaled[41];
   __shared__ int32_t s_problem_sizes[40];
-  __shared__ int32_t s_c_map[40];
+
+  auto k_scaled = scale_num_rows;
 
   if (num_experts > 2) {
     for (int i = threadIdx.x; i < num_experts - 1; i += blockDim.x) {
-      s_expert_offsets[i] = expert_offsets[i];
+      s_expert_offsets_scaled[i] = expert_offsets[i] * k_scaled;
       s_problem_sizes[i] = problem_sizes[3 * i];
     }
 
     if (!threadIdx.x) {
-      s_expert_offsets[num_experts - 1] = expert_offsets[num_experts - 1];
+      s_expert_offsets_scaled[num_experts - 1] = expert_offsets[num_experts - 1] * k_scaled;
     }
   } else {
     s_problem_sizes[0] = problem_sizes[0];
   }
 
-  auto k_scaled = scale_num_rows;
-  auto _row_id = scale_id / k_scaled;
 
   constexpr int vec_size = 16 / sizeof(T);
 
@@ -202,6 +201,8 @@ __global__ void per_token_group_quant_8bit_kernel_fused(
   };
 
   if (false) {
+    auto _row_id = scale_id / k_scaled;
+
     for (int i = 0; i < topk; i++) {
       auto row_id = c_map[topk * _row_id + i];
 
@@ -238,40 +239,41 @@ __global__ void per_token_group_quant_8bit_kernel_fused(
     auto col_id = scale_id % k_scaled;
 
     if (reorder) {
+      auto _row_id = scale_id / k_scaled;
+
       for (int i = 0; i < topk; i++) {
         auto row_id = c_map[topk * _row_id + i];
         scale_id = row_id * k_scaled + col_id;
 
         // TODO(elvircrn): Wrap this up in a lambda.
-        int64_t expert_idx = 0;
+        int32_t expert_idx = 0;
         int expert_offset_scaled = 0;
         if (num_experts > 2) {
           // Let's not touch any memory if we don't need to.
           for (; expert_idx < num_experts - 1 &&
-                 (s_expert_offsets[expert_idx + 1] * k_scaled) <= scale_id;
+                 (s_expert_offsets_scaled[expert_idx + 1]) <= scale_id;
                expert_idx++) {
                }
-          expert_offset_scaled = s_expert_offsets[expert_idx] * k_scaled;
+          expert_offset_scaled = s_expert_offsets_scaled[expert_idx];
         }
         auto num_tokens = s_problem_sizes[expert_idx];
-        int64_t local_id = scale_id - expert_offset_scaled;
+        int32_t local_id = scale_id - expert_offset_scaled;
         auto t = local_id / k_scaled;  // Untransposed row.
-        static_cast<float*>(
-            output_s)[expert_offset_scaled + col_id * num_tokens + t] = y_s;
+        static_cast<float*>(output_s)[expert_offset_scaled + col_id * num_tokens + t] = y_s;
       }
     } else {
-      int64_t expert_idx = 0;
+      int32_t expert_idx = 0;
       int expert_offset_scaled = 0;
       if (num_experts > 2) {
         // Let's not touch any memory if we don't need to.
         for (; expert_idx < num_experts - 1 &&
-               (s_expert_offsets[expert_idx + 1] * k_scaled) <= scale_id;
+               (s_expert_offsets_scaled[expert_idx + 1]) <= scale_id;
              expert_idx++) {
              }
-        expert_offset_scaled = s_expert_offsets[expert_idx] * k_scaled;
+        expert_offset_scaled = s_expert_offsets_scaled[expert_idx];
       }
       auto num_tokens = s_problem_sizes[expert_idx];
-      int64_t local_id = scale_id - expert_offset_scaled;
+      int32_t local_id = scale_id - expert_offset_scaled;
       auto t = local_id / k_scaled;  // Untransposed row.
       static_cast<float*>(
           output_s)[expert_offset_scaled + col_id * num_tokens + t] = y_s;
