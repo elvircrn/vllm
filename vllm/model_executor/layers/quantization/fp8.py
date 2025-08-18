@@ -1012,6 +1012,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 a2_scale=layer.w2_input_scale,
                 block_shape=self.quant_config.weight_block_size,
                 expert_map=expert_map)
+        # NOTE(elvircrn): Benchmark entry point.
         elif self.allow_cutlass_block_scaled_grouped_gemm:
             from vllm.model_executor.layers.fused_moe.cutlass_moe import (
                 block_scaled_cutlass_moe_fp8)
