@@ -118,24 +118,24 @@ __global__ void per_token_group_quant_8bit_kernel(
       scalar_op_quant);   // scalar handler
 }
 
-template <typename T, typename DST_DTYPE, bool IS_COLUMN_MAJOR = false,
+template <bool REORDER, typename T, typename DST_DTYPE,
           bool SCALE_UE8M0 = false, typename scale_packed_t = float>
 __global__ void per_token_group_quant_8bit_kernel_fused(
-    const T* __restrict__ input, void* __restrict__ output_q,
-    scale_packed_t* __restrict__ output_s, const int group_size,
-    const int num_groups, const int groups_per_block, const float eps,
-    const float min_8bit, const float max_8bit, int64_t num_experts,
-    int32_t* expert_offsets, int32_t* problem_sizes, bool reorder,
-    int32_t* c_map, const int scale_num_rows, int topk, int a_cols) {
+    int32_t num_experts, const T* __restrict__ input,
+    void* __restrict__ output_q, scale_packed_t* __restrict__ output_s,
+    const int group_size, const int groups_per_block, const float eps,
+    const float min_8bit, const float max_8bit, int32_t* expert_offsets,
+    int32_t* problem_sizes, int32_t* c_map, const int scale_num_rows, int topk,
+    int a_cols) {
   static constexpr int threads_per_group = 16;
-  const int64_t local_group_id = threadIdx.x / threads_per_group;
+  const int32_t local_group_id = threadIdx.x / threads_per_group;
   const int half_lane_id = threadIdx.x % threads_per_group;
 
-  const int64_t block_group_id = blockIdx.x * groups_per_block;
-  const int64_t global_group_id = block_group_id + local_group_id;
+  const int32_t block_group_id = blockIdx.x * groups_per_block;
+  const int32_t global_group_id = block_group_id + local_group_id;
   int32_t scale_id = blockIdx.x * (blockDim.x / threads_per_group) +
                      (threadIdx.x / threads_per_group);
-  const int64_t block_group_offset = global_group_id * group_size;
+  const int32_t block_group_offset = global_group_id * group_size;
 
   float local_absmax = eps;
 
@@ -161,12 +161,12 @@ __global__ void per_token_group_quant_8bit_kernel_fused(
     }
 
     if (!threadIdx.x) {
-      s_expert_offsets_scaled[num_experts - 1] = expert_offsets[num_experts - 1] * k_scaled;
+      s_expert_offsets_scaled[num_experts - 1] =
+          expert_offsets[num_experts - 1] * k_scaled;
     }
   } else {
     s_problem_sizes[0] = problem_sizes[0];
   }
-
 
   constexpr int vec_size = 16 / sizeof(T);
 
@@ -200,14 +200,15 @@ __global__ void per_token_group_quant_8bit_kernel_fused(
     dst = DST_DTYPE(q);
   };
 
-  if (reorder) {
+  if constexpr (REORDER) {
     auto _row_id = block_group_offset / a_cols;
 
     for (int i = 0; i < topk; i++) {
       auto row_id = c_map[topk * _row_id + i];
 
       DST_DTYPE* group_output =
- static_cast<DST_DTYPE*>(output_q) + (row_id * a_cols + (block_group_offset % a_cols));
+          static_cast<DST_DTYPE*>(output_q) +
+          (row_id * a_cols + (block_group_offset % a_cols));
       vllm::vectorize_with_alignment<vec_size>(
           smem_group,         // in (shared)
           group_output,       // out (global quant tensor)
@@ -218,7 +219,7 @@ __global__ void per_token_group_quant_8bit_kernel_fused(
     }
   } else {
     DST_DTYPE* group_output =
-     static_cast<DST_DTYPE*>(output_q) + block_group_offset;
+        static_cast<DST_DTYPE*>(output_q) + block_group_offset;
     vllm::vectorize_with_alignment<vec_size>(
         smem_group,         // in (shared)
         group_output,       // out (global quant tensor)
@@ -228,35 +229,14 @@ __global__ void per_token_group_quant_8bit_kernel_fused(
         scalar_op_quant);   // scalar handler
   }
 
-
-  if (half_lane_id == 0) {
-    // Here we find the expert matching elem_id.
-    auto col_id = scale_id % k_scaled;
-
-    if (reorder) {
-      auto _row_id = scale_id / k_scaled;
-
-      for (int i = 0; i < topk; i++) {
-        auto row_id = c_map[topk * _row_id + i];
-        scale_id = row_id * k_scaled + col_id;
-
-        // TODO(elvircrn): Wrap this up in a lambda.
-        int32_t expert_idx = 0;
-        int expert_offset_scaled = 0;
-        if (num_experts > 2) {
-          // Let's not touch any memory if we don't need to.
-          for (; expert_idx < num_experts - 1 &&
-                 (s_expert_offsets_scaled[expert_idx + 1]) <= scale_id;
-               expert_idx++) {
-               }
-          expert_offset_scaled = s_expert_offsets_scaled[expert_idx];
-        }
-        auto num_tokens = s_problem_sizes[expert_idx];
-        int32_t local_id = scale_id - expert_offset_scaled;
-        auto t = local_id / k_scaled;  // Untransposed row.
-        static_cast<float*>(output_s)[expert_offset_scaled + col_id * num_tokens + t] = y_s;
-      }
-    } else {
+  // Here we find the expert matching elem_id.
+  auto col_id = scale_id % k_scaled;
+  if constexpr (REORDER) {
+    auto _row_id = scale_id / k_scaled;
+    for (int i = threadIdx.x % threads_per_group; i < topk;
+         i += threads_per_group) {
+      auto row_id = c_map[topk * _row_id + i];
+      scale_id = row_id * k_scaled + col_id;
       int32_t expert_idx = 0;
       int expert_offset_scaled = 0;
       if (num_experts > 2) {
@@ -264,7 +244,7 @@ __global__ void per_token_group_quant_8bit_kernel_fused(
         for (; expert_idx < num_experts - 1 &&
                (s_expert_offsets_scaled[expert_idx + 1]) <= scale_id;
              expert_idx++) {
-             }
+        }
         expert_offset_scaled = s_expert_offsets_scaled[expert_idx];
       }
       auto num_tokens = s_problem_sizes[expert_idx];
@@ -273,6 +253,22 @@ __global__ void per_token_group_quant_8bit_kernel_fused(
       static_cast<float*>(
           output_s)[expert_offset_scaled + col_id * num_tokens + t] = y_s;
     }
+  } else if (half_lane_id == 0) {
+    int32_t expert_idx = 0;
+    int expert_offset_scaled = 0;
+    if (num_experts > 2) {
+      // Let's not touch any memory if we don't need to.
+      for (; expert_idx < num_experts - 1 &&
+             (s_expert_offsets_scaled[expert_idx + 1]) <= scale_id;
+           expert_idx++) {
+      }
+      expert_offset_scaled = s_expert_offsets_scaled[expert_idx];
+    }
+    auto num_tokens = s_problem_sizes[expert_idx];
+    int32_t local_id = scale_id - expert_offset_scaled;
+    auto t = local_id / k_scaled;  // Untransposed row.
+    static_cast<float*>(
+        output_s)[expert_offset_scaled + col_id * num_tokens + t] = y_s;
   }
 }
 
@@ -315,45 +311,45 @@ void per_token_group_quant_8bit(const torch::Tensor& input,
   const int scale_num_rows = output_s.size(1);  // NOTE(elvircrn): k_scaled?
   const int scale_stride = output_s.stride(1);
 
-#define LAUNCH_KERNEL(T, DST_DTYPE)                                        \
-  do {                                                                     \
-    dim3 grid(num_blocks);                                                 \
-    dim3 block(num_threads);                                               \
-    size_t smem_bytes =                                                    \
-        static_cast<size_t>(groups_per_block) * group_size * sizeof(T);    \
-    if (is_column_major) {                                                 \
-      if (scale_ue8m0) {                                                   \
-        per_token_group_quant_8bit_kernel<T, DST_DTYPE, true, true>        \
-            <<<grid, block, smem_bytes, stream>>>(                         \
-                static_cast<T*>(input.data_ptr()), output_q.data_ptr(),    \
-                static_cast<float*>(output_s.data_ptr()), group_size,      \
-                num_groups, groups_per_block, (float)eps, (float)min_8bit, \
-                (float)max_8bit, scale_num_rows, scale_stride);            \
-      } else {                                                             \
-        per_token_group_quant_8bit_kernel<T, DST_DTYPE, true, false>       \
-            <<<grid, block, smem_bytes, stream>>>(                         \
-                static_cast<T*>(input.data_ptr()), output_q.data_ptr(),    \
-                static_cast<float*>(output_s.data_ptr()), group_size,      \
-                num_groups, groups_per_block, (float)eps, (float)min_8bit, \
-                (float)max_8bit, scale_num_rows, scale_stride);            \
-      }                                                                    \
-    } else {                                                               \
-      if (scale_ue8m0) {                                                   \
-        per_token_group_quant_8bit_kernel<T, DST_DTYPE, false, true>       \
-            <<<grid, block, smem_bytes, stream>>>(                         \
-                static_cast<T*>(input.data_ptr()), output_q.data_ptr(),    \
-                static_cast<float*>(output_s.data_ptr()), group_size,      \
-                num_groups, groups_per_block, (float)eps, (float)min_8bit, \
-                (float)max_8bit);                                          \
-      } else {                                                             \
-        per_token_group_quant_8bit_kernel<T, DST_DTYPE, false, false>      \
-            <<<grid, block, smem_bytes, stream>>>(                         \
-                static_cast<T*>(input.data_ptr()), output_q.data_ptr(),    \
-                static_cast<float*>(output_s.data_ptr()), group_size,      \
-                num_groups, groups_per_block, (float)eps, (float)min_8bit, \
-                (float)max_8bit);                                          \
-      }                                                                    \
-    }                                                                      \
+#define LAUNCH_KERNEL(T, DST_DTYPE)                                         \
+  do {                                                                      \
+    dim3 grid(num_blocks);                                                  \
+    dim3 block(num_threads);                                                \
+    size_t smem_bytes =                                                     \
+        4 * static_cast<size_t>(groups_per_block) * group_size * sizeof(T); \
+    if (is_column_major) {                                                  \
+      if (scale_ue8m0) {                                                    \
+        per_token_group_quant_8bit_kernel<T, DST_DTYPE, true, true>         \
+            <<<grid, block, smem_bytes, stream>>>(                          \
+                static_cast<T*>(input.data_ptr()), output_q.data_ptr(),     \
+                static_cast<float*>(output_s.data_ptr()), group_size,       \
+                num_groups, groups_per_block, (float)eps, (float)min_8bit,  \
+                (float)max_8bit, scale_num_rows, scale_stride);             \
+      } else {                                                              \
+        per_token_group_quant_8bit_kernel<T, DST_DTYPE, true, false>        \
+            <<<grid, block, smem_bytes, stream>>>(                          \
+                static_cast<T*>(input.data_ptr()), output_q.data_ptr(),     \
+                static_cast<float*>(output_s.data_ptr()), group_size,       \
+                num_groups, groups_per_block, (float)eps, (float)min_8bit,  \
+                (float)max_8bit, scale_num_rows, scale_stride);             \
+      }                                                                     \
+    } else {                                                                \
+      if (scale_ue8m0) {                                                    \
+        per_token_group_quant_8bit_kernel<T, DST_DTYPE, false, true>        \
+            <<<grid, block, smem_bytes, stream>>>(                          \
+                static_cast<T*>(input.data_ptr()), output_q.data_ptr(),     \
+                static_cast<float*>(output_s.data_ptr()), group_size,       \
+                num_groups, groups_per_block, (float)eps, (float)min_8bit,  \
+                (float)max_8bit);                                           \
+      } else {                                                              \
+        per_token_group_quant_8bit_kernel<T, DST_DTYPE, false, false>       \
+            <<<grid, block, smem_bytes, stream>>>(                          \
+                static_cast<T*>(input.data_ptr()), output_q.data_ptr(),     \
+                static_cast<float*>(output_s.data_ptr()), group_size,       \
+                num_groups, groups_per_block, (float)eps, (float)min_8bit,  \
+                (float)max_8bit);                                           \
+      }                                                                     \
+    }                                                                       \
   } while (0)
 
   VLLM_DISPATCH_FLOATING_TYPES(
@@ -405,44 +401,64 @@ void per_token_group_quant_8bit_fused(
   const int num_blocks = num_groups / groups_per_block;
   const int num_threads = groups_per_block * THREADS_PER_GROUP;
 
-  const bool is_column_major = output_s.stride(0) < output_s.stride(1);
   const int scale_num_rows = output_s.size(1);  // NOTE(elvircrn): k_scaled?
-  const int scale_stride = output_s.stride(1);
   const int64_t num_experts = expert_offsets.size(0);
 
   int topk = c_map.size(0) / input.size(0);
 
-#define LAUNCH_KERNEL(T, DST_DTYPE)                                           \
-  do {                                                                        \
-    dim3 grid(num_blocks);                                                    \
-    dim3 block(num_threads);                                                  \
-    size_t experts_smem = num_experts > 2 ? (num_experts) : 0;                \
-    size_t smem_bytes =                                                       \
-        (static_cast<size_t>(groups_per_block) * group_size) * \
-        sizeof(T) + ((num_experts + 15) / 16) * sizeof(int);                                                            \
-    if (scale_ue8m0) {                                                        \
-      per_token_group_quant_8bit_kernel_fused<T, DST_DTYPE, false, true>      \
-          <<<grid, block, smem_bytes, stream>>>(                              \
-              static_cast<T*>(input.data_ptr()), output_q.data_ptr(),         \
-              static_cast<float*>(output_s.data_ptr()), group_size,           \
-              num_groups, groups_per_block, (float)eps, (float)min_8bit,      \
-              (float)max_8bit, num_experts,                                   \
-              (int32_t*)expert_offsets.data_ptr(),                            \
-              (int32_t*)problem_sizes.data_ptr(), reorder,                    \
-              reorder ? (int32_t*)c_map.data_ptr() : nullptr, scale_num_rows, \
-              topk, (int32_t)output_q.size(1));                               \
-    } else {                                                                  \
-      per_token_group_quant_8bit_kernel_fused<T, DST_DTYPE, false, false>     \
-          <<<grid, block, smem_bytes, stream>>>(                              \
-              static_cast<T*>(input.data_ptr()), output_q.data_ptr(),         \
-              static_cast<float*>(output_s.data_ptr()), group_size,           \
-              num_groups, groups_per_block, (float)eps, (float)min_8bit,      \
-              (float)max_8bit, num_experts,                                   \
-              (int32_t*)expert_offsets.data_ptr(),                            \
-              (int32_t*)problem_sizes.data_ptr(), reorder,                    \
-              reorder ? (int32_t*)c_map.data_ptr() : nullptr, scale_num_rows, \
-              topk, (int32_t)output_q.size(1));                               \
-    }                                                                         \
+#define LAUNCH_KERNEL(T, DST_DTYPE)                                            \
+  do {                                                                         \
+    dim3 grid(num_blocks);                                                     \
+    dim3 block(num_threads);                                                   \
+    size_t experts_smem = (num_experts > 2 ? (num_experts) : 0) + num_experts; \
+    size_t smem_bytes =                                                        \
+        (static_cast<size_t>(groups_per_block) * group_size) * sizeof(T) +     \
+        experts_smem * sizeof(int32_t);                                        \
+    if (reorder) {                                                             \
+      if (scale_ue8m0) {                                                       \
+        per_token_group_quant_8bit_kernel_fused<true, T, DST_DTYPE, true>      \
+            <<<grid, block, smem_bytes, stream>>>(                             \
+                num_experts, static_cast<T*>(input.data_ptr()),                \
+                output_q.data_ptr(), static_cast<float*>(output_s.data_ptr()), \
+                group_size, groups_per_block, (float)eps, (float)min_8bit,     \
+                (float)max_8bit, (int32_t*)expert_offsets.data_ptr(),          \
+                (int32_t*)problem_sizes.data_ptr(),                            \
+                reorder ? (int32_t*)c_map.data_ptr() : nullptr,                \
+                scale_num_rows, topk, (int32_t)output_q.size(1));              \
+      } else {                                                                 \
+        per_token_group_quant_8bit_kernel_fused<true, T, DST_DTYPE, false>     \
+            <<<grid, block, smem_bytes, stream>>>(                             \
+                num_experts, static_cast<T*>(input.data_ptr()),                \
+                output_q.data_ptr(), static_cast<float*>(output_s.data_ptr()), \
+                group_size, groups_per_block, (float)eps, (float)min_8bit,     \
+                (float)max_8bit, (int32_t*)expert_offsets.data_ptr(),          \
+                (int32_t*)problem_sizes.data_ptr(),                            \
+                reorder ? (int32_t*)c_map.data_ptr() : nullptr,                \
+                scale_num_rows, topk, (int32_t)output_q.size(1));              \
+      }                                                                        \
+    } else {                                                                   \
+      if (scale_ue8m0) {                                                       \
+        per_token_group_quant_8bit_kernel_fused<false, T, DST_DTYPE, true>     \
+            <<<grid, block, smem_bytes, stream>>>(                             \
+                num_experts, static_cast<T*>(input.data_ptr()),                \
+                output_q.data_ptr(), static_cast<float*>(output_s.data_ptr()), \
+                group_size, groups_per_block, (float)eps, (float)min_8bit,     \
+                (float)max_8bit, (int32_t*)expert_offsets.data_ptr(),          \
+                (int32_t*)problem_sizes.data_ptr(),                            \
+                reorder ? (int32_t*)c_map.data_ptr() : nullptr,                \
+                scale_num_rows, topk, (int32_t)output_q.size(1));              \
+      } else {                                                                 \
+        per_token_group_quant_8bit_kernel_fused<false, T, DST_DTYPE, false>    \
+            <<<grid, block, smem_bytes, stream>>>(                             \
+                num_experts, static_cast<T*>(input.data_ptr()),                \
+                output_q.data_ptr(), static_cast<float*>(output_s.data_ptr()), \
+                group_size, groups_per_block, (float)eps, (float)min_8bit,     \
+                (float)max_8bit, (int32_t*)expert_offsets.data_ptr(),          \
+                (int32_t*)problem_sizes.data_ptr(),                            \
+                reorder ? (int32_t*)c_map.data_ptr() : nullptr,                \
+                scale_num_rows, topk, (int32_t)output_q.size(1));              \
+      }                                                                        \
+    }                                                                          \
   } while (0)
 
   VLLM_DISPATCH_FLOATING_TYPES(
