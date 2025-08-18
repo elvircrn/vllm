@@ -118,15 +118,14 @@ __global__ void per_token_group_quant_8bit_kernel(
       scalar_op_quant);   // scalar handler
 }
 
-template <bool REORDER, typename T, typename DST_DTYPE,
+template <int groups_per_block, bool REORDER, typename T, typename DST_DTYPE,
           bool SCALE_UE8M0 = false, typename scale_packed_t = float>
 __global__ void per_token_group_quant_8bit_kernel_fused(
     int32_t num_experts, const T* __restrict__ input,
     void* __restrict__ output_q, scale_packed_t* __restrict__ output_s,
-    const int group_size, const int groups_per_block, const float eps,
-    const float min_8bit, const float max_8bit, int32_t* expert_offsets,
-    int32_t* problem_sizes, int32_t* c_map, const int scale_num_rows, int topk,
-    int a_cols) {
+    const int group_size, const float eps, const float min_8bit,
+    const float max_8bit, int32_t* expert_offsets, int32_t* problem_sizes,
+    int32_t* c_map, const int scale_num_rows, int topk, int a_cols) {
   static constexpr int threads_per_group = 16;
   const int32_t local_group_id = threadIdx.x / threads_per_group;
   const int half_lane_id = threadIdx.x % threads_per_group;
@@ -233,8 +232,8 @@ __global__ void per_token_group_quant_8bit_kernel_fused(
   auto col_id = scale_id % k_scaled;
   if constexpr (REORDER) {
     auto _row_id = scale_id / k_scaled;
-    for (int i = threadIdx.x % threads_per_group; i < topk;
-         i += threads_per_group) {
+    static_assert(threads_per_group == 16);
+    for (int i = threadIdx.x & 0b1111u; i < topk; i += threads_per_group) {
       auto row_id = c_map[topk * _row_id + i];
       scale_id = row_id * k_scaled + col_id;
       int32_t expert_idx = 0;
@@ -384,30 +383,15 @@ void per_token_group_quant_8bit_fused(
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   constexpr int THREADS_PER_GROUP = 16;
-
-  int groups_per_block = 1;
-
-  if (num_groups % 16 == 0) {
-    groups_per_block = 16;
-  } else if (num_groups % 8 == 0) {
-    groups_per_block = 8;
-  } else if (num_groups % 4 == 0) {
-    groups_per_block = 4;
-  } else if (num_groups % 2 == 0) {
-    groups_per_block = 2;
-  }
-
   auto dst_type = output_q.scalar_type();
-  const int num_blocks = num_groups / groups_per_block;
-  const int num_threads = groups_per_block * THREADS_PER_GROUP;
-
-  const int scale_num_rows = output_s.size(1);  // NOTE(elvircrn): k_scaled?
-  const int64_t num_experts = expert_offsets.size(0);
-
-  int topk = c_map.size(0) / input.size(0);
 
 #define LAUNCH_KERNEL(T, DST_DTYPE)                                            \
   do {                                                                         \
+    const int num_blocks = num_groups / groups_per_block;                      \
+    const int num_threads = groups_per_block * THREADS_PER_GROUP;              \
+    const int scale_num_rows = output_s.size(1);                               \
+    const int64_t num_experts = expert_offsets.size(0);                        \
+    int topk = c_map.size(0) / input.size(0);                                  \
     dim3 grid(num_blocks);                                                     \
     dim3 block(num_threads);                                                   \
     size_t experts_smem = (num_experts > 2 ? (num_experts) : 0) + num_experts; \
@@ -416,44 +400,48 @@ void per_token_group_quant_8bit_fused(
         experts_smem * sizeof(int32_t);                                        \
     if (reorder) {                                                             \
       if (scale_ue8m0) {                                                       \
-        per_token_group_quant_8bit_kernel_fused<true, T, DST_DTYPE, true>      \
+        per_token_group_quant_8bit_kernel_fused<groups_per_block, true, T,     \
+                                                DST_DTYPE, true>               \
             <<<grid, block, smem_bytes, stream>>>(                             \
                 num_experts, static_cast<T*>(input.data_ptr()),                \
                 output_q.data_ptr(), static_cast<float*>(output_s.data_ptr()), \
-                group_size, groups_per_block, (float)eps, (float)min_8bit,     \
-                (float)max_8bit, (int32_t*)expert_offsets.data_ptr(),          \
+                group_size, (float)eps, (float)min_8bit, (float)max_8bit,      \
+                (int32_t*)expert_offsets.data_ptr(),                           \
                 (int32_t*)problem_sizes.data_ptr(),                            \
                 reorder ? (int32_t*)c_map.data_ptr() : nullptr,                \
                 scale_num_rows, topk, (int32_t)output_q.size(1));              \
       } else {                                                                 \
-        per_token_group_quant_8bit_kernel_fused<true, T, DST_DTYPE, false>     \
+        per_token_group_quant_8bit_kernel_fused<groups_per_block, true, T,     \
+                                                DST_DTYPE, false>              \
             <<<grid, block, smem_bytes, stream>>>(                             \
                 num_experts, static_cast<T*>(input.data_ptr()),                \
                 output_q.data_ptr(), static_cast<float*>(output_s.data_ptr()), \
-                group_size, groups_per_block, (float)eps, (float)min_8bit,     \
-                (float)max_8bit, (int32_t*)expert_offsets.data_ptr(),          \
+                group_size, (float)eps, (float)min_8bit, (float)max_8bit,      \
+                (int32_t*)expert_offsets.data_ptr(),                           \
                 (int32_t*)problem_sizes.data_ptr(),                            \
                 reorder ? (int32_t*)c_map.data_ptr() : nullptr,                \
                 scale_num_rows, topk, (int32_t)output_q.size(1));              \
       }                                                                        \
     } else {                                                                   \
       if (scale_ue8m0) {                                                       \
-        per_token_group_quant_8bit_kernel_fused<false, T, DST_DTYPE, true>     \
+        per_token_group_quant_8bit_kernel_fused<groups_per_block, false, T,    \
+                                                DST_DTYPE, true>               \
             <<<grid, block, smem_bytes, stream>>>(                             \
                 num_experts, static_cast<T*>(input.data_ptr()),                \
                 output_q.data_ptr(), static_cast<float*>(output_s.data_ptr()), \
-                group_size, groups_per_block, (float)eps, (float)min_8bit,     \
-                (float)max_8bit, (int32_t*)expert_offsets.data_ptr(),          \
+                group_size, (float)eps, (float)min_8bit, (float)max_8bit,      \
+                (int32_t*)expert_offsets.data_ptr(),                           \
                 (int32_t*)problem_sizes.data_ptr(),                            \
                 reorder ? (int32_t*)c_map.data_ptr() : nullptr,                \
                 scale_num_rows, topk, (int32_t)output_q.size(1));              \
       } else {                                                                 \
-        per_token_group_quant_8bit_kernel_fused<false, T, DST_DTYPE, false>    \
+        per_token_group_quant_8bit_kernel_fused<groups_per_block, false, T,    \
+                                                DST_DTYPE, false>              \
             <<<grid, block, smem_bytes, stream>>>(                             \
                 num_experts, static_cast<T*>(input.data_ptr()),                \
                 output_q.data_ptr(), static_cast<float*>(output_s.data_ptr()), \
-                group_size, groups_per_block, (float)eps, (float)min_8bit,     \
-                (float)max_8bit, (int32_t*)expert_offsets.data_ptr(),          \
+                group_size, (float)eps, (float)min_8bit, (float)max_8bit,      \
+                (int32_t*)expert_offsets.data_ptr(),                           \
                 (int32_t*)problem_sizes.data_ptr(),                            \
                 reorder ? (int32_t*)c_map.data_ptr() : nullptr,                \
                 scale_num_rows, topk, (int32_t)output_q.size(1));              \
@@ -461,14 +449,57 @@ void per_token_group_quant_8bit_fused(
     }                                                                          \
   } while (0)
 
-  VLLM_DISPATCH_FLOATING_TYPES(
-      input.scalar_type(), "per_token_group_quant_8bit", ([&] {
-        if (dst_type == at::ScalarType::Float8_e4m3fn) {
-          LAUNCH_KERNEL(scalar_t, c10::Float8_e4m3fn);
-        } else if (dst_type == at::ScalarType::Char) {
-          LAUNCH_KERNEL(scalar_t, int8_t);
-        }
-      }));
+  if (num_groups % 16 == 0) {
+    static constexpr int groups_per_block = 16;
+    VLLM_DISPATCH_FLOATING_TYPES(
+        input.scalar_type(), "per_token_group_quant_8bit", ([&] {
+          if (dst_type == at::ScalarType::Float8_e4m3fn) {
+            LAUNCH_KERNEL(scalar_t, c10::Float8_e4m3fn);
+          } else if (dst_type == at::ScalarType::Char) {
+            LAUNCH_KERNEL(scalar_t, int8_t);
+          }
+        }));
+  } else if (num_groups % 8 == 0) {
+    static constexpr int groups_per_block = 8;
+    VLLM_DISPATCH_FLOATING_TYPES(
+        input.scalar_type(), "per_token_group_quant_8bit", ([&] {
+          if (dst_type == at::ScalarType::Float8_e4m3fn) {
+            LAUNCH_KERNEL(scalar_t, c10::Float8_e4m3fn);
+          } else if (dst_type == at::ScalarType::Char) {
+            LAUNCH_KERNEL(scalar_t, int8_t);
+          }
+        }));
+  } else if (num_groups % 4 == 0) {
+    static constexpr int groups_per_block = 4;
+    VLLM_DISPATCH_FLOATING_TYPES(
+        input.scalar_type(), "per_token_group_quant_8bit", ([&] {
+          if (dst_type == at::ScalarType::Float8_e4m3fn) {
+            LAUNCH_KERNEL(scalar_t, c10::Float8_e4m3fn);
+          } else if (dst_type == at::ScalarType::Char) {
+            LAUNCH_KERNEL(scalar_t, int8_t);
+          }
+        }));
+  } else if (num_groups % 2 == 0) {
+    static constexpr int groups_per_block = 2;
+    VLLM_DISPATCH_FLOATING_TYPES(
+        input.scalar_type(), "per_token_group_quant_8bit", ([&] {
+          if (dst_type == at::ScalarType::Float8_e4m3fn) {
+            LAUNCH_KERNEL(scalar_t, c10::Float8_e4m3fn);
+          } else if (dst_type == at::ScalarType::Char) {
+            LAUNCH_KERNEL(scalar_t, int8_t);
+          }
+        }));
+  } else {
+    static constexpr int groups_per_block = 1;
+    VLLM_DISPATCH_FLOATING_TYPES(
+        input.scalar_type(), "per_token_group_quant_8bit", ([&] {
+          if (dst_type == at::ScalarType::Float8_e4m3fn) {
+            LAUNCH_KERNEL(scalar_t, c10::Float8_e4m3fn);
+          } else if (dst_type == at::ScalarType::Char) {
+            LAUNCH_KERNEL(scalar_t, int8_t);
+          }
+        }));
+  }
 
 #undef LAUNCH_KERNEL
 }

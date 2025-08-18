@@ -307,6 +307,9 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     "csrc/attention/mla/cutlass_mla_entry.cu"
     "csrc/quantization/fp8/per_token_group_quant.cu")
 
+  list(APPEND VLLM_GPU_FLAGS "-lineinfo")
+
+
   set_gencode_flags_for_srcs(
     SRCS "${VLLM_EXT_SRC}"
     CUDA_ARCHS "${CUDA_ARCHS}")
