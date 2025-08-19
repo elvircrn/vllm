@@ -470,9 +470,9 @@ def run_benchmarks(verbose: bool = False):
         (4096, 7168, 2048),
     ]
     shapes = [
-        (4096, 7168, 16384),
+        (64, 7168, 2048),
     ]
-    num_experts = [8]
+    num_experts = [8, 40]
     topks = [1, 6, 8]
 
     all_results = []

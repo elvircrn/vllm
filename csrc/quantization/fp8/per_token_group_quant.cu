@@ -224,23 +224,25 @@ __global__ void per_token_group_quant_8bit_kernel_fused(
 
   auto parallel_search = [&](int32_t scale_id) {
     int32_t _expert_idx = half_lane_id;
-    int32_t expert_offset_scaled = 0;
-    int32_t expert_idx_base = 0;
+    int32_t next_expert_offset;
+
     // Let's not touch any memory if we don't need to.
     for (; _expert_idx < num_experts - 1 &&
-           (s_expert_offsets_scaled[_expert_idx + 1]) <= scale_id;
+           (next_expert_offset = s_expert_offsets_scaled[_expert_idx + 1]) <= scale_id;
          _expert_idx += threads_per_group) {
-      expert_idx_base += threads_per_group;
          }
+
     bool pred = (_expert_idx < num_experts - 1) && s_expert_offsets_scaled[_expert_idx] <= scale_id &&
            scale_id < s_expert_offsets_scaled[_expert_idx + 1];
+
     auto predicate_mask = __ballot_sync(0xffffffffu, pred);
+
     predicate_mask = (predicate_mask >> ((local_group_id & 0b1u) * 16u)) & 0xffffu;
     auto expert_idx = __ffs(predicate_mask) - 1;
     if (half_lane_id == expert_idx && predicate_mask) {
       _expert_idx = (_expert_idx / threads_per_group) * threads_per_group + expert_idx;
-      expert_offset_scaled = s_expert_offsets_scaled[_expert_idx];
-      auto num_tokens = (s_expert_offsets_scaled[_expert_idx + 1] - expert_offset_scaled) / scale_num_rows;
+      int32_t expert_offset_scaled = s_expert_offsets_scaled[_expert_idx];
+      auto num_tokens = (next_expert_offset - expert_offset_scaled) / scale_num_rows;
       int32_t local_id = scale_id - expert_offset_scaled;
       auto t = local_id / scale_num_rows;  // Untransposed row.
       static_cast<float*>(
