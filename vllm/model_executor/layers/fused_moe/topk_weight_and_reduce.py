@@ -85,8 +85,10 @@ class TopKWeightAndReduceContiguous(mk.TopKWeightAndReduce):
             f"Expected fused_expert_output size {(m, num_topk, k)}. But got "
             f"{fused_expert_output.size()}")
 
+        print(f'feo.shape = {fused_expert_output.shape}\ntkw = {topk_weights.shape}')
+
         if not apply_router_weight_on_input:
-            # NOTE(elvircrn): Get rid of this.
+            # NOTE(elvircrn): Get rid of this. mul_
             fused_expert_output.mul_(topk_weights.view(m, -1, 1))
 
         if output is None:
