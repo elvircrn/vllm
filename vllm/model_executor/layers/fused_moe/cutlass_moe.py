@@ -1091,6 +1091,7 @@ def block_scaled_cutlass_moe_fp8(
     out_dtype = a.dtype
 
     fn = mk.FusedMoEModularKernel(
+        # NOTE(elvircrn): bwell starts here.. ?
         MoEPrepareAndFinalizeNoEP(),
         CutlassExpertsBlockedFp8(
             max_experts_per_worker=global_num_experts,

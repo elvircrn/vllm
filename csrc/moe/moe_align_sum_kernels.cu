@@ -111,8 +111,9 @@ __global__ void moe_sum_kernel(
     scalar_t* __restrict__ out,          // [..., d]
     const scalar_t* __restrict__ input,  // [..., topk, d]
     const int d) {
-  const int64_t token_idx = blockIdx.x;
-  for (int64_t idx = threadIdx.x; idx < d; idx += blockDim.x) {
+  // printf("elvircrn: Am I getting called?");
+  const uint32_t token_idx = blockIdx.x;
+  for (uint32_t idx = threadIdx.x; idx < d; idx += blockDim.x) {
     scalar_t x = 0.0;
 #pragma unroll
     for (int k = 0; k < TOPK; ++k) {

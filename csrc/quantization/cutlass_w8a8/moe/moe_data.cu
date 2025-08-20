@@ -76,7 +76,6 @@ __global__ void compute_expert_blockscale_offsets(
   }
 }
 
-template<int SHOULD_FUSE>
 __global__ void compute_arg_sorts(const int32_t* __restrict__ topk_ids,
                                   const int32_t* __restrict__ expert_offsets,
                                   int32_t* input_permutation,
@@ -150,25 +149,13 @@ void get_cutlass_moe_mm_data_caller(
         static_cast<int32_t*>(atomic_buffer.data_ptr()), num_experts, swap_ab);
   }
 
-  if (should_fuse) {
-    // NOTE(elvircrn)
-    compute_arg_sorts<true><<<num_experts, num_threads, 0, stream>>>(
+    compute_arg_sorts<<<num_experts, num_threads, 0, stream>>>(
         static_cast<const int32_t*>(topk_ids.data_ptr()),
         static_cast<const int32_t*>(expert_offsets.data_ptr()),
         static_cast<int32_t*>(input_permutation.data_ptr()),
         static_cast<int32_t*>(output_permutation.data_ptr()),
         static_cast<int32_t*>(atomic_buffer.data_ptr()), topk_ids.numel(),
         topk_ids.size(1));
-  } else {
-    // NOTE(elvircrn)
-    compute_arg_sorts<false><<<num_experts, num_threads, 0, stream>>>(
-        static_cast<const int32_t*>(topk_ids.data_ptr()),
-        static_cast<const int32_t*>(expert_offsets.data_ptr()),
-        static_cast<int32_t*>(input_permutation.data_ptr()),
-        static_cast<int32_t*>(output_permutation.data_ptr()),
-        static_cast<int32_t*>(atomic_buffer.data_ptr()), topk_ids.numel(),
-        topk_ids.size(1));
-  }
 }
 
 __global__ void compute_pplx_data(int32_t* expert_offsets,

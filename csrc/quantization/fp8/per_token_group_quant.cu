@@ -189,11 +189,45 @@ __global__ void per_token_group_quant_8bit_kernel_fused(
     dst = DST_DTYPE(q);
   };
 
+
+  // Here we find the expert matching elem_id.
+  static_assert(threads_per_group == 16);
+
+  auto parallel_search = [&](int32_t scale_id, int32_t col_id) {
+    int32_t _expert_idx = half_lane_id;
+    int32_t next_expert_offset{};
+
+    // Let's not touch any memory if we don't need to.
+    for (; _expert_idx < num_experts - 1 &&
+           (next_expert_offset = s_expert_offsets_scaled[_expert_idx + 1]) <= scale_id;
+         _expert_idx += threads_per_group) {
+         }
+
+    int32_t current_expert_offset = s_expert_offsets_scaled[_expert_idx];
+
+    bool pred = (_expert_idx < num_experts - 1) && current_expert_offset <= scale_id;
+
+    auto predicate_mask = __ballot_sync(0xffffffffu, pred);
+
+    predicate_mask = (predicate_mask >> ((local_group_id & 0b1u) * 16u)) & 0xffffu;
+    auto expert_idx = __ffs(predicate_mask) - 1;
+    if (half_lane_id == expert_idx && predicate_mask) {
+      _expert_idx = (_expert_idx / threads_per_group) * threads_per_group + expert_idx;
+      auto num_tokens = (next_expert_offset - current_expert_offset) / scale_num_rows;
+      int32_t local_id = scale_id - current_expert_offset;
+      auto t = local_id / scale_num_rows;  // Untransposed row.
+      static_cast<float*>(
+          output_s)[current_expert_offset + col_id * num_tokens + t] = y_s;
+    }
+  };
+  auto col_id = scale_id % scale_num_rows;
+
   if constexpr (REORDER) {
     auto _row_id = block_group_offset / a_cols;
+    auto c_map_ptr = c_map + topk * _row_id;
 
     for (int i = 0; i < topk; i++) {
-      auto row_id = c_map[topk * _row_id + i];
+      auto row_id = c_map_ptr[i];
 
       DST_DTYPE* group_output =
           static_cast<DST_DTYPE*>(output_q) +
@@ -205,6 +239,9 @@ __global__ void per_token_group_quant_8bit_kernel_fused(
           half_lane_id,       // tid
           threads_per_group,  // stride
           scalar_op_quant);   // scalar handler
+
+      scale_id = row_id * scale_num_rows + col_id;
+      parallel_search(scale_id, col_id);
     }
   } else {
     DST_DTYPE* group_output =
@@ -216,49 +253,7 @@ __global__ void per_token_group_quant_8bit_kernel_fused(
         half_lane_id,       // tid
         threads_per_group,  // stride
         scalar_op_quant);   // scalar handler
-  }
-
-  // Here we find the expert matching elem_id.
-  static_assert(threads_per_group == 16);
-  auto col_id = scale_id % scale_num_rows;
-
-  auto parallel_search = [&](int32_t scale_id) {
-    int32_t _expert_idx = half_lane_id;
-    int32_t next_expert_offset;
-
-    // Let's not touch any memory if we don't need to.
-    for (; _expert_idx < num_experts - 1 &&
-           (next_expert_offset = s_expert_offsets_scaled[_expert_idx + 1]) <= scale_id;
-         _expert_idx += threads_per_group) {
-         }
-
-    bool pred = (_expert_idx < num_experts - 1) && s_expert_offsets_scaled[_expert_idx] <= scale_id &&
-           scale_id < s_expert_offsets_scaled[_expert_idx + 1];
-
-    auto predicate_mask = __ballot_sync(0xffffffffu, pred);
-
-    predicate_mask = (predicate_mask >> ((local_group_id & 0b1u) * 16u)) & 0xffffu;
-    auto expert_idx = __ffs(predicate_mask) - 1;
-    if (half_lane_id == expert_idx && predicate_mask) {
-      _expert_idx = (_expert_idx / threads_per_group) * threads_per_group + expert_idx;
-      int32_t expert_offset_scaled = s_expert_offsets_scaled[_expert_idx];
-      auto num_tokens = (next_expert_offset - expert_offset_scaled) / scale_num_rows;
-      int32_t local_id = scale_id - expert_offset_scaled;
-      auto t = local_id / scale_num_rows;  // Untransposed row.
-      static_cast<float*>(
-          output_s)[expert_offset_scaled + col_id * num_tokens + t] = y_s;
-    }
-  };
-
-  if constexpr (REORDER) {
-    auto _row_id = scale_id / scale_num_rows;
-    for (int32_t i = 0; i < topk; i++) {
-      auto row_id = c_map[topk * _row_id + i];
-      scale_id = row_id * scale_num_rows + col_id;
-      parallel_search(scale_id);
-    }
-  } else {
-    parallel_search(scale_id);
+    parallel_search(scale_id, col_id);
   }
 }
 

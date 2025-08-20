@@ -86,6 +86,7 @@ class TopKWeightAndReduceContiguous(mk.TopKWeightAndReduce):
             f"{fused_expert_output.size()}")
 
         if not apply_router_weight_on_input:
+            # NOTE(elvircrn): Get rid of this.
             fused_expert_output.mul_(topk_weights.view(m, -1, 1))
 
         if output is None:
@@ -95,6 +96,7 @@ class TopKWeightAndReduceContiguous(mk.TopKWeightAndReduce):
         assert output.size() == (m, k), (
             f"Expected output size {(m, k)}. But got {output.size()}")
 
+        # NOTE(elvircrn): Fuse here??
         ops.moe_sum(fused_expert_output, output)
         return output
 

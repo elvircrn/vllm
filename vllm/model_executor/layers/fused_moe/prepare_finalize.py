@@ -73,6 +73,7 @@ class MoEPrepareAndFinalizeNoEP(mk.FusedMoEPrepareAndFinalize):
         else:
             if isinstance(weight_and_reduce_impl, TopKWeightAndReduceDelegate):
                 weight_and_reduce_impl = TopKWeightAndReduceContiguous()
+            # NOTE(elvircrn): Bwell stuff starts here.
             weight_and_reduce_impl.apply(
                 output=output,
                 fused_expert_output=fused_expert_output,
