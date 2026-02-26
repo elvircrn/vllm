@@ -242,9 +242,41 @@ class QuantFP8(CustomOp):
         x_quant = x_quant.view(orig_shape)
 
         scales = scales.squeeze(-1)
-        scales = scales.reshape(orig_shape[:-1] + (num_groups,))
+        # scales: [mn, num_groups], dtype float32
 
-        if self.column_major_scales:
-            scales = scales.transpose(-2, -1).contiguous().transpose(-1, -2)
+        if self.use_ue8m0:
+            # Pack FP32 power-of-2 scales into int32 UE8M0 format
+            # to skip DeepGEMM's pack_fp32_into_ue8m0 kernel at runtime.
+            mn = scales.shape[0]
+            scale_bits = scales.view(torch.int32)
+
+            # Pad num_groups to multiple of 4 for packing
+            num_groups_k = scale_bits.shape[-1]
+            if num_groups_k % 4 != 0:
+                pad_size = 4 - (num_groups_k % 4)
+                scale_bits = F.pad(scale_bits, (0, pad_size), value=0)
+
+            num_packed_k = scale_bits.shape[-1] // 4
+            scale_bits = scale_bits.view(mn, num_packed_k, 4)
+
+            # Pack 4 UE8M0 exponents per int32
+            # (matches deep_gemm::pack_fp32_into_ue8m0 in smxx_layout.cuh)
+            packed = (
+                (scale_bits[..., 0] >> 23)
+                | (scale_bits[..., 1] >> 15)
+                | (scale_bits[..., 2] >> 7)
+                | (scale_bits[..., 3] << 1)
+            )
+
+            # TMA-aligned column-major (MN-major) layout:
+            # shape (mn, num_packed_k), stride (1, align(mn, 4))
+            tma_aligned_mn = ((mn + 3) // 4) * 4
+            buf = packed.new_zeros(num_packed_k, tma_aligned_mn)
+            buf[:, :mn] = packed.t()
+            scales = buf.t()[:mn, :]
+        else:
+            scales = scales.reshape(orig_shape[:-1] + (num_groups,))
+            if self.column_major_scales:
+                scales = scales.transpose(-2, -1).contiguous().transpose(-1, -2)
 
         return x_quant, scales
