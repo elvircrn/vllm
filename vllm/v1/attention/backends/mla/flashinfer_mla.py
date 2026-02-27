@@ -5,8 +5,7 @@ from typing import ClassVar
 
 import torch
 from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
-from flashinfer.rope import mla_rope_quantize_fp8
-
+from vllm._custom_ops import mla_rope_quantize_fp8
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import (
@@ -166,8 +165,8 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Fused RoPE + FP8 quantization for Q and K.
 
-        Uses flashinfer.rope.mla_rope_quantize_fp8 to apply RoPE and quantize
-        in a single fused kernel for better performance.
+        Uses vLLM's in-tree mla_rope_quantize_fp8 kernel (yanked from
+        FlashInfer) to apply RoPE and quantize in a single fused kernel.
 
         Args:
             ql_nope: Projected q_nope. Shape: [B, N, L] where L = kv_lora_rank.
@@ -197,25 +196,26 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
         k_nope_out = k_nope.new_empty(k_nope.shape, dtype=attn_dtype)
         k_pe_out = k_pe.new_empty(k_pe.shape, dtype=attn_dtype)
 
-        # flashinfer requires cos_sin_cache to be float32
-        cos_sin_cache_f32 = self.rotary_emb.cos_sin_cache.float()
+        # cos_sin_cache is passed directly (kernel handles bf16->f32 internally
+        # via vec_t::cast_load, eliminating the per-layer .float() copy)
+        cos_sin_cache = self.rotary_emb.cos_sin_cache
 
-        # Call fused kernel - applies RoPE and FP8 quant to both Q and K
+        # Call vLLM's in-tree fused kernel
         mla_rope_quantize_fp8(
-            q_rope=q_pe,
-            k_rope=k_pe,
-            q_nope=ql_nope,
-            k_nope=k_nope,
-            cos_sin_cache=cos_sin_cache_f32,
-            pos_ids=positions,
-            is_neox=False,  # MLA uses GPT-J style RoPE
-            quantize_dtype=attn_dtype,
-            q_rope_out=q_out[..., L:],  # RoPE portion goes after nope
-            q_nope_out=q_out[..., :L],  # nope portion goes first
-            k_rope_out=k_pe_out,
-            k_nope_out=k_nope_out,
-            quant_scale_q=q_scale,
-            quant_scale_kv=k_scale,
+            q_pe,                # q_rope_in
+            k_pe,                # k_rope_in
+            ql_nope,             # q_nope_in
+            k_nope,              # k_nope_in
+            q_out[..., L:],      # q_rope_out (RoPE portion after nope)
+            k_pe_out,            # k_rope_out
+            q_out[..., :L],      # q_nope_out (nope portion first)
+            k_nope_out,          # k_nope_out
+            cos_sin_cache,       # cos_sin_cache (bf16 OK, no .float() needed)
+            positions,           # pos_ids
+            q_scale,             # quant_scale_q
+            k_scale,             # quant_scale_kv
+            False,               # interleave (MLA uses GPT-J style RoPE)
+            False,               # enable_pdl
         )
 
         return q_out, k_nope_out, k_pe_out

@@ -147,6 +147,18 @@ void rotary_embedding(torch::Tensor& positions, torch::Tensor& query,
                       std::optional<torch::Tensor> key, int64_t head_size,
                       torch::Tensor& cos_sin_cache, bool is_neox);
 
+void mla_rope_quantize_fp8(torch::Tensor& q_rope_in, torch::Tensor& k_rope_in,
+                           torch::Tensor& q_nope_in,
+                           torch::Tensor& k_nope_in,
+                           torch::Tensor& q_rope_out,
+                           torch::Tensor& k_rope_out,
+                           torch::Tensor& q_nope_out,
+                           torch::Tensor& k_nope_out,
+                           torch::Tensor& cos_sin_cache,
+                           torch::Tensor& pos_ids, double quant_scale_q,
+                           double quant_scale_kv, bool interleave,
+                           bool enable_pdl);
+
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 
 void silu_and_mul_quant(torch::Tensor& out, torch::Tensor& input,
