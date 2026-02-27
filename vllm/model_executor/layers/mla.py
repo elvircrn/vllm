@@ -111,6 +111,42 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         self.prefix = prefix
 
+        # Fused RMSNorm + FP8 quant for q_b_proj: eliminates 3 separate
+        # kernels (rmsnorm, quant reduction, quant pointwise) and the
+        # DeepGEMM pack_fp32_into_ue8m0 kernel.
+        self._use_fused_rmsnorm_quant = (
+            self.q_lora_rank is not None
+            and self.q_a_layernorm is not None
+            and self.q_b_proj is not None
+            and hasattr(self.q_b_proj, "weight_scale_inv")
+        )
+
+    def _fused_q_b_proj(self, q_c: torch.Tensor) -> torch.Tensor:
+        """Fused RMSNorm + FP8 quant + DeepGEMM for q_b_proj."""
+        from vllm.model_executor.layers.quantization.fused_rmsnorm_quant import (
+            fused_rmsnorm_fp8_quant_ue8m0,
+        )
+
+        q_c_2d = q_c.view(-1, q_c.shape[-1])
+        q_quant, q_scale = fused_rmsnorm_fp8_quant_ue8m0(
+            q_c_2d,
+            self.q_a_layernorm.weight,
+            eps=self.q_a_layernorm.variance_epsilon,
+            group_size=128,
+        )
+        weight = self.q_b_proj.weight
+        weight_scale = self.q_b_proj.weight_scale_inv
+        output = torch.empty(
+            q_quant.shape[0],
+            weight.shape[0],
+            dtype=torch.bfloat16,
+            device=q_c.device,
+        )
+        torch.ops.vllm.fp8_gemm_nt_op(
+            q_quant, q_scale, weight, weight_scale, output, True
+        )
+        return output.to(q_c.dtype)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -136,8 +172,11 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 dim=-1,
             )
-            q_c = self.q_a_layernorm(q_c)
-            q = self.q_b_proj(q_c)[0]
+            if self._use_fused_rmsnorm_quant:
+                q = self._fused_q_b_proj(q_c)
+            else:
+                q_c = self.q_a_layernorm(q_c)
+                q = self.q_b_proj(q_c)[0]
         else:
             assert self.kv_a_proj_with_mqa is not None, (
                 "kv_a_proj_with_mqa is required when q_lora_rank is None"
