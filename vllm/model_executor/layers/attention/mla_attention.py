@@ -709,9 +709,26 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             if use_fused_decode:
                 # Fused RoPE + cache write path: applies RoPE to Q and K
                 # and writes K to the KV cache in a single kernel call.
+                # When fp8_attention, also fuses Q cat+FP8 quantization.
                 decode_k_c = k_c_normed[:num_mqa_tokens]
                 decode_k_pe = k_pe[:num_mqa_tokens]
                 decode_positions = positions[:num_mqa_tokens]
+
+                # Prepare optional Q FP8 quantization outputs
+                fused_q_quant = (
+                    fp8_attention
+                    and self.impl.supports_quant_query_input
+                )
+                if fused_q_quant:
+                    fp8_dtype = current_platform.fp8_dtype()
+                    q_out = mqa_q_pe.new_empty(
+                        mqa_q_pe.shape[0],
+                        mqa_q_pe.shape[1],
+                        self.kv_lora_rank + mqa_q_pe.shape[2],
+                        dtype=fp8_dtype,
+                    )
+                else:
+                    q_out = None
 
                 if kv_cache.numel() > 0:
                     ops.concat_and_cache_mla_rope_fused(
@@ -726,14 +743,20 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                         kv_cache,
                         self.kv_cache_dtype,
                         self._k_scale,
+                        ql_nope=mqa_ql_nope if fused_q_quant else None,
+                        q_out=q_out,
+                        q_scale=self._q_scale if fused_q_quant else None,
                     )
                 else:
                     # Fallback: apply RoPE without cache write
                     mqa_q_pe, decode_k_pe = self.impl.rotary_emb(
                         decode_positions, mqa_q_pe, decode_k_pe)
+                    # Q quant must also fall back since kernel wasn't called
+                    fused_q_quant = False
 
-                # Quantize Q to FP8 if the attention kernel requires it
-                if fp8_attention and self.impl.supports_quant_query_input:
+                if fused_q_quant:
+                    mqa_q = q_out
+                elif fp8_attention and self.impl.supports_quant_query_input:
                     mqa_q = self._decode_concat_quant_fp8_op(
                         mqa_ql_nope, mqa_q_pe, self._q_scale)
                 else:

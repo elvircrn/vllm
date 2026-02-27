@@ -2458,6 +2458,9 @@ def concat_and_cache_mla_rope_fused(
     kv_cache: torch.Tensor,
     kv_cache_dtype: str,
     kv_cache_scale: torch.Tensor,
+    ql_nope: torch.Tensor | None = None,
+    q_out: torch.Tensor | None = None,
+    q_scale: torch.Tensor | None = None,
 ) -> None:
     torch.ops._C_cache_ops.concat_and_cache_mla_rope_fused(
         positions,
@@ -2470,6 +2473,9 @@ def concat_and_cache_mla_rope_fused(
         kv_cache,
         kv_cache_dtype,
         kv_cache_scale,
+        ql_nope,
+        q_out,
+        q_scale,
     )
 
 

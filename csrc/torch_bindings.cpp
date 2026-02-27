@@ -732,6 +732,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
   cache_ops.impl("concat_and_cache_mla", torch::kCUDA, &concat_and_cache_mla);
 
   // Rotate Q and K, then write to kv cache for MLA
+  // Optionally quantizes Q (cat ql_nope + q_pe_roped) to FP8 into q_out
   cache_ops.def(
       "concat_and_cache_mla_rope_fused("
       "                     Tensor positions,"
@@ -743,7 +744,10 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
       "                     Tensor slot_mapping,"
       "                     Tensor! kv_cache,"
       "                     str kv_cache_dtype,"
-      "                     Tensor kv_cache_scale) -> ()");
+      "                     Tensor kv_cache_scale,"
+      "                     Tensor? ql_nope=None,"
+      "                     Tensor!? q_out=None,"
+      "                     Tensor? q_scale=None) -> ()");
   cache_ops.impl("concat_and_cache_mla_rope_fused", torch::kCUDA,
                  &concat_and_cache_mla_rope_fused);
 
