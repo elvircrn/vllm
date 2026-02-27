@@ -328,6 +328,40 @@ def rotary_embedding(
     )
 
 
+def mla_rope_quantize_fp8(
+    q_rope_in: torch.Tensor,
+    k_rope_in: torch.Tensor,
+    q_nope_in: torch.Tensor,
+    k_nope_in: torch.Tensor,
+    q_rope_out: torch.Tensor,
+    k_rope_out: torch.Tensor,
+    q_nope_out: torch.Tensor,
+    k_nope_out: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    pos_ids: torch.Tensor,
+    quant_scale_q: float,
+    quant_scale_kv: float,
+    interleave: bool,
+    enable_pdl: bool,
+) -> None:
+    torch.ops._C.mla_rope_quantize_fp8(
+        q_rope_in,
+        k_rope_in,
+        q_nope_in,
+        k_nope_in,
+        q_rope_out,
+        k_rope_out,
+        q_nope_out,
+        k_nope_out,
+        cos_sin_cache,
+        pos_ids,
+        quant_scale_q,
+        quant_scale_kv,
+        interleave,
+        enable_pdl,
+    )
+
+
 # layer norm ops
 def rms_norm(
     out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor, epsilon: float

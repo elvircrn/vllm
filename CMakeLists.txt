@@ -288,6 +288,7 @@ set(VLLM_EXT_SRC
   "csrc/attention/merge_attn_states.cu"
   "csrc/attention/vertical_slash_index.cu"
   "csrc/pos_encoding_kernels.cu"
+  "csrc/mla_rope_quant.cu"
   "csrc/activation_kernels.cu"
   "csrc/layernorm_kernels.cu"
   "csrc/fused_qknorm_rope_kernel.cu"
