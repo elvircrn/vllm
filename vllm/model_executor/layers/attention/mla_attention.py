@@ -544,12 +544,13 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         if positions is not None:
             positions = positions[:attn_metadata.num_actual_tokens]
 
-        use_fused = (
-            fp8_attention
-            and getattr(self.impl, "use_fused_rope_quant", False)
+        _has_fused = (
+            getattr(self.impl, "use_fused_rope_quant", False)
             and getattr(self.impl, "rotary_emb", None) is not None
             and positions is not None
         )
+        use_fused_prefill = _has_fused and envs.VLLM_MLA_FUSED_ROPE_PREFILL
+        use_fused_decode = _has_fused and envs.VLLM_MLA_FUSED_ROPE_DECODE
 
         num_actual_toks = attn_metadata.num_actual_tokens
 
@@ -560,7 +561,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         k_c_normed = k_c_normed[:num_actual_toks, ...]
         k_pe = k_pe[:num_actual_toks, ...]
 
-        if not use_fused:
+        if not (use_fused_prefill or use_fused_decode):
             # Original path: RoPE was applied upfront, write ALL tokens
             if kv_cache.numel() > 0:
                 ops.concat_and_cache_mla(
@@ -574,8 +575,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
             if fp8_attention and self.kv_cache_dtype != "fp8_ds_mla":
                 kv_cache = kv_cache.view(current_platform.fp8_dtype())
-        # When use_fused: cache writes happen per-section below
-        # (prefill after normal RoPE, decode after fused RoPE+quant)
+        # When use_fused_*: cache writes happen per-section below
 
         # Sparse MLA impls only support forward_mqa (decode-style attention)
         is_sparse_impl = isinstance(self.impl, SparseMLAAttentionImpl)
@@ -593,33 +593,40 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             num_mha_tokens = q.size(0) - num_mqa_tokens
 
         if num_mha_tokens > 0:
-            if use_fused:
-                # Fused path: RoPE was NOT applied upfront, apply to
-                # prefill tokens here and write to cache separately.
+            if use_fused_prefill:
+                # Fused path: RoPE was NOT applied upfront.
+                # Use fused kernel for RoPE + cache write in one launch.
                 prefill_q = q[num_mqa_tokens:]
                 prefill_k_pe = k_pe[num_mqa_tokens:]
                 prefill_positions = positions[num_mqa_tokens:]
 
                 prefill_q_nope = prefill_q[
                     ..., :self.qk_nope_head_dim]
+                # Slice into q_pe — fused kernel applies RoPE in-place
                 prefill_q_pe = prefill_q[
                     ..., self.qk_nope_head_dim:]
-                prefill_q_pe, prefill_k_pe = self.impl.rotary_emb(
-                    prefill_positions, prefill_q_pe, prefill_k_pe)
-                prefill_q = torch.cat(
-                    [prefill_q_nope, prefill_q_pe], dim=-1)
 
-                # Write prefill tokens to cache (after RoPE)
                 if kv_cache.numel() > 0:
-                    ops.concat_and_cache_mla(
-                        k_c_normed[num_mqa_tokens:],
+                    ops.concat_and_cache_mla_rope_fused(
+                        prefill_positions,
+                        prefill_q_pe,
                         prefill_k_pe.squeeze(1),
-                        kv_cache,
+                        k_c_normed[num_mqa_tokens:],
+                        self.impl.rotary_emb.cos_sin_cache,
+                        self.impl.rotary_emb.is_neox_style,
                         attn_metadata.slot_mapping[
                             num_mqa_tokens:].flatten(),
-                        kv_cache_dtype=self.kv_cache_dtype,
-                        scale=self._k_scale,
+                        kv_cache,
+                        self.kv_cache_dtype,
+                        self._k_scale,
                     )
+                else:
+                    # Fallback: apply RoPE without cache write
+                    prefill_q_pe, prefill_k_pe = self.impl.rotary_emb(
+                        prefill_positions, prefill_q_pe, prefill_k_pe)
+
+                prefill_q = torch.cat(
+                    [prefill_q_nope, prefill_q_pe], dim=-1)
 
                 kv_cache_prefill = kv_cache.view(
                     current_platform.fp8_dtype())
@@ -699,38 +706,40 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 # Convert from (N, B, L) to (B, N, L)
                 mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
 
-            if use_fused:
-                # Fused RoPE + FP8 quant path: applies RoPE and FP8
-                # quantization to Q and K in a single kernel call.
+            if use_fused_decode:
+                # Fused RoPE + cache write path: applies RoPE to Q and K
+                # and writes K to the KV cache in a single kernel call.
                 decode_k_c = k_c_normed[:num_mqa_tokens]
                 decode_k_pe = k_pe[:num_mqa_tokens]
                 decode_positions = positions[:num_mqa_tokens]
 
-                mqa_q, decode_k_c_out, decode_k_pe_out = (
-                    self.impl._fused_rope_quant(
-                        mqa_ql_nope,
-                        mqa_q_pe,
-                        decode_k_c,
-                        decode_k_pe.squeeze(1),
-                        decode_positions,
-                        self._q_scale_float,
-                        self._k_scale_float,
-                    ))
-
-                # Write decode tokens to cache (K has RoPE from fused
-                # kernel, stored as FP8)
                 if kv_cache.numel() > 0:
-                    ops.concat_and_cache_mla(
-                        decode_k_c_out,
-                        decode_k_pe_out,
-                        kv_cache,
+                    ops.concat_and_cache_mla_rope_fused(
+                        decode_positions,
+                        mqa_q_pe,
+                        decode_k_pe.squeeze(1),
+                        decode_k_c,
+                        self.impl.rotary_emb.cos_sin_cache,
+                        self.impl.rotary_emb.is_neox_style,
                         attn_metadata.slot_mapping[
                             :num_mqa_tokens].flatten(),
-                        kv_cache_dtype=self.kv_cache_dtype,
-                        scale=self._k_scale,
+                        kv_cache,
+                        self.kv_cache_dtype,
+                        self._k_scale,
                     )
+                else:
+                    # Fallback: apply RoPE without cache write
+                    mqa_q_pe, decode_k_pe = self.impl.rotary_emb(
+                        decode_positions, mqa_q_pe, decode_k_pe)
 
-                kv_cache = kv_cache.view(current_platform.fp8_dtype())
+                # Quantize Q to FP8 if the attention kernel requires it
+                if fp8_attention and self.impl.supports_quant_query_input:
+                    mqa_q = self._decode_concat_quant_fp8_op(
+                        mqa_ql_nope, mqa_q_pe, self._q_scale)
+                else:
+                    mqa_q = (mqa_ql_nope, mqa_q_pe)
+                if fp8_attention:
+                    kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
             elif fp8_attention and self.impl.supports_quant_query_input:
                 assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
