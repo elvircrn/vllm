@@ -58,7 +58,7 @@ struct vec_cast<float, nv_bfloat16> {
   template <size_t vec_size>
   MLA_ROPE_INLINE static void cast(float* dst, const nv_bfloat16* src) {
     if constexpr (vec_size == 1) {
-      dst[0] = (float)src[0];
+      dst[0] = __bfloat162float(src[0]);
     } else {
 #pragma unroll
       for (size_t i = 0; i < vec_size / 2; ++i) {
@@ -88,7 +88,7 @@ struct vec_cast<float, half> {
   template <size_t vec_size>
   MLA_ROPE_INLINE static void cast(float* dst, const half* src) {
     if constexpr (vec_size == 1) {
-      dst[0] = (float)src[0];
+      dst[0] = __half2float(src[0]);
     } else {
 #pragma unroll
       for (size_t i = 0; i < vec_size / 2; ++i) {
