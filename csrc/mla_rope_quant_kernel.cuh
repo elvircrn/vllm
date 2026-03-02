@@ -1020,3 +1020,248 @@ __global__ void RopeQuantizeKernel(
 
 }  // namespace mla_rope
 }  // namespace vllm
+
+// ============================================================
+// Tiled dynamic RoPE kernel: computes cos/sin on-the-fly from inv_freq
+// instead of looking up from a precomputed cos_sin_cache.
+// Processes vec_size in tiles of 4 to reduce register pressure.
+// Uses __launch_bounds__(128, 16) to target 32 registers/thread.
+// ============================================================
+
+namespace vllm {
+namespace mla_rope {
+
+// Tiled interleave rotation: process 4 elements at a time
+template <typename DType, typename QuantType, uint32_t vec_size>
+__device__ __forceinline__ void tiled_rope_interleave_store(
+    const DType* x_ptr, QuantType* out_ptr, const float* inv_freq,
+    uint32_t vec_idx, float fpos, uint32_t rope_dim, float scale,
+    uint32_t tx) {
+  constexpr uint32_t TILE = 4;
+  uint32_t base_offset = tx * vec_size;
+
+  if (base_offset >= rope_dim) {
+    vec_t<float, vec_size> vec;
+    vec.cast_load(x_ptr + base_offset);
+#pragma unroll
+    for (uint32_t i = 0; i < vec_size; ++i) vec[i] *= scale;
+    vec.cast_store(out_ptr + base_offset);
+    return;
+  }
+
+#pragma unroll
+  for (uint32_t tile = 0; tile < vec_size / TILE; tile++) {
+    uint32_t tile_offset = tile * TILE;
+    uint32_t elem_offset = base_offset + tile_offset;
+
+    float in4[TILE];
+    {
+      vec_t<float, TILE> tmp;
+      tmp.cast_load(x_ptr + elem_offset);
+#pragma unroll
+      for (uint32_t i = 0; i < TILE; i++) in4[i] = tmp[i];
+    }
+
+    float out4[TILE];
+#pragma unroll
+    for (uint32_t i = 0; i < TILE; i += 2) {
+      uint32_t freq_idx = vec_idx + (tile_offset + i) / 2;
+      float cos_val, sin_val;
+      if (freq_idx < rope_dim / 2) {
+        __sincosf(fpos * inv_freq[freq_idx], &sin_val, &cos_val);
+      } else {
+        cos_val = 1.f;
+        sin_val = 0.f;
+      }
+      out4[i]     = (in4[i] * cos_val - in4[i + 1] * sin_val) * scale;
+      out4[i + 1] = (in4[i] * sin_val + in4[i + 1] * cos_val) * scale;
+    }
+
+    {
+      vec_t<float, TILE> tmp;
+#pragma unroll
+      for (uint32_t i = 0; i < TILE; i++) tmp[i] = out4[i];
+      tmp.cast_store(out_ptr + elem_offset);
+    }
+  }
+}
+
+// Tiled non-interleave (NeoX) rotation
+template <typename DType, typename QuantType, uint32_t vec_size>
+__device__ __forceinline__ void tiled_rope_neox_store(
+    const DType* x_ptr, QuantType* out_ptr, const float* inv_freq,
+    uint32_t vec_idx, float fpos, uint32_t rope_dim, float scale,
+    uint32_t tx) {
+  constexpr uint32_t TILE = 4;
+  uint32_t base_offset = tx * vec_size;
+  uint32_t half_rope = rope_dim / 2;
+
+  if (base_offset >= rope_dim) {
+    vec_t<float, vec_size> vec;
+    vec.cast_load(x_ptr + base_offset);
+#pragma unroll
+    for (uint32_t i = 0; i < vec_size; ++i) vec[i] *= scale;
+    vec.cast_store(out_ptr + base_offset);
+    return;
+  }
+
+#pragma unroll
+  for (uint32_t tile = 0; tile < vec_size / TILE; tile++) {
+    uint32_t tile_offset = tile * TILE;
+    uint32_t elem_offset = base_offset + tile_offset;
+
+    float in4[TILE];
+    {
+      vec_t<float, TILE> tmp;
+      tmp.cast_load(x_ptr + elem_offset);
+#pragma unroll
+      for (uint32_t i = 0; i < TILE; i++) in4[i] = tmp[i];
+    }
+
+    float paired4[TILE];
+    {
+      uint32_t pair_offset = (elem_offset < half_rope)
+                                 ? elem_offset + half_rope
+                                 : elem_offset - half_rope;
+      vec_t<float, TILE> tmp;
+      tmp.cast_load(x_ptr + pair_offset);
+#pragma unroll
+      for (uint32_t i = 0; i < TILE; i++) paired4[i] = tmp[i];
+    }
+
+    float out4[TILE];
+#pragma unroll
+    for (uint32_t i = 0; i < TILE; i++) {
+      uint32_t freq_idx = (elem_offset + i) % half_rope;
+      float cos_val, sin_val;
+      if (freq_idx < half_rope) {
+        __sincosf(fpos * inv_freq[freq_idx], &sin_val, &cos_val);
+      } else {
+        cos_val = 1.f;
+        sin_val = 0.f;
+      }
+      float sign = (elem_offset + i < half_rope) ? -1.f : 1.f;
+      out4[i] = (in4[i] * cos_val + sign * paired4[i] * sin_val) * scale;
+    }
+
+    {
+      vec_t<float, TILE> tmp;
+#pragma unroll
+      for (uint32_t i = 0; i < TILE; i++) tmp[i] = out4[i];
+      tmp.cast_store(out_ptr + elem_offset);
+    }
+  }
+}
+
+template <bool interleave, uint32_t vec_size, uint32_t bdx, typename DType,
+          typename IdType, typename QuantType>
+__global__ void __launch_bounds__(128, 16)
+RopeQuantizeTiledKernel(
+    DType* q_rope_in, DType* k_rope_in, DType* q_nope_in, DType* k_nope_in,
+    QuantType* q_rope_out, QuantType* k_rope_out, QuantType* q_nope_out,
+    QuantType* k_nope_out, const float* __restrict__ inv_freq,
+    IdType* __restrict__ pos_ids, uint32_t nnz, uint32_t num_qo_heads,
+    uint32_t num_kv_heads, uint32_t rope_dim, uint32_t no_rope_dim,
+    size_t q_rope_in_stride_n, size_t q_rope_in_stride_h,
+    size_t q_nope_in_stride_n, size_t q_nope_in_stride_h,
+    size_t q_rope_out_stride_n, size_t q_rope_out_stride_h,
+    size_t q_nope_out_stride_n, size_t q_nope_out_stride_h,
+    size_t k_rope_in_stride, size_t k_rope_in_stride_h,
+    size_t k_nope_in_stride, size_t k_nope_in_stride_h,
+    size_t k_rope_out_stride, size_t k_rope_out_stride_h,
+    size_t k_nope_out_stride, size_t k_nope_out_stride_h,
+    float quant_scale_q, float quant_scale_kv) {
+  uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y;
+  uint32_t by = blockIdx.y;
+  uint32_t bdy = blockDim.y;
+
+  uint32_t rope_chunk_size = rope_dim;
+  uint32_t rope_chunks = (rope_dim + rope_chunk_size - 1) / rope_chunk_size;
+  uint32_t no_rope_chunks =
+      (no_rope_dim + rope_chunk_size - 1) / rope_chunk_size;
+
+  uint32_t q_rope_end = num_qo_heads * rope_chunks;
+  uint32_t k_rope_end = q_rope_end + num_kv_heads * rope_chunks;
+  uint32_t k_nope_end = k_rope_end + num_kv_heads * no_rope_chunks;
+
+  if (bx * bdy + ty < nnz) {
+    const uint32_t idx = bx * bdy + ty;
+    const IdType pos = pos_ids[idx];
+    const float fpos = static_cast<float>(pos);
+
+    uint32_t vec_idx;
+    if constexpr (interleave) {
+      vec_idx = (tx * vec_size) / 2;
+    } else {
+      vec_idx = (tx * vec_size) % (rope_dim / 2);
+    }
+
+    if (by < q_rope_end) {
+      uint32_t q_head_idx = by / rope_chunks;
+      uint32_t elem_offset = (by % rope_chunks) * rope_chunk_size;
+
+      DType* in_ptr = q_rope_in + get_elem_offset_impl(
+          idx, q_head_idx, elem_offset, q_rope_in_stride_n, q_rope_in_stride_h);
+      QuantType* out_ptr = q_rope_out + get_elem_offset_impl(
+          idx, q_head_idx, elem_offset, q_rope_out_stride_n, q_rope_out_stride_h);
+
+      if constexpr (interleave) {
+        tiled_rope_interleave_store<DType, QuantType, vec_size>(
+            in_ptr, out_ptr, inv_freq, vec_idx, fpos, rope_dim, quant_scale_q, tx);
+      } else {
+        tiled_rope_neox_store<DType, QuantType, vec_size>(
+            in_ptr, out_ptr, inv_freq, vec_idx, fpos, rope_dim, quant_scale_q, tx);
+      }
+
+    } else if (by < k_rope_end) {
+      uint32_t k_head_idx = (by - q_rope_end) / rope_chunks;
+      uint32_t elem_offset = ((by - q_rope_end) % rope_chunks) * rope_chunk_size;
+
+      DType* in_ptr = k_rope_in + get_elem_offset_impl(
+          idx, k_head_idx, elem_offset, k_rope_in_stride, k_rope_in_stride_h);
+      QuantType* out_ptr = k_rope_out + get_elem_offset_impl(
+          idx, k_head_idx, elem_offset, k_rope_out_stride, k_rope_out_stride_h);
+
+      if constexpr (interleave) {
+        tiled_rope_interleave_store<DType, QuantType, vec_size>(
+            in_ptr, out_ptr, inv_freq, vec_idx, fpos, rope_dim, quant_scale_kv, tx);
+      } else {
+        tiled_rope_neox_store<DType, QuantType, vec_size>(
+            in_ptr, out_ptr, inv_freq, vec_idx, fpos, rope_dim, quant_scale_kv, tx);
+      }
+
+    } else if (by < k_nope_end) {
+      uint32_t k_head_idx = (by - k_rope_end) / no_rope_chunks;
+      uint32_t nope_chunk_idx = (by - k_rope_end) % no_rope_chunks;
+      uint32_t elem_offset = nope_chunk_idx * rope_chunk_size;
+
+      DType* in_ptr = k_nope_in + get_elem_offset_impl(
+          idx, k_head_idx, elem_offset, k_nope_in_stride, k_nope_in_stride_h);
+      QuantType* out_ptr = k_nope_out + get_elem_offset_impl(
+          idx, k_head_idx, elem_offset, k_nope_out_stride, k_nope_out_stride_h);
+
+      uint32_t chunk_valid = (elem_offset < no_rope_dim)
+          ? min(rope_chunk_size, no_rope_dim - elem_offset) : 0u;
+      scale_store_partial_chunk<DType, QuantType, vec_size>(
+          in_ptr, out_ptr, tx * vec_size, chunk_valid, quant_scale_kv);
+
+    } else {
+      uint32_t q_head_idx = (by - k_nope_end) / no_rope_chunks;
+      uint32_t nope_chunk_idx = (by - k_nope_end) % no_rope_chunks;
+      uint32_t elem_offset = nope_chunk_idx * rope_chunk_size;
+
+      DType* in_ptr = q_nope_in + get_elem_offset_impl(
+          idx, q_head_idx, elem_offset, q_nope_in_stride_n, q_nope_in_stride_h);
+      QuantType* out_ptr = q_nope_out + get_elem_offset_impl(
+          idx, q_head_idx, elem_offset, q_nope_out_stride_n, q_nope_out_stride_h);
+
+      uint32_t chunk_valid = (elem_offset < no_rope_dim)
+          ? min(rope_chunk_size, no_rope_dim - elem_offset) : 0u;
+      scale_store_partial_chunk<DType, QuantType, vec_size>(
+          in_ptr, out_ptr, tx * vec_size, chunk_valid, quant_scale_q);
+    }
+  }
+}
+
+}  // namespace mla_rope
+}  // namespace vllm

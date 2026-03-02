@@ -154,7 +154,7 @@ void mla_rope_quantize_fp8(torch::Tensor& q_rope_in, torch::Tensor& k_rope_in,
                            torch::Tensor& k_rope_out,
                            torch::Tensor& q_nope_out,
                            torch::Tensor& k_nope_out,
-                           torch::Tensor& cos_sin_cache,
+                           torch::Tensor& inv_freq,
                            torch::Tensor& pos_ids, double quant_scale_q,
                            double quant_scale_kv, bool interleave,
                            bool enable_pdl);

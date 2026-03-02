@@ -238,12 +238,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("rotary_embedding", torch::kCUDA, &rotary_embedding);
 
   // Fused RoPE + FP8 quantization for MLA decode.
+  // Computes cos/sin on-the-fly from inv_freq via __sincosf.
   ops.def(
       "mla_rope_quantize_fp8(Tensor! q_rope_in, Tensor! k_rope_in,"
       "                      Tensor! q_nope_in, Tensor! k_nope_in,"
       "                      Tensor! q_rope_out, Tensor! k_rope_out,"
       "                      Tensor! q_nope_out, Tensor! k_nope_out,"
-      "                      Tensor cos_sin_cache, Tensor pos_ids,"
+      "                      Tensor inv_freq, Tensor pos_ids,"
       "                      float quant_scale_q, float quant_scale_kv,"
       "                      bool interleave, bool enable_pdl) -> ()");
   ops.impl("mla_rope_quantize_fp8", torch::kCUDA, &mla_rope_quantize_fp8);

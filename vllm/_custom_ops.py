@@ -337,7 +337,7 @@ def mla_rope_quantize_fp8(
     k_rope_out: torch.Tensor,
     q_nope_out: torch.Tensor,
     k_nope_out: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
+    inv_freq: torch.Tensor,
     pos_ids: torch.Tensor,
     quant_scale_q: float,
     quant_scale_kv: float,
@@ -353,7 +353,7 @@ def mla_rope_quantize_fp8(
         k_rope_out,
         q_nope_out,
         k_nope_out,
-        cos_sin_cache,
+        inv_freq,
         pos_ids,
         quant_scale_q,
         quant_scale_kv,
@@ -3323,3 +3323,4 @@ if hasattr(torch.ops._C, "hadacore_transform"):
     @register_fake("_C::hadacore_transform")
     def _hadacore_transform_fake(x: torch.Tensor, inplace: bool) -> torch.Tensor:
         return torch.empty_like(x) if not inplace else x
+

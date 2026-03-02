@@ -196,11 +196,10 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
         k_nope_out = k_nope.new_empty(k_nope.shape, dtype=attn_dtype)
         k_pe_out = k_pe.new_empty(k_pe.shape, dtype=attn_dtype)
 
-        # cos_sin_cache is passed directly (kernel handles bf16->f32 internally
-        # via vec_t::cast_load, eliminating the per-layer .float() copy)
-        cos_sin_cache = self.rotary_emb.cos_sin_cache
+        # Dynamic kernel: computes cos/sin on-the-fly from inv_freq,
+        # eliminating the cos_sin_cache entirely.
+        inv_freq = self.rotary_emb.inv_freq
 
-        # Call vLLM's in-tree fused kernel
         mla_rope_quantize_fp8(
             q_pe,                # q_rope_in
             k_pe,                # k_rope_in
@@ -210,7 +209,7 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
             k_pe_out,            # k_rope_out
             q_out[..., :L],      # q_nope_out (nope portion first)
             k_nope_out,          # k_nope_out
-            cos_sin_cache,       # cos_sin_cache (bf16 OK, no .float() needed)
+            inv_freq,            # inv_freq (32 floats, computes cos/sin via __sincosf)
             positions,           # pos_ids
             q_scale,             # quant_scale_q
             k_scale,             # quant_scale_kv
