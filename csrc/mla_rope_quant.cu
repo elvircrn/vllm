@@ -192,3 +192,111 @@ void mla_rope_quantize_fp8(
   TORCH_CHECK(status == cudaSuccess,
               "mla_rope_quantize_fp8 failed: ", cudaGetErrorString(status));
 }
+
+
+// ============================================================================
+// Split-fused RoPE+quant+cache launcher (2 kernels, optimal block dims)
+//
+// Kernel 1: RopeOnlyFusedCacheKernel  (bdx=4, bdy=32) Q rope + K rope->cache
+// Kernel 2: NopeScaleQuantFusedCacheKernel (bdx=32, bdy=4) Q nope + K nope->cache
+// ============================================================================
+void mla_rope_quantize_fp8_fused_cache(
+    torch::Tensor& q_rope_in, torch::Tensor& q_nope_in,
+    torch::Tensor& q_rope_out, torch::Tensor& q_nope_out,
+    torch::Tensor& k_rope_in, torch::Tensor& k_nope_in,
+    torch::Tensor& kv_cache,
+    torch::Tensor& slot_mapping,
+    torch::Tensor& inv_freq, torch::Tensor& pos_ids,
+    double quant_scale_q, double quant_scale_kv,
+    bool interleave, bool enable_pdl) {
+
+  TORCH_CHECK(q_rope_in.dim() == 3, "q_rope_in must be 3D");
+  TORCH_CHECK(q_nope_in.dim() == 3, "q_nope_in must be 3D");
+  TORCH_CHECK(q_rope_in.scalar_type() == at::kBFloat16,
+              "Input dtype must be bfloat16");
+
+  uint32_t nnz = q_rope_in.size(0);
+  uint32_t num_actual_tokens = slot_mapping.size(0);
+  uint32_t num_qo_heads = q_rope_in.size(1);
+  uint32_t rope_dim = q_rope_in.size(-1);
+  uint32_t no_rope_dim = q_nope_in.size(-1);
+  uint32_t num_kv_heads = (k_rope_in.dim() == 2) ? 1 : k_rope_in.size(1);
+
+  constexpr uint32_t vec_size = 32 / sizeof(nv_bfloat16);  // = 16
+
+  int block_size_cache = kv_cache.size(1);
+  int64_t cache_stride_block = kv_cache.stride(0);
+  int64_t cache_stride_entry = kv_cache.stride(1);
+
+  size_t k_rope_in_stride, k_nope_in_stride;
+  size_t k_rope_in_stride_h, k_nope_in_stride_h;
+  if (k_rope_in.dim() == 2) {
+    k_rope_in_stride = k_rope_in.stride(0);
+    k_nope_in_stride = k_nope_in.stride(0);
+    k_rope_in_stride_h = k_rope_in_stride;
+    k_nope_in_stride_h = k_nope_in_stride;
+  } else {
+    k_rope_in_stride = k_rope_in.stride(0);
+    k_rope_in_stride_h = k_rope_in.stride(1);
+    k_nope_in_stride = k_nope_in.stride(0);
+    k_nope_in_stride_h = k_nope_in.stride(1);
+  }
+
+  const float scale_q = static_cast<float>(quant_scale_q);
+  const float scale_kv = static_cast<float>(quant_scale_kv);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  // Kernel 1: rope (bdx=4, bdy=32)
+  DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
+    constexpr uint32_t rope_bdx = 4;
+    constexpr uint32_t rope_bdy = 32;
+    uint32_t nblks_x = (nnz + rope_bdy - 1) / rope_bdy;
+    uint32_t nblks_y = num_qo_heads + num_kv_heads;
+    dim3 grid(nblks_x, nblks_y);
+    dim3 block(rope_bdx, rope_bdy);
+
+    auto kernel = vllm::mla_rope::RopeOnlyFusedCacheKernel<
+        INTERLEAVE, vec_size, rope_bdx, nv_bfloat16, int64_t, __nv_fp8_e4m3>;
+    kernel<<<grid, block, 0, stream>>>(
+        reinterpret_cast<nv_bfloat16*>(q_rope_in.data_ptr()),
+        reinterpret_cast<__nv_fp8_e4m3*>(q_rope_out.data_ptr()),
+        reinterpret_cast<nv_bfloat16*>(k_rope_in.data_ptr()),
+        reinterpret_cast<__nv_fp8_e4m3*>(kv_cache.data_ptr()),
+        slot_mapping.data_ptr<int64_t>(),
+        reinterpret_cast<const float*>(inv_freq.data_ptr()),
+        pos_ids.data_ptr<int64_t>(),
+        nnz, num_actual_tokens, num_qo_heads, num_kv_heads,
+        rope_dim, no_rope_dim,
+        q_rope_in.stride(0), q_rope_in.stride(1),
+        q_rope_out.stride(0), q_rope_out.stride(1),
+        k_rope_in_stride, k_rope_in_stride_h,
+        cache_stride_block, cache_stride_entry, block_size_cache,
+        scale_q, scale_kv);
+  });
+
+  // Kernel 2: nope (bdx=32, bdy=4)
+  {
+    constexpr uint32_t nope_bdx = 32;
+    constexpr uint32_t nope_bdy = 4;
+    uint32_t nblks_x = (nnz + nope_bdy - 1) / nope_bdy;
+    uint32_t nblks_y = num_qo_heads + num_kv_heads;
+    dim3 grid(nblks_x, nblks_y);
+    dim3 block(nope_bdx, nope_bdy);
+
+    auto kernel = vllm::mla_rope::NopeScaleQuantFusedCacheKernel<
+        vec_size, nv_bfloat16, __nv_fp8_e4m3>;
+    kernel<<<grid, block, 0, stream>>>(
+        reinterpret_cast<const nv_bfloat16*>(q_nope_in.data_ptr()),
+        reinterpret_cast<__nv_fp8_e4m3*>(q_nope_out.data_ptr()),
+        reinterpret_cast<const nv_bfloat16*>(k_nope_in.data_ptr()),
+        reinterpret_cast<__nv_fp8_e4m3*>(kv_cache.data_ptr()),
+        slot_mapping.data_ptr<int64_t>(),
+        nnz, num_actual_tokens, num_qo_heads, num_kv_heads,
+        no_rope_dim,
+        q_nope_in.stride(0), q_nope_in.stride(1),
+        q_nope_out.stride(0), q_nope_out.stride(1),
+        k_nope_in_stride, k_nope_in_stride_h,
+        cache_stride_block, cache_stride_entry, block_size_cache,
+        scale_q, scale_kv);
+  }
+}

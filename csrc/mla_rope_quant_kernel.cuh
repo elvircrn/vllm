@@ -1263,5 +1263,150 @@ RopeQuantizeTiledKernel(
   }
 }
 
+
+// ============================================================================
+// Split-fused cache kernels: RoPE + KV cache scatter-write
+//
+// Kernel A: RopeOnlyFusedCacheKernel (bdx=4, bdy=32) for rope_dim=64
+//   Q rope -> q_rope_out,  K rope -> cache[slot, no_rope_dim:]
+//
+// Kernel B: NopeScaleQuantFusedCacheKernel (bdx=32, bdy=4) for nope_dim=512
+//   Q nope -> q_nope_out,  K nope -> cache[slot, 0:no_rope_dim]
+// ============================================================================
+
+template <bool interleave, uint32_t vec_size, uint32_t bdx, typename DType,
+          typename IdType, typename QuantType>
+__global__ void __launch_bounds__(128, 16)
+RopeOnlyFusedCacheKernel(
+    DType* q_rope_in, QuantType* q_rope_out,
+    DType* k_rope_in,
+    QuantType* __restrict__ kv_cache,
+    const int64_t* __restrict__ slot_mapping,
+    const float* __restrict__ inv_freq,
+    IdType* __restrict__ pos_ids,
+    uint32_t nnz, uint32_t num_actual_tokens,
+    uint32_t num_qo_heads, uint32_t num_kv_heads,
+    uint32_t rope_dim, uint32_t no_rope_dim,
+    size_t q_rope_in_stride_n, size_t q_rope_in_stride_h,
+    size_t q_rope_out_stride_n, size_t q_rope_out_stride_h,
+    size_t k_rope_in_stride, size_t k_rope_in_stride_h,
+    int64_t cache_stride_block, int64_t cache_stride_entry,
+    int block_size,
+    float quant_scale_q, float quant_scale_kv) {
+  uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y;
+  uint32_t by = blockIdx.y;
+  uint32_t bdy = blockDim.y;
+
+  if (bx * bdy + ty >= nnz) return;
+  const uint32_t idx = bx * bdy + ty;
+  const IdType pos = pos_ids[idx];
+  const float fpos = static_cast<float>(pos);
+
+  uint32_t vec_idx;
+  if constexpr (interleave) {
+    vec_idx = (tx * vec_size) / 2;
+  } else {
+    vec_idx = (tx * vec_size) % (rope_dim / 2);
+  }
+
+  if (by < num_qo_heads) {
+    // Q rope -> q_rope_out
+    DType* in_ptr = q_rope_in + get_elem_offset_impl(
+        idx, by, 0u, q_rope_in_stride_n, q_rope_in_stride_h);
+    QuantType* out_ptr = q_rope_out + get_elem_offset_impl(
+        idx, by, 0u, q_rope_out_stride_n, q_rope_out_stride_h);
+    if constexpr (interleave) {
+      tiled_rope_interleave_store<DType, QuantType, vec_size>(
+          in_ptr, out_ptr, inv_freq, vec_idx, fpos, rope_dim,
+          quant_scale_q, tx);
+    } else {
+      tiled_rope_neox_store<DType, QuantType, vec_size>(
+          in_ptr, out_ptr, inv_freq, vec_idx, fpos, rope_dim,
+          quant_scale_q, tx);
+    }
+  } else {
+    // K rope -> cache[slot, no_rope_dim:]
+    uint32_t k_head_idx = by - num_qo_heads;
+    DType* in_ptr = k_rope_in + get_elem_offset_impl(
+        idx, k_head_idx, 0u, k_rope_in_stride, k_rope_in_stride_h);
+    if (idx < num_actual_tokens) {
+      int64_t slot = slot_mapping[idx];
+      if (slot >= 0) {
+        QuantType* dst = kv_cache +
+                         (slot / block_size) * cache_stride_block +
+                         (slot % block_size) * cache_stride_entry +
+                         no_rope_dim;
+        if constexpr (interleave) {
+          tiled_rope_interleave_store<DType, QuantType, vec_size>(
+              in_ptr, dst, inv_freq, vec_idx, fpos, rope_dim,
+              quant_scale_kv, tx);
+        } else {
+          tiled_rope_neox_store<DType, QuantType, vec_size>(
+              in_ptr, dst, inv_freq, vec_idx, fpos, rope_dim,
+              quant_scale_kv, tx);
+        }
+      }
+    }
+  }
+}
+
+template <uint32_t vec_size, typename DType, typename QuantType>
+__global__ void __launch_bounds__(128, 16)
+NopeScaleQuantFusedCacheKernel(
+    const DType* __restrict__ q_nope_in,
+    QuantType* __restrict__ q_nope_out,
+    const DType* __restrict__ k_nope_in,
+    QuantType* __restrict__ kv_cache,
+    const int64_t* __restrict__ slot_mapping,
+    uint32_t nnz, uint32_t num_actual_tokens,
+    uint32_t num_qo_heads, uint32_t num_kv_heads,
+    uint32_t dim,
+    size_t q_stride_n, size_t q_stride_h,
+    size_t q_out_stride_n, size_t q_out_stride_h,
+    size_t k_stride_n, size_t k_stride_h,
+    int64_t cache_stride_block, int64_t cache_stride_entry,
+    int block_size,
+    float scale_q, float scale_kv) {
+  uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y;
+  uint32_t by = blockIdx.y;
+  uint32_t bdy = blockDim.y;
+
+  if (bx * bdy + ty >= nnz) return;
+  const uint32_t idx = bx * bdy + ty;
+  const uint32_t offset = tx * vec_size;
+  if (offset >= dim) return;
+
+  if (by < num_qo_heads) {
+    // Q nope -> q_nope_out
+    const DType* in_ptr = q_nope_in + idx * q_stride_n + by * q_stride_h;
+    QuantType* out_ptr = q_nope_out + idx * q_out_stride_n +
+                         by * q_out_stride_h;
+    vec_t<float, vec_size> v;
+    v.cast_load(in_ptr + offset);
+#pragma unroll
+    for (uint32_t i = 0; i < vec_size; ++i) v[i] *= scale_q;
+    v.cast_store(out_ptr + offset);
+  } else {
+    // K nope -> cache[slot, 0:dim]
+    uint32_t k_head_idx = by - num_qo_heads;
+    const DType* in_ptr = k_nope_in + idx * k_stride_n +
+                          k_head_idx * k_stride_h;
+    vec_t<float, vec_size> v;
+    v.cast_load(in_ptr + offset);
+#pragma unroll
+    for (uint32_t i = 0; i < vec_size; ++i) v[i] *= scale_kv;
+    if (idx < num_actual_tokens) {
+      int64_t slot = slot_mapping[idx];
+      if (slot >= 0) {
+        QuantType* dst = kv_cache +
+                         (slot / block_size) * cache_stride_block +
+                         (slot % block_size) * cache_stride_entry;
+        v.cast_store(dst + offset);
+      }
+    }
+  }
+}
+
+
 }  // namespace mla_rope
 }  // namespace vllm

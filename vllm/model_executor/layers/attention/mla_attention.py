@@ -700,14 +700,19 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
 
             if use_fused:
-                # Fused RoPE + FP8 quant path: applies RoPE and FP8
-                # quantization to Q and K in a single kernel call.
                 decode_k_c = k_c_normed[:num_mqa_tokens]
                 decode_k_pe = k_pe[:num_mqa_tokens]
                 decode_positions = positions[:num_mqa_tokens]
+                decode_slot_mapping = attn_metadata.slot_mapping[
+                    :num_mqa_tokens].flatten()
 
-                mqa_q, decode_k_c_out, decode_k_pe_out = (
-                    self.impl._fused_rope_quant(
+                if (kv_cache.numel() > 0
+                        and getattr(self.impl,
+                                    'use_fused_rope_cache', False)):
+                    # Fused RoPE + FP8 quant + cache write: applies
+                    # RoPE, quantizes, and scatter-writes K directly
+                    # to paged KV cache (2 kernel launches).
+                    mqa_q = self.impl._fused_rope_quant_cache(
                         mqa_ql_nope,
                         mqa_q_pe,
                         decode_k_c,
@@ -715,20 +720,31 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                         decode_positions,
                         self._q_scale_float,
                         self._k_scale_float,
-                    ))
-
-                # Write decode tokens to cache (K has RoPE from fused
-                # kernel, stored as FP8)
-                if kv_cache.numel() > 0:
-                    ops.concat_and_cache_mla(
-                        decode_k_c_out,
-                        decode_k_pe_out,
                         kv_cache,
-                        attn_metadata.slot_mapping[
-                            :num_mqa_tokens].flatten(),
-                        kv_cache_dtype=self.kv_cache_dtype,
-                        scale=self._k_scale,
+                        decode_slot_mapping,
                     )
+                else:
+                    # Fused RoPE + FP8 quant (no cache fusion)
+                    mqa_q, decode_k_c_out, decode_k_pe_out = (
+                        self.impl._fused_rope_quant(
+                            mqa_ql_nope,
+                            mqa_q_pe,
+                            decode_k_c,
+                            decode_k_pe.squeeze(1),
+                            decode_positions,
+                            self._q_scale_float,
+                            self._k_scale_float,
+                        ))
+
+                    if kv_cache.numel() > 0:
+                        ops.concat_and_cache_mla(
+                            decode_k_c_out,
+                            decode_k_pe_out,
+                            kv_cache,
+                            decode_slot_mapping,
+                            kv_cache_dtype=self.kv_cache_dtype,
+                            scale=self._k_scale,
+                        )
 
                 kv_cache = kv_cache.view(current_platform.fp8_dtype())
 

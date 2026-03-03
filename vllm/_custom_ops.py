@@ -362,6 +362,41 @@ def mla_rope_quantize_fp8(
     )
 
 
+
+def mla_rope_quantize_fp8_fused_cache(
+    q_rope_in: torch.Tensor,
+    q_nope_in: torch.Tensor,
+    q_rope_out: torch.Tensor,
+    q_nope_out: torch.Tensor,
+    k_rope_in: torch.Tensor,
+    k_nope_in: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    inv_freq: torch.Tensor,
+    pos_ids: torch.Tensor,
+    quant_scale_q: float,
+    quant_scale_kv: float,
+    interleave: bool,
+    enable_pdl: bool,
+) -> None:
+    torch.ops._C.mla_rope_quantize_fp8_fused_cache(
+        q_rope_in,
+        q_nope_in,
+        q_rope_out,
+        q_nope_out,
+        k_rope_in,
+        k_nope_in,
+        kv_cache,
+        slot_mapping,
+        inv_freq,
+        pos_ids,
+        quant_scale_q,
+        quant_scale_kv,
+        interleave,
+        enable_pdl,
+    )
+
+
 # layer norm ops
 def rms_norm(
     out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor, epsilon: float
