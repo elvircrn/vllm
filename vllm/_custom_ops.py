@@ -362,7 +362,6 @@ def mla_rope_quantize_fp8(
     )
 
 
-
 def mla_rope_quantize_fp8_fused_cache(
     q_rope_in: torch.Tensor,
     q_nope_in: torch.Tensor,
@@ -394,6 +393,58 @@ def mla_rope_quantize_fp8_fused_cache(
         quant_scale_kv,
         interleave,
         enable_pdl,
+    )
+
+
+def mla_fused_cache_rope(
+    q_rope_in: torch.Tensor,
+    q_rope_out: torch.Tensor,
+    k_rope_in: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    inv_freq: torch.Tensor,
+    pos_ids: torch.Tensor,
+    num_kv_heads: int,
+    no_rope_dim: int,
+    quant_scale_q: float,
+    quant_scale_kv: float,
+    interleave: bool,
+) -> None:
+    torch.ops._C.mla_fused_cache_rope(
+        q_rope_in,
+        q_rope_out,
+        k_rope_in,
+        kv_cache,
+        slot_mapping,
+        inv_freq,
+        pos_ids,
+        num_kv_heads,
+        no_rope_dim,
+        quant_scale_q,
+        quant_scale_kv,
+        interleave,
+    )
+
+
+def mla_fused_cache_nope(
+    q_nope_in: torch.Tensor,
+    q_nope_out: torch.Tensor,
+    k_nope_in: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    num_kv_heads: int,
+    quant_scale_q: float,
+    quant_scale_kv: float,
+) -> None:
+    torch.ops._C.mla_fused_cache_nope(
+        q_nope_in,
+        q_nope_out,
+        k_nope_in,
+        kv_cache,
+        slot_mapping,
+        num_kv_heads,
+        quant_scale_q,
+        quant_scale_kv,
     )
 
 
@@ -3358,4 +3409,3 @@ if hasattr(torch.ops._C, "hadacore_transform"):
     @register_fake("_C::hadacore_transform")
     def _hadacore_transform_fake(x: torch.Tensor, inplace: bool) -> torch.Tensor:
         return torch.empty_like(x) if not inplace else x
-

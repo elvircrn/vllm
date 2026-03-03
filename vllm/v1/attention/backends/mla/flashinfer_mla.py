@@ -1,13 +1,17 @@
 import os
+
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 from typing import ClassVar
 
 import torch
 from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
-from vllm._custom_ops import mla_rope_quantize_fp8
-from vllm._custom_ops import mla_rope_quantize_fp8_fused_cache
+
+from vllm._custom_ops import (
+    mla_fused_cache_nope,
+    mla_fused_cache_rope,
+    mla_rope_quantize_fp8,
+)
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import (
@@ -18,6 +22,7 @@ from vllm.model_executor.layers.attention.mla_attention import (
     QueryLenSupport,
 )
 from vllm.platforms.interface import DeviceCapability
+from vllm.utils.torch_utils import aux_stream, current_stream
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
     AttentionLayer,
@@ -207,20 +212,20 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
         inv_freq = self.rotary_emb.inv_freq
 
         mla_rope_quantize_fp8(
-            q_pe,                # q_rope_in
-            k_pe,                # k_rope_in
-            ql_nope,             # q_nope_in
-            k_nope,              # k_nope_in
-            q_out[..., L:],      # q_rope_out (RoPE portion after nope)
-            k_pe_out,            # k_rope_out
-            q_out[..., :L],      # q_nope_out (nope portion first)
-            k_nope_out,          # k_nope_out
-            inv_freq,            # inv_freq (32 floats, computes cos/sin via __sincosf)
-            positions,           # pos_ids
-            q_scale,             # quant_scale_q
-            k_scale,             # quant_scale_kv
-            True,                # interleave (= not is_neox; MLA uses GPT-J style)
-            False,               # enable_pdl
+            q_pe,  # q_rope_in
+            k_pe,  # k_rope_in
+            ql_nope,  # q_nope_in
+            k_nope,  # k_nope_in
+            q_out[..., L:],  # q_rope_out (RoPE portion after nope)
+            k_pe_out,  # k_rope_out
+            q_out[..., :L],  # q_nope_out (nope portion first)
+            k_nope_out,  # k_nope_out
+            inv_freq,  # inv_freq (32 floats, computes cos/sin via __sincosf)
+            positions,  # pos_ids
+            q_scale,  # quant_scale_q
+            k_scale,  # quant_scale_kv
+            True,  # interleave (= not is_neox; MLA uses GPT-J style)
+            False,  # enable_pdl
         )
 
         return q_out, k_nope_out, k_pe_out
@@ -239,39 +244,62 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
     ) -> torch.Tensor:
         """Fused RoPE + FP8 quant + KV cache scatter-write.
 
-        Eliminates intermediate k_nope_out/k_pe_out tensors by writing
-        K directly to the paged KV cache during quantization.
-        Uses 2 kernels with optimal block dims:
-          - rope kernel (bdx=4):  Q rope + K rope -> cache
-          - nope kernel (bdx=32): Q nope + K nope -> cache
+        Two independent kernels on separate CUDA streams:
+          - main stream:  nope kernel (heavier, ~32us)
+          - aux stream:   rope kernel (lighter, ~12us)
+        Uses vLLM's aux_stream() singleton so all layers share one
+        stream, avoiding excessive stream allocations during CUDA
+        graph capture/replay.
         """
         assert self.rotary_emb is not None
         L = ql_nope.shape[-1]
         attn_dtype = torch.float8_e4m3fn
 
         q_out = q_pe.new_empty(
-            q_pe.shape[0], q_pe.shape[1], L + q_pe.shape[2],
+            q_pe.shape[0],
+            q_pe.shape[1],
+            L + q_pe.shape[2],
             dtype=attn_dtype,
         )
 
         inv_freq = self.rotary_emb.inv_freq
+        num_kv_heads = 1 if k_pe.dim() == 2 else k_pe.size(1)
 
-        mla_rope_quantize_fp8_fused_cache(
-            q_pe,                # q_rope_in
-            ql_nope,             # q_nope_in
-            q_out[..., L:],      # q_rope_out
-            q_out[..., :L],      # q_nope_out
-            k_pe,                # k_rope_in
-            k_nope,              # k_nope_in
-            kv_cache,            # paged KV cache
-            slot_mapping,        # slot mapping
-            inv_freq,
-            positions,
+        rope_stream = aux_stream()
+
+        # Fork: rope stream waits for main stream's prior work
+        rope_stream.wait_stream(current_stream())
+
+        with torch.cuda.stream(rope_stream):
+            mla_fused_cache_rope(
+                q_pe,
+                q_out[..., L:],
+                k_pe,
+                kv_cache,
+                slot_mapping,
+                inv_freq,
+                positions,
+                num_kv_heads,
+                L,
+                q_scale,
+                k_scale,
+                True,
+            )
+
+        # Nope kernel on main stream (runs in parallel with rope)
+        mla_fused_cache_nope(
+            ql_nope,
+            q_out[..., :L],
+            k_nope,
+            kv_cache,
+            slot_mapping,
+            num_kv_heads,
             q_scale,
             k_scale,
-            True,                # interleave
-            False,               # enable_pdl
         )
+
+        # Join: main stream waits for rope stream
+        current_stream().wait_stream(rope_stream)
 
         return q_out
 
