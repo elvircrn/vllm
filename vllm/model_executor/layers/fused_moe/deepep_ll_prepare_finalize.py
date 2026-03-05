@@ -16,6 +16,7 @@ from vllm.model_executor.layers.fused_moe.utils import (
     moe_kernel_quantize_input,
     normalize_batched_scales_shape,
 )
+from vllm.utils.torch_utils import aux_stream, current_stream
 from vllm.v1.worker.ubatching import (
     dbo_current_ubatch_id,
     dbo_enabled,
@@ -119,12 +120,26 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # time. This setting is handled by post_init_setup.
         self.use_ue8m0_dispatch = False
 
+        # GEMM2-combine overlap state. Initialized in post_init_setup when
+        # VLLM_DEEPEP_COMBINE_GEMM2_OVERLAP is enabled.
+        self.overlap_enabled = envs.VLLM_DEEPEP_COMBINE_GEMM2_OVERLAP
+        self.combine_comm_sms = envs.VLLM_DEEPEP_COMBINE_COMM_SMS
+        self._combine_stream: torch.cuda.Stream | None = None
+        self._combine_signal: torch.Tensor | None = None
+        self._combine_event: torch.cuda.Event | None = None
+        self._combine_event_sm_count: int = 0
+
+        logger.debug(
+            "DeepEP overlap config: enabled=%s, comm_sms=%d",
+            self.overlap_enabled,
+            self.combine_comm_sms,
+        )
+
     def post_init_setup(self, fused_experts: mk.FusedMoEPermuteExpertsUnpermute):
         if not fused_experts.supports_packed_ue8m0_act_scales():
             # Early exit.
-            return
-
-        if self.use_fp8_dispatch:
+            pass
+        elif self.use_fp8_dispatch:
             logger.debug_once(
                 "Update DeepEPLLPrepareFinalize to do packed ue8m0 scales dispatch."
             )
@@ -135,6 +150,71 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 f"activations despite ({fused_experts.__class__.__name__}) being able "
                 "to support quantized activations.",
                 scope="local",
+            )
+
+        # Setup GEMM2-combine two-stream overlap if enabled.
+        if self.overlap_enabled:
+
+            from vllm.model_executor.layers.fused_moe.flashinfer_cutedsl_moe import (
+                FlashInferCuteDSLExperts,
+            )
+            if not isinstance(fused_experts, FlashInferCuteDSLExperts):
+                logger.warning_once(
+                    "VLLM_DEEPEP_COMBINE_GEMM2_OVERLAP requires "
+                    "FlashInferCuteDSLExperts. Disabling overlap.",
+                    scope="local",
+                )
+                self.overlap_enabled = False
+                return
+
+            num_local_experts = fused_experts.moe_config.num_local_experts
+            device = fused_experts.moe_config.device
+
+            # FlashInfer's overlap-capable GEMM kernel has a limitation of 8 experts max
+            if num_local_experts > 8:
+                logger.warning_once(
+                    "VLLM_DEEPEP_COMBINE_GEMM2_OVERLAP disabled: FlashInfer overlap "
+                    f"kernel supports max 8 local experts, got {num_local_experts}. "
+                    "This is a FlashInfer limitation.",
+                    scope="local",
+                )
+                self.overlap_enabled = False
+                return
+
+            total_sms = torch.cuda.get_device_properties(
+                device
+            ).multi_processor_count
+            compute_sms = total_sms - self.combine_comm_sms
+
+            # Signal tensor shared between GEMM2 (writer) and combine_v2 (reader).
+            # Use global aux_stream like shared experts to avoid creating streams per layer.
+            self._combine_stream = aux_stream()
+            if self._combine_stream is None:
+                logger.warning_once(
+                    "VLLM_DEEPEP_COMBINE_GEMM2_OVERLAP disabled: aux_stream not available "
+                    "(non-CUDA platform?)",
+                    scope="local",
+                )
+                self.overlap_enabled = False
+                return
+
+            self._combine_signal = torch.zeros(
+                num_local_experts, dtype=torch.uint32, device=device
+            )
+            self._combine_event = torch.cuda.Event()
+            self._combine_event_sm_count = compute_sms
+
+            # Wire overlap params onto the experts instance.
+            fused_experts.down_sm_count = compute_sms
+            fused_experts.down_signals = self._combine_signal
+            fused_experts.down_start_event = self._combine_event
+
+            logger.info(
+                "GEMM2-combine overlap enabled: %d compute SMs, "
+                "%d combine comm SMs, %d local experts (using aux_stream)",
+                compute_sms,
+                self.combine_comm_sms,
+                num_local_experts,
             )
 
     def num_dispatchers(self) -> int:
@@ -397,18 +477,59 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         combine_topk_ids = self._map_global_to_physical_ids(topk_ids)
         # TODO (varun) : Enable zero copy mode
         dbo_maybe_run_recv_hook()
-        _, _, recv_hook = self.buffer.low_latency_combine(
-            fused_expert_output,
-            combine_topk_ids,
-            combine_topk_weights,
-            handle,
-            async_finish=False,
-            zero_copy=False,
-            return_recv_hook=do_recv_hook,
-            out=output,
+
+        # MoE layers run outside CUDA graphs (registered in static_forward_context),
+        # so multi-stream overlap is always safe here.
+        use_overlap = (
+            self.overlap_enabled
+            and self._combine_signal is not None
+            and self._combine_stream is not None
         )
 
-        return recv_hook, lambda: None
+        if use_overlap:
+            # Launch combine_v2 on secondary stream, overlapping with GEMM2.
+            # Signal zeroing + event recording already happened in
+            # flashinfer_cutedsl_moe_masked() before GEMM2 on the main stream.
+            logger.debug_once(
+                "Using GEMM2-combine overlap: launching combine_v2 on aux_stream",
+                scope="local",
+            )
+            self._combine_stream.wait_event(self._combine_event)
+            with torch.cuda.stream(self._combine_stream):
+                _, _, recv_hook = self.buffer.low_latency_combine(
+                    fused_expert_output,
+                    combine_topk_ids,
+                    combine_topk_weights,
+                    handle,
+                    async_finish=False,
+                    zero_copy=False,
+                    return_recv_hook=do_recv_hook,
+                    out=output,
+                    overlap=True,
+                    src_signals=self._combine_signal,
+                    src_signal_expect_value=self._combine_event_sm_count,
+                )
+
+            combine_stream = self._combine_stream
+
+            def _overlap_receiver():
+                # Sync combine stream back to main stream.
+                current_stream().wait_stream(combine_stream)
+
+            return recv_hook, _overlap_receiver
+        else:
+            _, _, recv_hook = self.buffer.low_latency_combine(
+                fused_expert_output,
+                combine_topk_ids,
+                combine_topk_weights,
+                handle,
+                async_finish=False,
+                zero_copy=False,
+                return_recv_hook=do_recv_hook,
+                out=output,
+            )
+
+            return recv_hook, lambda: None
 
     def finalize_async(
         self,

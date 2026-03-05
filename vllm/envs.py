@@ -220,6 +220,8 @@ if TYPE_CHECKING:
     VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE: bool = False
     VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL: bool = False
     VLLM_DBO_COMM_SMS: int = 20
+    VLLM_DEEPEP_COMBINE_GEMM2_OVERLAP: bool = False
+    VLLM_DEEPEP_COMBINE_COMM_SMS: int = 32
     VLLM_PATTERN_MATCH_DEBUG: str | None = None
     VLLM_DEBUG_DUMP_PATH: str | None = None
     VLLM_ENABLE_INDUCTOR_MAX_AUTOTUNE: bool = True
@@ -1514,6 +1516,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The number of SMs to allocate for communication kernels when running DBO
     # the rest of the SMs on the device will be allocated to compute
     "VLLM_DBO_COMM_SMS": lambda: int(os.getenv("VLLM_DBO_COMM_SMS", "20")),
+    # Enable GEMM2-combine two-stream overlap for DeepEP low-latency decode.
+    # Requires FlashInfer CuteDSL backend. Only supported on Blackwell GPUs.
+    "VLLM_DEEPEP_COMBINE_GEMM2_OVERLAP": lambda: bool(
+        int(os.getenv("VLLM_DEEPEP_COMBINE_GEMM2_OVERLAP", "0"))
+    ),
+    # Number of SMs reserved for DeepEP combine communication when overlap
+    # is enabled. Remaining SMs are used for GEMM2 compute.
+    "VLLM_DEEPEP_COMBINE_COMM_SMS": lambda: int(
+        os.getenv("VLLM_DEEPEP_COMBINE_COMM_SMS", "32")
+    ),
     # Enable max_autotune & coordinate_descent_tuning in inductor_config
     # to compile static shapes passed from compile_sizes in compilation_config
     # If set to 1, enable max_autotune; By default, this is enabled (1)

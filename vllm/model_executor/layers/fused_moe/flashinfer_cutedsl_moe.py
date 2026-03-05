@@ -49,6 +49,12 @@ class FlashInferCuteDSLExperts(mk.FusedMoEPermuteExpertsUnpermute):
         )
         self.out_dtype = moe_config.in_dtype
 
+        # Overlap attributes, wired up by DeepEPLLPrepareAndFinalize
+        # when VLLM_DEEPEP_COMBINE_GEMM2_OVERLAP is enabled.
+        self.down_sm_count: int | None = None
+        self.down_signals: torch.Tensor | None = None
+        self.down_start_event: torch.cuda.Event | None = None
+
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
         return mk.FusedMoEActivationFormat.BatchedExperts
@@ -180,6 +186,9 @@ class FlashInferCuteDSLExperts(mk.FusedMoEPermuteExpertsUnpermute):
             masked_m=expert_num_tokens,
             workspace=workspace2,
             out=output,
+            down_sm_count=self.down_sm_count,
+            down_signals=self.down_signals,
+            down_start_event=self.down_start_event,
         )
 
 
@@ -207,6 +216,9 @@ def flashinfer_cutedsl_moe_masked(
     masked_m: torch.Tensor,
     workspace: torch.Tensor,
     out: torch.Tensor,
+    down_sm_count: int | None = None,
+    down_signals: torch.Tensor | None = None,
+    down_start_event: torch.cuda.Event | None = None,
 ):
     """
     Perform masked Mixture-of-Experts computation with FlashInfer's CuteDSL
@@ -332,6 +344,16 @@ def flashinfer_cutedsl_moe_masked(
         a2_global_scale,
     )
 
+    # MoE layers run outside CUDA graphs (registered in static_forward_context),
+    # so multi-stream overlap is always safe here.
+    use_overlap = down_signals is not None and down_start_event is not None
+
+    if use_overlap:
+        # Zero overlap signals and record event before GEMM2 starts.
+        # These operations are enqueued on the main stream before GEMM2.
+        down_signals.zero_()
+        down_start_event.record()
+
     # Gemm2
     out = out.permute(1, 2, 0)  # requirement of kernel
     flashinfer_cutedsl_grouped_gemm_nt_masked(
@@ -345,5 +367,10 @@ def flashinfer_cutedsl_moe_masked(
         sf_vec_size=sf_vec_size,
         alpha=w2_alpha.view(1, 1, num_experts),
         alpha_dtype=get_cute_dtype(w2_alpha),
+        **(
+            dict(sm_count=down_sm_count, dst_signals=down_signals)
+            if use_overlap
+            else {}
+        ),
     )  # in logical [m, k, l]
     out = out.permute(2, 0, 1)
