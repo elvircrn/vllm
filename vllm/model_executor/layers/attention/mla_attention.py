@@ -648,6 +648,13 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             mqa_q = q[:num_mqa_tokens]
             mqa_output_slice = output[:num_mqa_tokens]
 
+            # Check for CUTLASS FP8 absorption BMM (skips standard BMM)
+            use_fused_absorption = (
+                use_fused
+                and kv_cache.numel() > 0
+                and getattr(self.impl, "use_fused_absorption", False)
+            )
+
             mqa_q_nope, mqa_q_pe = mqa_q.split(
                 [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
             )
@@ -662,7 +669,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 mqa_pe_padded.copy_(mqa_q_pe)
                 mqa_q_pe = mqa_pe_padded
 
-            if self.is_aiter_triton_fp4_bmm_enabled:
+            if use_fused_absorption:
+                # Absorption BMM handled by CUTLASS FP8 path below
+                pass
+            elif self.is_aiter_triton_fp4_bmm_enabled:
                 from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
 
                 mqa_ql_nope = batched_gemm_a16wfp4(
@@ -706,7 +716,21 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 decode_slot_mapping = attn_metadata.slot_mapping[
                     :num_mqa_tokens].flatten()
 
-                if (kv_cache.numel() > 0
+                if use_fused_absorption:
+                    # CUTLASS BF16xBF16->FP8 absorption BMM + RoPE + cache.
+                    mqa_q = self.impl._fused_absorption_rope_cache(
+                        mqa_q_nope,
+                        mqa_q_pe,
+                        decode_k_c,
+                        decode_k_pe.squeeze(1),
+                        decode_positions,
+                        self._q_scale_float,
+                        self._k_scale_float,
+                        self.W_UK_bf16,
+                        kv_cache,
+                        decode_slot_mapping,
+                    )
+                elif (kv_cache.numel() > 0
                         and getattr(self.impl,
                                     'use_fused_rope_cache', False)):
                     # Fused RoPE + FP8 quant + cache write: applies
@@ -869,6 +893,27 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             self.W_UV = W_UV.transpose(0, 1)
             # Convert from (L, N, P) to (N, P, L)
             self.W_UK_T = W_UK.permute(1, 2, 0)
+
+            # W_UK for CUTLASS absorption BMM: [L, N, P] -> [N, L, P]
+            W_UK_contiguous = W_UK.permute(1, 0, 2).contiguous()
+
+            # FP8 quantized W_UK for FP8xFP8 path
+            w_uk_scale = (
+                W_UK_contiguous.abs().amax()
+                / torch.finfo(torch.float8_e4m3fn).max
+            )
+            self.W_UK_fp8 = (
+                (W_UK_contiguous / w_uk_scale)
+                .clamp(
+                    -torch.finfo(torch.float8_e4m3fn).max,
+                    torch.finfo(torch.float8_e4m3fn).max,
+                )
+                .to(torch.float8_e4m3fn)
+            )
+            self._w_uk_scale = w_uk_scale
+
+            # BF16 W_UK for BF16xBF16->FP8 absorption BMM path
+            self.W_UK_bf16 = W_UK_contiguous
 
         # If we should not load quant weights, we initialize the scales to 1.0
         # as the default value. See [Note: Register q/k/v/prob scales in state dict]

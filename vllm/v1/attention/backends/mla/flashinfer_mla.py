@@ -8,6 +8,7 @@ import torch
 from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
 
 from vllm._custom_ops import (
+    mla_absorption_bmm_bf16,
     mla_fused_cache_nope,
     mla_fused_cache_rope,
     mla_rope_quantize_fp8,
@@ -163,6 +164,18 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
             self.use_fused_rope_quant
             and os.getenv("VLLM_MLA_FUSED_ROPE_CACHE", "0") == "1"
         )
+        self.use_fused_absorption = (
+            self.use_fused_rope_quant
+            and os.getenv("VLLM_MLA_FUSED_ABSORPTION", "0") == "1"
+        )
+
+        # Pre-allocate constant scale_b=1.0 for absorption BMM to avoid
+        # per-call tensor allocation.
+        self._absorption_scale_b = torch.ones(
+            1, dtype=torch.float32, device="cuda"
+        )
+        # Cached scale_a = q_scale * w_uk_scale (computed on first call).
+        self._absorption_scale_a: torch.Tensor | None = None
 
     def _fused_rope_quant(
         self,
@@ -299,6 +312,110 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
         )
 
         # Join: main stream waits for rope stream
+        current_stream().wait_stream(rope_stream)
+
+        return q_out
+
+    def _fused_absorption_rope_cache(
+        self,
+        mqa_q_nope: torch.Tensor,
+        mqa_q_pe: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        positions: torch.Tensor,
+        q_scale: float,
+        k_scale: float,
+        w_uk_bf16: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fused CUTLASS BF16×BF16→FP8 absorption BMM + RoPE + KV cache write.
+
+        Uses BF16 MMA with FP8 output via ScaledEpilogue. W_UK is
+        pre-dequantized to BF16 during model init (one-time cost).
+
+        Dual-stream execution:
+          main:  CUTLASS BMM
+          aux:   rope kernel + nope kernel (KV cache writes)  [starts before BMM]
+
+        Args:
+            mqa_q_nope: [N_heads, B, P=128] bf16, pre-transposed.
+            mqa_q_pe:   [B, N_heads, R=64] bf16.
+            k_nope:     [B, L=512] bf16 (k_c_normed).
+            k_pe:       [B, R=64] bf16.
+            positions:  [B] int64.
+            q_scale:    FP8 quant scale for Q (host float).
+            k_scale:    FP8 quant scale for K (host float).
+            w_uk_bf16:  [N_heads, 512, 128] bf16 (pre-dequantized weight).
+            kv_cache:   paged KV cache tensor.
+            slot_mapping: [B] int64 slot indices.
+
+        Returns:
+            q_out: [B, N_heads, L+R] fp8 — ready for attention.
+        """
+        assert self.rotary_emb is not None
+        N = mqa_q_nope.shape[0]
+        B = mqa_q_nope.shape[1]
+        L = w_uk_bf16.shape[1]
+        R = mqa_q_pe.shape[-1]
+        attn_dtype = torch.float8_e4m3fn
+
+        q_out = mqa_q_pe.new_empty(B, N, L + R, dtype=attn_dtype)
+
+        # --- 1. CUTLASS BF16×BF16→FP8 BMM -> q_out[..., :L] ---
+        # Both q_nope and W_UK are BF16. No runtime quantization.
+        # scale_a = q_scale (constant, cached on first call).
+        if self._absorption_scale_a is None:
+            self._absorption_scale_a = torch.tensor(
+                q_scale, dtype=torch.float32, device="cuda"
+            ).reshape(1)
+
+        # --- 2. Dual-stream: BMM (main) / rope+nope (aux) ---
+        # Fork aux stream BEFORE BMM: neither RoPE nor nope depend
+        # on the BMM output. RoPE needs q_pe/k_pe, nope needs k_nope —
+        # all from q_b_proj. Both ~16us combined, hidden behind ~35us BMM.
+        inv_freq = self.rotary_emb.inv_freq
+        num_kv_heads = 1 if k_pe.dim() == 2 else k_pe.size(1)
+
+        rope_stream = aux_stream()
+        rope_stream.wait_stream(current_stream())
+
+        with torch.cuda.stream(rope_stream):
+            mla_fused_cache_rope(
+                mqa_q_pe,
+                q_out[..., L:],
+                k_pe,
+                kv_cache,
+                slot_mapping,
+                inv_freq,
+                positions,
+                num_kv_heads,
+                L,
+                q_scale,
+                k_scale,
+                True,
+            )
+
+            # Nope kernel for K cache write only.
+            # Zero-Q-head tensors [B, 0, L] so only K blocks launch.
+            zero_q_in = k_nope.new_empty(B, 0, L)
+            zero_q_out = q_out.new_empty(B, 0, L)
+            mla_fused_cache_nope(
+                zero_q_in,
+                zero_q_out,
+                k_nope,
+                kv_cache,
+                slot_mapping,
+                num_kv_heads,
+                q_scale,
+                k_scale,
+            )
+
+        mla_absorption_bmm_bf16(
+            q_out, mqa_q_nope, w_uk_bf16,
+            self._absorption_scale_a, self._absorption_scale_b,
+        )
+
         current_stream().wait_stream(rope_stream)
 
         return q_out
