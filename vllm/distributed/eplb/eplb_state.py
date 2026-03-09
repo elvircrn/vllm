@@ -530,6 +530,10 @@ class EplbState:
                 False,
                 rank_mapping,
             )
+            # Ensure rearranged weights are visible to all CUDA streams
+            # (e.g. the CUDAGraph capture/replay stream) before the next
+            # forward pass.
+            torch.cuda.synchronize()
             self.expert_rearrangement_step = 0
 
         expert_buffer = [torch.empty_like(w) for w in model.expert_weights[0]]
@@ -852,6 +856,11 @@ class EplbState:
                     is_profile,
                     rank_mapping,
                 )
+                # Ensure rearranged weights are visible to all CUDA
+                # streams (e.g. CUDAGraph replay stream) before the
+                # next forward pass.
+                if not is_profile:
+                    torch.cuda.synchronize()
 
                 if not is_profile:
                     if (
