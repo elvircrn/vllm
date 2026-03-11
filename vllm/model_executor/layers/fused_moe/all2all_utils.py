@@ -5,6 +5,7 @@ from typing import Any
 
 import torch
 
+from vllm.config import get_current_vllm_config
 from vllm.distributed import (
     get_ep_group,
 )
@@ -14,8 +15,8 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
 )
-from vllm.model_executor.layers.fused_moe.flashinfer_a2a_prepare_finalize import (
-    FlashInferA2APrepareAndFinalize,
+from vllm.model_executor.layers.fused_moe.flashinfer_nvlink_2s_prepare_finalize import (
+    FlashInferNVLinkTwoSidedPrepareAndFinalize,
 )
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEPrepareAndFinalize,
@@ -23,6 +24,9 @@ from vllm.model_executor.layers.fused_moe.modular_kernel import (
 from vllm.model_executor.layers.fused_moe.prepare_finalize import (
     make_moe_prepare_and_finalize_naive_dp_ep,
     make_moe_prepare_and_finalize_no_dp_ep,
+)
+from vllm.model_executor.layers.fused_moe.prepare_finalize.flashinfer_nvlink_1s import (
+    FlashInferNVLinkOneSidedPrepareAndFinalize,
 )
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_deep_ep, has_mori
@@ -196,9 +200,22 @@ def maybe_make_prepare_finalize(
             use_fp8_dispatch=use_fp8_dispatch,
         )
 
-    elif moe.use_fi_all2allv_kernels:
+    elif moe.use_fi_nvl_two_sided_kernels:
         assert quant_config is not None
-        prepare_finalize = FlashInferA2APrepareAndFinalize(
+        prepare_finalize = FlashInferNVLinkTwoSidedPrepareAndFinalize(
+            num_dispatchers=all2all_manager.world_size,
+        )
+
+    elif moe.use_fi_nvl_one_sided_kernels:
+        assert quant_config is not None
+        max_num_tokens = (
+            get_current_vllm_config().scheduler_config.max_num_batched_tokens
+        )
+        prepare_finalize = FlashInferNVLinkOneSidedPrepareAndFinalize(
+            max_num_tokens=max_num_tokens,
+            top_k=moe.experts_per_token,
+            num_experts=moe.num_experts,
+            hidden_size=moe.hidden_dim,
             num_dispatchers=all2all_manager.world_size,
         )
 
