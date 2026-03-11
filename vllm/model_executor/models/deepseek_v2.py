@@ -33,6 +33,11 @@ from torch import nn
 from transformers import DeepseekV2Config, DeepseekV3Config
 
 import vllm._custom_ops as ops
+from vllm.model_executor.models.nan_check_helper import (
+    ensure_flags as _nan_ensure_flags,
+    mark as _nan_mark,
+    report_if_nan as _nan_report,
+)
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ParallelConfig, VllmConfig, get_current_vllm_config
@@ -1091,6 +1096,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         if not self.use_mha:
             attn_kwargs["llama_4_scaling"] = llama_4_scaling
         hidden_states = self.self_attn(**attn_kwargs)
+        _nan_mark(hidden_states, 0, self.layer_idx)
 
         if (
             not isinstance(self.self_attn, DeepseekAttention)
@@ -1108,6 +1114,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+        _nan_mark(hidden_states, 1, self.layer_idx)
 
         if isinstance(self.mlp, DeepseekV2MLP) and hidden_states.dtype == torch.float16:
             # Fix FP16 overflow
@@ -1359,6 +1366,8 @@ class DeepseekV2ForCausalLM(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
+        _nan_ensure_flags(62, hidden_states.device)
+        _nan_report(hidden_states)
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
