@@ -44,12 +44,9 @@ def ensure_flags(num_layers: int, device: torch.device) -> None:
         _inf_attn_detail = torch.zeros(num_layers, 17, dtype=torch.int64, device=device)
 
 
-def _safe_check(tensor: torch.Tensor):
-    """Cast FP8 tensors to float16 so isnan/isinf work."""
-    if tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2,
-                        torch.float8_e4m3fnuz, torch.float8_e5m2fnuz):
-        tensor = tensor.to(torch.float16)
-    return tensor
+def _is_fp8(dtype: torch.dtype) -> bool:
+    return dtype in (torch.float8_e4m3fn, torch.float8_e5m2,
+                     torch.float8_e4m3fnuz, torch.float8_e5m2fnuz)
 
 
 def mark(tensor: torch.Tensor, stage_col: int, layer_idx: int) -> None:
@@ -59,9 +56,13 @@ def mark(tensor: torch.Tensor, stage_col: int, layer_idx: int) -> None:
     global _nan_counts, _inf_counts
     if _nan_counts is None:
         return
-    t = _safe_check(tensor)
-    _nan_counts[layer_idx, stage_col] = t.isnan().sum()
-    _inf_counts[layer_idx, stage_col] = t.isinf().sum()
+    if _is_fp8(tensor.dtype):
+        flat = tensor.reshape(-1)[:8192].to(torch.float16)
+        _nan_counts[layer_idx, stage_col] = flat.isnan().sum()
+        _inf_counts[layer_idx, stage_col] = flat.isinf().sum()
+    else:
+        _nan_counts[layer_idx, stage_col] = tensor.isnan().sum()
+        _inf_counts[layer_idx, stage_col] = tensor.isinf().sum()
 
 
 def mark_attn(tensor: torch.Tensor, stage_col: int, layer_idx: int) -> None:
@@ -71,9 +72,13 @@ def mark_attn(tensor: torch.Tensor, stage_col: int, layer_idx: int) -> None:
     global _attn_detail, _inf_attn_detail
     if _attn_detail is None:
         return
-    t = _safe_check(tensor)
-    _attn_detail[layer_idx, stage_col] = t.isnan().sum()
-    _inf_attn_detail[layer_idx, stage_col] = t.isinf().sum()
+    if _is_fp8(tensor.dtype):
+        flat = tensor.reshape(-1)[:8192].to(torch.float16)
+        _attn_detail[layer_idx, stage_col] = flat.isnan().sum()
+        _inf_attn_detail[layer_idx, stage_col] = flat.isinf().sum()
+    else:
+        _attn_detail[layer_idx, stage_col] = tensor.isnan().sum()
+        _inf_attn_detail[layer_idx, stage_col] = tensor.isinf().sum()
 
 
 _saved_scales: dict | None = None
