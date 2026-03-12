@@ -18,8 +18,11 @@ _log_fh = None
 # column 2 = attn, column 3 = moe
 _nan_counts: torch.Tensor | None = None
 
-# Attention detail tensor: shape (num_layers, 6)
-# Columns: 0=qkv_proj, 1=q_norm, 2=kv_norm, 3=rope, 4=mla_attn, 5=o_proj
+# Attention detail tensor: shape (num_layers, 10)
+# Outer MLA wrapper (mla.py):
+#   0=qkv_proj, 1=q_norm, 2=kv_norm, 3=rope, 4=mla_attn, 5=o_proj
+# Inner MLAAttention (mla_attention.py):
+#   6=after_kv_cache_update, 7=after_W_UK_bmm, 8=after_fwd_mqa, 9=after_v_up
 _attn_detail: torch.Tensor | None = None
 
 
@@ -28,7 +31,7 @@ def ensure_flags(num_layers: int, device: torch.device) -> None:
     if _nan_counts is None or _nan_counts.shape[0] < num_layers:
         _nan_counts = torch.zeros(num_layers, 4, dtype=torch.int64, device=device)
     if _attn_detail is None or _attn_detail.shape[0] < num_layers:
-        _attn_detail = torch.zeros(num_layers, 6, dtype=torch.int64, device=device)
+        _attn_detail = torch.zeros(num_layers, 10, dtype=torch.int64, device=device)
 
 
 def mark(tensor: torch.Tensor, stage_col: int, layer_idx: int) -> None:
@@ -128,6 +131,16 @@ def report_if_nan(hidden_states: torch.Tensor) -> None:
                     f"qkv_proj={ad[0].item()} q_norm={ad[1].item()} "
                     f"kv_norm={ad[2].item()} rope={ad[3].item()} "
                     f"mla_attn={ad[4].item()} o_proj={ad[5].item()}\n"
+                )
+                f.write(msg)
+                f.flush()
+                print(msg, file=sys.stderr, end="", flush=True)
+
+                # Print inner MLAAttention detail (cols 6-9)
+                msg = (
+                    f"[NAN_FIRST] layer={layer_idx} mla_inner: "
+                    f"kv_cache_upd={ad[6].item()} W_UK_bmm={ad[7].item()} "
+                    f"fwd_mqa={ad[8].item()} v_up_proj={ad[9].item()}\n"
                 )
                 f.write(msg)
                 f.flush()

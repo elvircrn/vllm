@@ -232,6 +232,7 @@ from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.models.nan_check_helper import mark_attn as _nan_mark_mla
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
@@ -317,6 +318,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.head_size = kv_lora_rank + qk_rope_head_dim
         self.layer_name = prefix
         self.indexer = indexer
+
+        # Extract layer index for NaN debugging
+        try:
+            self._nan_layer_idx = int(prefix.split(".")[-3])
+        except (ValueError, IndexError):
+            self._nan_layer_idx = -1
 
         self.num_kv_heads = 1
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
@@ -493,6 +500,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 self.kv_cache_dtype,
                 self._k_scale,
             )
+            _nan_mark_mla(kv_c_normed, 6, self._nan_layer_idx)  # after kv_cache_update (input unchanged)
             if self.attn_backend.accept_output_buffer:
                 output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
                 self.forward_impl(
@@ -516,6 +524,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 self.kv_cache_dtype,
                 self._k_scale,
             )
+            _nan_mark_mla(kv_c_normed, 6, self._nan_layer_idx)  # after kv_cache_update (input unchanged)
             if self.attn_backend.accept_output_buffer:
                 output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
                 torch.ops.vllm.unified_mla_attention_with_output(
@@ -671,6 +680,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 # Convert from (N, B, L) to (B, N, L)
                 mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
 
+            _nan_mark_mla(mqa_ql_nope, 7, self._nan_layer_idx)  # after W_UK bmm
+
             if fp8_attention and self.impl.supports_quant_query_input:
                 assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
                 assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
@@ -690,6 +701,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             if not is_sparse_impl:
                 assert attn_metadata.decode is not None
             attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, attn_metadata, self)
+            _nan_mark_mla(attn_out, 8, self._nan_layer_idx)  # after fwd_mqa
 
             # correct dcp attn_out with lse.
             if self.impl.dcp_world_size > 1:
@@ -710,6 +722,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
             # v_up projection
             self._v_up_proj(attn_out, out=mqa_output_slice)
+            _nan_mark_mla(mqa_output_slice, 9, self._nan_layer_idx)  # after v_up_proj
         return output_padded
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
