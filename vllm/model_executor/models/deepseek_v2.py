@@ -1357,6 +1357,8 @@ class DeepseekV2ForCausalLM(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        # Init NaN flags before layers so mark() is captured with flags present
+        _nan_ensure_flags(62, positions.device)
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
@@ -1366,7 +1368,6 @@ class DeepseekV2ForCausalLM(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
-        _nan_ensure_flags(62, hidden_states.device)
         _nan_report(hidden_states)
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
