@@ -328,6 +328,193 @@ class Worker(WorkerBase):
     def reload_weights(self, *args, **kwargs) -> None:
         self.model_runner.reload_weights(*args, **kwargs)
 
+    @staticmethod
+    def _clear_triton_and_inductor_caches() -> None:
+        """Clear Triton and Inductor disk + in-memory caches."""
+        import shutil
+
+        # 1. Clear Triton disk cache
+        triton_cache_dir = os.environ.get("TRITON_CACHE_DIR")
+        if not triton_cache_dir:
+            triton_cache_dir = os.path.join(
+                os.environ.get("HOME", os.path.expanduser("~")),
+                ".triton",
+                "cache",
+            )
+        if os.path.isdir(triton_cache_dir):
+            shutil.rmtree(triton_cache_dir, ignore_errors=True)
+            os.makedirs(triton_cache_dir, exist_ok=True)
+            logger.info("Cleared Triton disk cache: %s", triton_cache_dir)
+
+        # 2. Clear Inductor disk cache
+        inductor_cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+        if inductor_cache_dir and os.path.isdir(inductor_cache_dir):
+            shutil.rmtree(inductor_cache_dir, ignore_errors=True)
+            os.makedirs(inductor_cache_dir, exist_ok=True)
+            logger.info(
+                "Cleared Inductor disk cache: %s", inductor_cache_dir
+            )
+
+        # 3. Clear Inductor in-memory FxGraphCache
+        try:
+            from torch._inductor.codecache import FxGraphCache
+            if hasattr(FxGraphCache, "clear"):
+                FxGraphCache.clear()
+                logger.info("Cleared Inductor FxGraphCache")
+        except (ImportError, AttributeError):
+            pass
+
+        # 2. Clear in-memory JIT caches on all loaded @triton.jit functions
+        try:
+            from triton.runtime.jit import JITFunction
+
+            import sys
+            count = 0
+            for module in list(sys.modules.values()):
+                if module is None:
+                    continue
+                for attr_name in dir(module):
+                    try:
+                        obj = getattr(module, attr_name, None)
+                    except Exception:
+                        continue
+                    if isinstance(obj, JITFunction) and hasattr(obj, "cache"):
+                        obj.cache.clear()
+                        count += 1
+            if count:
+                logger.info(
+                    "Cleared in-memory cache on %d Triton JIT functions",
+                    count,
+                )
+        except ImportError:
+            pass
+
+    def hot_reload(
+        self,
+        branch: str,
+        remote: str = "origin",
+        vllm_source_dir: str = "/opt/vllm-source",
+        module_prefixes: list[str] | None = None,
+    ) -> None:
+        """Hot-reload code from a git branch without reloading model weights.
+
+        Pulls new code, reloads Python modules, resets torch.compile and
+        CUDA graphs, and re-runs compilation/warmup. Model weight tensors
+        on GPU are kept untouched.
+        """
+        import importlib
+        import subprocess
+        import sys
+        import time
+
+        from vllm.compilation.wrapper import reset_compile_wrapper
+        from vllm.v1.worker.gpu.cudagraph_utils import ModelCudaGraphManager
+
+        logger.info(
+            "Worker rank %d: hot reload branch=%s remote=%s",
+            self.rank,
+            branch,
+            remote,
+        )
+        start = time.perf_counter()
+
+        # 1. Git fetch and checkout (only on rank 0 per node to avoid races,
+        #    all ranks share the same filesystem)
+        if self.local_rank == 0:
+            subprocess.run(
+                ["git", "-C", vllm_source_dir, "fetch", remote],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", vllm_source_dir, "checkout",
+                 f"{remote}/{branch}"],
+                check=True,
+                capture_output=True,
+            )
+            logger.info("Git checkout complete: %s/%s", remote, branch)
+
+        # Barrier so all ranks wait for git checkout to finish
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
+        # 2. Reset environment variable cache so new env vars take effect
+        from vllm.envs import (
+            disable_envs_cache,
+            enable_envs_cache,
+            _is_envs_cache_enabled,
+        )
+
+        envs_were_cached = _is_envs_cache_enabled()
+        if envs_were_cached:
+            disable_envs_cache()
+            logger.info("Environment variable cache cleared")
+
+        # Reload Python modules
+        if module_prefixes is None:
+            module_prefixes = [
+                "vllm.compilation",
+                "vllm.v1.worker.gpu.cudagraph",
+                "vllm.v1.cudagraph",
+            ]
+
+        reloaded = []
+        # Sort by depth (deepest first) to handle dependencies
+        modules_to_reload = sorted(
+            [
+                name
+                for name in list(sys.modules.keys())
+                if any(name.startswith(p) for p in module_prefixes)
+            ],
+            key=lambda x: -x.count("."),
+        )
+        for mod_name in modules_to_reload:
+            try:
+                importlib.reload(sys.modules[mod_name])
+                reloaded.append(mod_name)
+            except Exception as e:
+                logger.warning("Failed to reload %s: %s", mod_name, e)
+
+        if reloaded:
+            logger.info("Reloaded %d modules: %s", len(reloaded), reloaded)
+
+        # 3. Clear Triton and Inductor caches (disk + in-memory)
+        self._clear_triton_and_inductor_caches()
+
+        # 4. Reset torch.compile caches
+        torch.compiler.reset()
+
+        # 5. Reset the compile wrapper on the model
+        with set_current_vllm_config(self.vllm_config):
+            reset_compile_wrapper(self.model_runner.get_model())
+
+        # 6. Recreate the cudagraph manager with new code
+        self.model_runner.cudagraph_manager = ModelCudaGraphManager(
+            self.vllm_config,
+            self.model_runner.device,
+            self.model_runner.compilation_config.cudagraph_mode,
+            decode_query_len=self.model_runner.decode_query_len,
+        )
+
+        # 7. Free old graph memory
+        gc.collect()
+        torch.accelerator.synchronize()
+        torch.accelerator.empty_cache()
+
+        # 8. Re-enable environment variable cache
+        if envs_were_cached:
+            enable_envs_cache()
+
+        # 9. Re-run compilation and CUDA graph capture
+        self.compile_or_warm_up_model()
+
+        elapsed = time.perf_counter() - start
+        logger.info(
+            "Worker rank %d: hot reload completed in %.1f seconds",
+            self.rank,
+            elapsed,
+        )
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much

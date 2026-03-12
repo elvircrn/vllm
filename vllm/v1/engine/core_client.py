@@ -239,6 +239,15 @@ class EngineCoreClient(ABC):
     async def is_sleeping_async(self) -> bool:
         raise NotImplementedError
 
+    async def hot_reload_async(
+        self,
+        branch: str,
+        remote: str = "origin",
+        vllm_source_dir: str = "/opt/vllm-source",
+        module_prefixes: list[str] | None = None,
+    ) -> None:
+        raise NotImplementedError
+
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         raise NotImplementedError
 
@@ -1075,6 +1084,17 @@ class AsyncMPClient(MPClient):
 
     async def is_sleeping_async(self) -> bool:
         return await self.call_utility_async("is_sleeping")
+
+    async def hot_reload_async(
+        self,
+        branch: str,
+        remote: str = "origin",
+        vllm_source_dir: str = "/opt/vllm-source",
+        module_prefixes: list[str] | None = None,
+    ) -> None:
+        await self.call_utility_async(
+            "hot_reload", branch, remote, vllm_source_dir, module_prefixes
+        )
 
     async def execute_dummy_batch_async(self) -> None:
         await self.call_utility_async("execute_dummy_batch")

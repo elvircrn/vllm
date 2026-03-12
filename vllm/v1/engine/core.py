@@ -698,6 +698,52 @@ class EngineCore:
         """Check if engine is sleeping at any level."""
         return self.is_scheduler_paused() or self.model_executor.is_sleeping
 
+    def hot_reload(
+        self,
+        branch: str,
+        remote: str = "origin",
+        vllm_source_dir: str = "/opt/vllm-source",
+        module_prefixes: list[str] | None = None,
+    ) -> None:
+        """Hot-reload code from a git branch without reloading weights.
+
+        1. Pauses scheduler and aborts all in-flight requests
+        2. Clears KV cache, prefix cache, and encoder cache
+        3. Runs git fetch + checkout on all workers
+        4. Reloads Python modules, resets torch.compile and CUDA graphs
+        5. Re-warms up / re-captures CUDA graphs
+        6. Resumes the scheduler
+        """
+        logger.info(
+            "Hot reload: branch=%s, remote=%s, source=%s",
+            branch,
+            remote,
+            vllm_source_dir,
+        )
+
+        # 1. Pause scheduler — abort all requests and clear caches
+        self.pause_scheduler(mode="abort", clear_cache=True)
+
+        try:
+            # 2. Hot-reload on all workers (git pull + reset compile +
+            #    re-warmup)
+            self.model_executor.collective_rpc(
+                "hot_reload",
+                kwargs=dict(
+                    branch=branch,
+                    remote=remote,
+                    vllm_source_dir=vllm_source_dir,
+                    module_prefixes=module_prefixes,
+                ),
+            )
+            logger.info("Hot reload completed successfully")
+        except Exception:
+            logger.exception("Hot reload failed on workers")
+            raise
+        finally:
+            # 3. Always resume the scheduler
+            self.resume_scheduler()
+
     def execute_dummy_batch(self):
         self.model_executor.execute_dummy_batch()
 

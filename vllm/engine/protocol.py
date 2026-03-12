@@ -163,6 +163,17 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
+    async def hot_reload(
+        self,
+        branch: str,
+        remote: str = "origin",
+        vllm_source_dir: str = "/opt/vllm-source",
+        module_prefixes: list[str] | None = None,
+    ) -> None:
+        """Hot-reload code from a git branch without reloading weights."""
+        ...
+
+    @abstractmethod
     async def add_lora(self, lora_request: LoRARequest) -> bool:
         """Load a new LoRA adapter into the engine for future requests."""
         ...
