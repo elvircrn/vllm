@@ -27,6 +27,7 @@ _inf_counts: torch.Tensor | None = None
 # Inner MLAAttention (mla_attention.py):
 #   6=after_kv_cache_update, 7=after_W_UK_bmm, 8=after_fwd_mqa, 9=after_v_up
 #   10=after_fwd_mha, 11=kv_cache, 12=mqa_q_pre_fwd, 13=lse_post_fwd_mqa
+#   14=mha_q, 15=mha_kv_c_normed, 16=mha_k_pe
 _attn_detail: torch.Tensor | None = None
 _inf_attn_detail: torch.Tensor | None = None
 
@@ -38,9 +39,9 @@ def ensure_flags(num_layers: int, device: torch.device) -> None:
     if _inf_counts is None or _inf_counts.shape[0] < num_layers:
         _inf_counts = torch.zeros(num_layers, 4, dtype=torch.int64, device=device)
     if _attn_detail is None or _attn_detail.shape[0] < num_layers:
-        _attn_detail = torch.zeros(num_layers, 14, dtype=torch.int64, device=device)
+        _attn_detail = torch.zeros(num_layers, 17, dtype=torch.int64, device=device)
     if _inf_attn_detail is None or _inf_attn_detail.shape[0] < num_layers:
-        _inf_attn_detail = torch.zeros(num_layers, 14, dtype=torch.int64, device=device)
+        _inf_attn_detail = torch.zeros(num_layers, 17, dtype=torch.int64, device=device)
 
 
 def mark(tensor: torch.Tensor, stage_col: int, layer_idx: int) -> None:
@@ -173,7 +174,9 @@ def _emit_report(tag: str, hidden_states: torch.Tensor,
                 f"kv_cache_upd={ad[6].item()} W_UK_bmm={ad[7].item()} "
                 f"fwd_mqa={ad[8].item()} v_up_proj={ad[9].item()} "
                 f"fwd_mha={ad[10].item()} kv_cache={ad[11].item()} "
-                f"mqa_q_pre={ad[12].item()} lse={ad[13].item()}\n"
+                f"mqa_q_pre={ad[12].item()} lse={ad[13].item()} "
+                f"mha_q={ad[14].item()} mha_kv_c={ad[15].item()} "
+                f"mha_k_pe={ad[16].item()}\n"
             )
             f.write(msg)
             f.flush()
