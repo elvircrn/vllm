@@ -233,6 +233,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.nan_check_helper import mark_attn as _nan_mark_mla
+from vllm.model_executor.models.nan_check_helper import report_scales as _nan_report_scales
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
@@ -614,6 +615,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             num_mqa_tokens = attn_metadata.num_decode_tokens
             num_mha_tokens = q.size(0) - num_mqa_tokens
 
+        _nan_mark_mla(kv_cache, 11, self._nan_layer_idx)  # kv_cache before attn
+
         if num_mha_tokens > 0:
             self.impl.forward_mha(
                 q[num_mqa_tokens:],
@@ -624,6 +627,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 self._k_scale,
                 output=output[num_mqa_tokens:],
             )
+            _nan_mark_mla(output[num_mqa_tokens:], 10, self._nan_layer_idx)  # after fwd_mha
 
         if num_mqa_tokens > 0:
             mqa_q = q[:num_mqa_tokens]
@@ -700,8 +704,22 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # call decode attn
             if not is_sparse_impl:
                 assert attn_metadata.decode is not None
+            if isinstance(mqa_q, tuple):
+                _nan_mark_mla(mqa_q[0], 12, self._nan_layer_idx)  # mqa_q_nope before fwd_mqa
+            else:
+                _nan_mark_mla(mqa_q, 12, self._nan_layer_idx)  # mqa_q before fwd_mqa
             attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, attn_metadata, self)
             _nan_mark_mla(attn_out, 8, self._nan_layer_idx)  # after fwd_mqa
+            if lse is not None:
+                _nan_mark_mla(lse, 13, self._nan_layer_idx)  # lse after fwd_mqa
+            _nan_report_scales(
+                self._nan_layer_idx,
+                scale=self.scale,
+                q_scale=getattr(self, '_q_scale_float', None),
+                k_scale=getattr(self, '_k_scale_float', None),
+                bmm1_scale=getattr(self.impl, 'bmm1_scale', None),
+                bmm2_scale=getattr(self.impl, 'bmm2_scale', None),
+            )
 
             # correct dcp attn_out with lse.
             if self.impl.dcp_world_size > 1:
