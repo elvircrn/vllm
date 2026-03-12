@@ -255,6 +255,105 @@ def _emit_report(tag: str, hidden_states: torch.Tensor,
             print(msg, file=sys.stderr, end="", flush=True)
 
 
+# ---------------------------------------------------------------------------
+# Stash latest attention inputs per layer for NaN repro dump.
+# Only tensor references (no copy) — nearly free.
+# kv_cache and block_table/seq_lens are persistent across layers so the
+# last-stashed reference is still valid at compute_logits time.
+# mqa_q is ephemeral (reused by CUDA graph), so we clone it.
+# ---------------------------------------------------------------------------
+_stashed_attn_inputs: dict[int, dict] = {}
+
+
+def stash_attn_inputs(layer_idx: int, mqa_q, kv_cache,
+                      block_table, seq_lens, num_actual_toks: int,
+                      attn_output=None) -> None:
+    """Called inside mla_attention forward_impl after fwd_mqa.
+    Keeps references (+ cloned mqa_q) for the NaN repro dump.
+    """
+    if _nan_real_reported:
+        return
+    # Clone mqa_q since it's a CUDA graph buffer that gets reused.
+    if isinstance(mqa_q, tuple):
+        mqa_q_save = tuple(t.clone() for t in mqa_q)
+    else:
+        mqa_q_save = mqa_q.clone()
+    _stashed_attn_inputs[layer_idx] = {
+        "mqa_q": mqa_q_save,
+        "kv_cache": kv_cache,           # persistent, no clone needed
+        "block_table": block_table,     # persistent
+        "seq_lens": seq_lens,           # persistent
+        "num_actual_toks": num_actual_toks,
+    }
+    if attn_output is not None:
+        _stashed_attn_inputs[layer_idx]["attn_output"] = attn_output.clone()
+
+
+def _find_origin_layer(nan_cpu: torch.Tensor) -> int | None:
+    """Find the first layer where NaN appeared in the attn column."""
+    for layer_idx in range(nan_cpu.shape[0]):
+        if nan_cpu[layer_idx, 2].item() > 0:  # column 2 = attn
+            return layer_idx
+    return None
+
+
+def _dump_repro(origin_layer: int, hidden_states: torch.Tensor,
+                nan_cpu: torch.Tensor,
+                attn_nan_cpu: torch.Tensor | None) -> None:
+    """Save stashed attention inputs to disk for NaN reproduction."""
+    if origin_layer not in _stashed_attn_inputs:
+        f = _get_log()
+        msg = (f"[NAN_REPRO] origin layer {origin_layer} not in stash "
+               f"(stashed: {list(_stashed_attn_inputs.keys())})\n")
+        f.write(msg)
+        f.flush()
+        print(msg, file=sys.stderr, end="", flush=True)
+        return
+
+    log_dir = "/mnt/lustre/vllm-vlm-elvircrn/logs/nan_check"
+    hostname = os.environ.get("HOSTNAME", "unknown")
+    gpu = os.environ.get("CUDA_VISIBLE_DEVICES", "x")
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    save_path = f"{log_dir}/{hostname}_gpu{gpu}_{ts}_repro_layer{origin_layer}.pt"
+
+    stashed = _stashed_attn_inputs[origin_layer]
+    save_dict = {
+        "origin_layer": origin_layer,
+        "hidden_states": hidden_states.cpu(),
+        "nan_counts": nan_cpu,
+        "attn_nan_counts": attn_nan_cpu,
+    }
+    if _saved_batch_info is not None:
+        save_dict["batch_info"] = _saved_batch_info
+    if _saved_scales is not None:
+        save_dict["scales"] = _saved_scales
+
+    for k, v in stashed.items():
+        if isinstance(v, torch.Tensor):
+            save_dict[k] = v.cpu()
+        elif isinstance(v, tuple):
+            save_dict[k] = tuple(t.cpu() if isinstance(t, torch.Tensor) else t
+                                 for t in v)
+        else:
+            save_dict[k] = v
+
+    try:
+        torch.save(save_dict, save_path)
+        f = _get_log()
+        msg = f"[NAN_REPRO] saved to {save_path}\n"
+        f.write(msg)
+        f.flush()
+        print(msg, file=sys.stderr, end="", flush=True)
+    except Exception as e:
+        f = _get_log()
+        msg = f"[NAN_REPRO] FAILED to save: {e}\n"
+        f.write(msg)
+        f.flush()
+        print(msg, file=sys.stderr, end="", flush=True)
+
+    _stashed_attn_inputs.clear()
+
+
 def _all_reported() -> bool:
     return (_nan_real_reported and _nan_pad_reported
             and _inf_real_reported and _inf_pad_reported)
@@ -313,6 +412,9 @@ def report_if_nan(hidden_states: torch.Tensor) -> None:
                      region="REAL_ONLY")
         _emit_scales("NAN_REAL")
         _emit_batch_info("NAN_REAL")
+        origin = _find_origin_layer(nan_cpu)
+        if origin is not None:
+            _dump_repro(origin, hidden_states, nan_cpu, attn_nan_cpu)
 
     if pad_has_nan:
         _nan_pad_reported = True
