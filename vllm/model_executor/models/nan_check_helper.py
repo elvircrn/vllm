@@ -82,13 +82,15 @@ def mark_attn(tensor: torch.Tensor, stage_col: int, layer_idx: int) -> None:
 
 
 _saved_batch_info: dict | None = None
+_last_num_actual_toks: int | None = None
 
 
 def report_batch_info(layer_idx: int, num_actual_toks: int,
                       padded_size: int, num_decode_tokens: int,
                       num_mha_tokens: int) -> None:
     """Capture batch sizing info (logged later only when NaN/Inf detected)."""
-    global _saved_batch_info
+    global _saved_batch_info, _last_num_actual_toks
+    _last_num_actual_toks = num_actual_toks
     if _saved_batch_info is not None:
         return
     _saved_batch_info = {
@@ -175,18 +177,39 @@ def _zero_all():
         _inf_attn_detail.zero_()
 
 
+def _region_str(in_real: bool, in_pad: bool) -> str:
+    if in_real and in_pad:
+        return "BOTH"
+    elif in_real:
+        return "REAL_ONLY"
+    elif in_pad:
+        return "PAD_ONLY"
+    return "NONE"
+
+
 def _emit_report(tag: str, hidden_states: torch.Tensor,
                  layer_counts: torch.Tensor, attn_counts: torch.Tensor | None,
-                 total_count: int) -> None:
+                 total_count: int, *,
+                 num_actual_toks: int | None = None,
+                 real_count: int = 0, pad_count: int = 0,
+                 region: str = "") -> None:
     """Emit a single [NAN_FIRST] or [INF_FIRST] report block."""
     numel = hidden_states.numel()
     h = hidden_states.shape[-1]  # hidden_size (7168)
     f = _get_log()
 
+    region_info = ""
+    if num_actual_toks is not None:
+        region_info = (
+            f" region={region}"
+            f" real={real_count}({num_actual_toks} toks)"
+            f" pad={pad_count}({hidden_states.shape[0] - num_actual_toks} toks)"
+        )
     msg = (
         f"[{tag}] at_compute_logits: "
         f"count={total_count}/{numel} ({total_count // h} rows) "
-        f"shape={list(hidden_states.shape)} dtype={hidden_states.dtype}\n"
+        f"shape={list(hidden_states.shape)} dtype={hidden_states.dtype}"
+        f"{region_info}\n"
     )
     f.write(msg)
     f.flush()
@@ -238,14 +261,39 @@ def report_if_nan(hidden_states: torch.Tensor) -> None:
     """Called from compute_logits (OUTSIDE torch.compile / cudagraph).
     Reads NaN/Inf count tensors, reports per-layer counts, then resets.
     Reports first NaN and first Inf independently.
+    Differentiates between real tokens and CUDA-graph padding region.
     """
     global _nan_reported, _inf_reported
     if _nan_counts is None or (_nan_reported and _inf_reported):
         _zero_all()
         return
 
-    hs_has_nan = hidden_states.isnan().any().item() if not _nan_reported else False
-    hs_has_inf = hidden_states.isinf().any().item() if not _inf_reported else False
+    n = _last_num_actual_toks
+    total = hidden_states.shape[0]
+
+    if n is not None and n < total:
+        real = hidden_states[:n]
+        pad = hidden_states[n:]
+    else:
+        real = hidden_states
+        pad = None
+
+    if not _nan_reported:
+        real_has_nan = real.isnan().any().item()
+        pad_has_nan = pad.isnan().any().item() if pad is not None else False
+        hs_has_nan = real_has_nan or pad_has_nan
+    else:
+        hs_has_nan = False
+        real_has_nan = pad_has_nan = False
+
+    if not _inf_reported:
+        real_has_inf = real.isinf().any().item()
+        pad_has_inf = pad.isinf().any().item() if pad is not None else False
+        hs_has_inf = real_has_inf or pad_has_inf
+    else:
+        hs_has_inf = False
+        real_has_inf = pad_has_inf = False
+
     if not hs_has_nan and not hs_has_inf:
         _zero_all()
         return
@@ -259,14 +307,24 @@ def report_if_nan(hidden_states: torch.Tensor) -> None:
 
     if hs_has_nan and not _nan_reported:
         _nan_reported = True
-        nc = hidden_states.isnan().sum().item()
-        _emit_report("NAN_FIRST", hidden_states, nan_cpu, attn_nan_cpu, nc)
+        real_nc = real.isnan().sum().item()
+        pad_nc = pad.isnan().sum().item() if pad is not None else 0
+        region = _region_str(real_has_nan, pad_has_nan)
+        _emit_report("NAN_FIRST", hidden_states, nan_cpu, attn_nan_cpu,
+                     real_nc + pad_nc,
+                     num_actual_toks=n, real_count=real_nc,
+                     pad_count=pad_nc, region=region)
         _emit_scales("NAN")
         _emit_batch_info("NAN")
 
     if hs_has_inf and not _inf_reported:
         _inf_reported = True
-        ic = hidden_states.isinf().sum().item()
-        _emit_report("INF_FIRST", hidden_states, inf_cpu, attn_inf_cpu, ic)
+        real_ic = real.isinf().sum().item()
+        pad_ic = pad.isinf().sum().item() if pad is not None else 0
+        region = _region_str(real_has_inf, pad_has_inf)
+        _emit_report("INF_FIRST", hidden_states, inf_cpu, attn_inf_cpu,
+                     real_ic + pad_ic,
+                     num_actual_toks=n, real_count=real_ic,
+                     pad_count=pad_ic, region=region)
         _emit_scales("INF")
         _emit_batch_info("INF")
