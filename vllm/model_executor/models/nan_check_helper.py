@@ -13,7 +13,8 @@ import torch
 _reported = False
 _log_fh = None
 
-# Count tensor: shape (num_layers, 2) — column 0 = attn, column 1 = moe
+# Count tensor: shape (num_layers, 3)
+# column 0 = pre_attn (after layernorm), column 1 = attn, column 2 = moe
 # Values: number of NaN elements in hidden_states after that stage
 _nan_counts: torch.Tensor | None = None
 
@@ -21,7 +22,7 @@ _nan_counts: torch.Tensor | None = None
 def ensure_flags(num_layers: int, device: torch.device) -> None:
     global _nan_counts
     if _nan_counts is None or _nan_counts.shape[0] < num_layers:
-        _nan_counts = torch.zeros(num_layers, 2, dtype=torch.int64, device=device)
+        _nan_counts = torch.zeros(num_layers, 3, dtype=torch.int64, device=device)
 
 
 def mark(tensor: torch.Tensor, stage_col: int, layer_idx: int) -> None:
@@ -76,7 +77,6 @@ def report_if_nan(hidden_states: torch.Tensor) -> None:
     numel = hidden_states.numel()
     h = hidden_states.shape[-1]  # hidden_size (7168)
 
-    stage_names = ["attn", "moe"]
     f = _get_log()
 
     msg = (
@@ -89,12 +89,13 @@ def report_if_nan(hidden_states: torch.Tensor) -> None:
     print(msg, file=sys.stderr, end="", flush=True)
 
     for layer_idx in range(counts_cpu.shape[0]):
-        attn_nan = counts_cpu[layer_idx, 0].item()
-        moe_nan = counts_cpu[layer_idx, 1].item()
-        if attn_nan > 0 or moe_nan > 0:
+        pre_nan = counts_cpu[layer_idx, 0].item()
+        attn_nan = counts_cpu[layer_idx, 1].item()
+        moe_nan = counts_cpu[layer_idx, 2].item()
+        if pre_nan > 0 or attn_nan > 0 or moe_nan > 0:
             msg = (
                 f"[NAN_FIRST] layer={layer_idx} "
-                f"attn_nan={attn_nan} moe_nan={moe_nan}\n"
+                f"pre_attn_nan={pre_nan} attn_nan={attn_nan} moe_nan={moe_nan}\n"
             )
             f.write(msg)
             f.flush()
