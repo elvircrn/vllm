@@ -11,8 +11,10 @@ import sys
 
 import torch
 
-_nan_reported = False
-_inf_reported = False
+_nan_real_reported = False
+_nan_pad_reported = False
+_inf_real_reported = False
+_inf_pad_reported = False
 _log_fh = None
 
 # Count tensors: shape (num_layers, 4)
@@ -257,14 +259,20 @@ def _emit_report(tag: str, hidden_states: torch.Tensor,
             print(msg, file=sys.stderr, end="", flush=True)
 
 
+def _all_reported() -> bool:
+    return (_nan_real_reported and _nan_pad_reported
+            and _inf_real_reported and _inf_pad_reported)
+
+
 def report_if_nan(hidden_states: torch.Tensor) -> None:
     """Called from compute_logits (OUTSIDE torch.compile / cudagraph).
     Reads NaN/Inf count tensors, reports per-layer counts, then resets.
-    Reports first NaN and first Inf independently.
-    Differentiates between real tokens and CUDA-graph padding region.
+    Tracks 4 independent first-occurrences:
+      NAN_REAL, NAN_PAD, INF_REAL, INF_PAD
     """
-    global _nan_reported, _inf_reported
-    if _nan_counts is None or (_nan_reported and _inf_reported):
+    global _nan_real_reported, _nan_pad_reported
+    global _inf_real_reported, _inf_pad_reported
+    if _nan_counts is None or _all_reported():
         _zero_all()
         return
 
@@ -278,23 +286,19 @@ def report_if_nan(hidden_states: torch.Tensor) -> None:
         real = hidden_states
         pad = None
 
-    if not _nan_reported:
-        real_has_nan = real.isnan().any().item()
-        pad_has_nan = pad.isnan().any().item() if pad is not None else False
-        hs_has_nan = real_has_nan or pad_has_nan
-    else:
-        hs_has_nan = False
-        real_has_nan = pad_has_nan = False
+    # Check each region we still care about
+    real_has_nan = (not _nan_real_reported
+                    and real.isnan().any().item())
+    pad_has_nan = (not _nan_pad_reported
+                   and pad is not None
+                   and pad.isnan().any().item())
+    real_has_inf = (not _inf_real_reported
+                    and real.isinf().any().item())
+    pad_has_inf = (not _inf_pad_reported
+                   and pad is not None
+                   and pad.isinf().any().item())
 
-    if not _inf_reported:
-        real_has_inf = real.isinf().any().item()
-        pad_has_inf = pad.isinf().any().item() if pad is not None else False
-        hs_has_inf = real_has_inf or pad_has_inf
-    else:
-        hs_has_inf = False
-        real_has_inf = pad_has_inf = False
-
-    if not hs_has_nan and not hs_has_inf:
+    if not (real_has_nan or pad_has_nan or real_has_inf or pad_has_inf):
         _zero_all()
         return
 
@@ -305,26 +309,38 @@ def report_if_nan(hidden_states: torch.Tensor) -> None:
     attn_inf_cpu = _inf_attn_detail.cpu() if _inf_attn_detail is not None else None
     _zero_all()
 
-    if hs_has_nan and not _nan_reported:
-        _nan_reported = True
-        real_nc = real.isnan().sum().item()
-        pad_nc = pad.isnan().sum().item() if pad is not None else 0
-        region = _region_str(real_has_nan, pad_has_nan)
-        _emit_report("NAN_FIRST", hidden_states, nan_cpu, attn_nan_cpu,
-                     real_nc + pad_nc,
-                     num_actual_toks=n, real_count=real_nc,
-                     pad_count=pad_nc, region=region)
-        _emit_scales("NAN")
-        _emit_batch_info("NAN")
+    if real_has_nan:
+        _nan_real_reported = True
+        rc = real.isnan().sum().item()
+        _emit_report("NAN_FIRST_REAL", hidden_states, nan_cpu, attn_nan_cpu,
+                     rc, num_actual_toks=n, real_count=rc, pad_count=0,
+                     region="REAL_ONLY")
+        _emit_scales("NAN_REAL")
+        _emit_batch_info("NAN_REAL")
 
-    if hs_has_inf and not _inf_reported:
-        _inf_reported = True
-        real_ic = real.isinf().sum().item()
-        pad_ic = pad.isinf().sum().item() if pad is not None else 0
-        region = _region_str(real_has_inf, pad_has_inf)
-        _emit_report("INF_FIRST", hidden_states, inf_cpu, attn_inf_cpu,
-                     real_ic + pad_ic,
-                     num_actual_toks=n, real_count=real_ic,
-                     pad_count=pad_ic, region=region)
-        _emit_scales("INF")
-        _emit_batch_info("INF")
+    if pad_has_nan:
+        _nan_pad_reported = True
+        pc = pad.isnan().sum().item()
+        _emit_report("NAN_FIRST_PAD", hidden_states, nan_cpu, attn_nan_cpu,
+                     pc, num_actual_toks=n, real_count=0, pad_count=pc,
+                     region="PAD_ONLY")
+        _emit_scales("NAN_PAD")
+        _emit_batch_info("NAN_PAD")
+
+    if real_has_inf:
+        _inf_real_reported = True
+        rc = real.isinf().sum().item()
+        _emit_report("INF_FIRST_REAL", hidden_states, inf_cpu, attn_inf_cpu,
+                     rc, num_actual_toks=n, real_count=rc, pad_count=0,
+                     region="REAL_ONLY")
+        _emit_scales("INF_REAL")
+        _emit_batch_info("INF_REAL")
+
+    if pad_has_inf:
+        _inf_pad_reported = True
+        pc = pad.isinf().sum().item()
+        _emit_report("INF_FIRST_PAD", hidden_states, inf_cpu, attn_inf_cpu,
+                     pc, num_actual_toks=n, real_count=0, pad_count=pc,
+                     region="PAD_ONLY")
+        _emit_scales("INF_PAD")
+        _emit_batch_info("INF_PAD")
