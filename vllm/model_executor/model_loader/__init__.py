@@ -44,6 +44,7 @@ LoadFormats = Literal[
     "safetensors",
     "sharded_state",
     "tensorizer",
+    "weight_server",
 ]
 _LOAD_FORMAT_TO_MODEL_LOADER: dict[str, type[BaseModelLoader]] = {
     "auto": DefaultModelLoader,
@@ -62,6 +63,15 @@ _LOAD_FORMAT_TO_MODEL_LOADER: dict[str, type[BaseModelLoader]] = {
     "sharded_state": ShardedStateLoader,
     "tensorizer": TensorizerLoader,
 }
+
+# Lazy import to avoid circular dependency
+def _register_weight_server_loader():
+    from vllm.model_executor.model_loader.weight_server_loader import (
+        WeightServerLoader,
+    )
+    _LOAD_FORMAT_TO_MODEL_LOADER["weight_server"] = WeightServerLoader
+
+_register_weight_server_loader()
 
 
 def register_model_loader(load_format: str):
