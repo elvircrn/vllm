@@ -55,6 +55,8 @@ def _get_log():
 def report_if_nan(hidden_states: torch.Tensor) -> None:
     """Called from compute_logits (OUTSIDE torch.compile / cudagraph).
     Reads the flag tensor, reports the first bad layer, then resets flags.
+    Only triggers when hidden_states at compute_logits ALSO has NaN
+    (skips warmup/dummy passes where layers see NaN but output is clean).
     """
     global _flags, _reported
     if _flags is None or _reported:
@@ -62,18 +64,34 @@ def report_if_nan(hidden_states: torch.Tensor) -> None:
             _flags.zero_()
         return
 
-    # Single GPU->CPU transfer of the small flag tensor
+    # Check if hidden_states actually has NaN — if not, this is warmup noise
+    hs_has_nan = hidden_states.isnan().any().item()
+    hs_has_inf = hidden_states.isinf().any().item()
+    if not (hs_has_nan or hs_has_inf):
+        _flags.zero_()
+        return
+
+    # Real NaN detected at compute_logits — now read per-layer flags
+    _reported = True
     flags_cpu = _flags.cpu()
     _flags.zero_()
 
-    bad = (flags_cpu > 0).nonzero(as_tuple=False)
-    if bad.numel() == 0:
-        return
+    nc = hidden_states.isnan().sum().item()
+    ic = hidden_states.isinf().sum().item()
 
-    _reported = True
     stage_names = ["attn", "moe"]
     f = _get_log()
 
+    msg = (
+        f"[NAN_FIRST] at_compute_logits: "
+        f"NaN={nc}/{hidden_states.numel()} Inf={ic}/{hidden_states.numel()} "
+        f"shape={list(hidden_states.shape)} dtype={hidden_states.dtype}\n"
+    )
+    f.write(msg)
+    f.flush()
+    print(msg, file=sys.stderr, end="", flush=True)
+
+    bad = (flags_cpu > 0).nonzero(as_tuple=False)
     for row in bad:
         layer_idx = row[0].item()
         stage_col = row[1].item()
@@ -87,15 +105,3 @@ def report_if_nan(hidden_states: torch.Tensor) -> None:
         f.write(msg)
         f.flush()
         print(msg, file=sys.stderr, end="", flush=True)
-
-    # Also log hidden_states stats at compute_logits
-    nc = hidden_states.isnan().sum().item()
-    ic = hidden_states.isinf().sum().item()
-    msg = (
-        f"[NAN_FIRST] at_compute_logits: "
-        f"NaN={nc}/{hidden_states.numel()} Inf={ic}/{hidden_states.numel()} "
-        f"shape={list(hidden_states.shape)} dtype={hidden_states.dtype}\n"
-    )
-    f.write(msg)
-    f.flush()
-    print(msg, file=sys.stderr, end="", flush=True)
