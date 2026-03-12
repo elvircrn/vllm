@@ -18,22 +18,37 @@ _log_fh = None
 # column 2 = attn, column 3 = moe
 _nan_counts: torch.Tensor | None = None
 
+# Attention detail tensor: shape (num_layers, 6)
+# Columns: 0=qkv_proj, 1=q_norm, 2=kv_norm, 3=rope, 4=mla_attn, 5=o_proj
+_attn_detail: torch.Tensor | None = None
+
 
 def ensure_flags(num_layers: int, device: torch.device) -> None:
-    global _nan_counts
+    global _nan_counts, _attn_detail
     if _nan_counts is None or _nan_counts.shape[0] < num_layers:
         _nan_counts = torch.zeros(num_layers, 4, dtype=torch.int64, device=device)
+    if _attn_detail is None or _attn_detail.shape[0] < num_layers:
+        _attn_detail = torch.zeros(num_layers, 6, dtype=torch.int64, device=device)
 
 
 def mark(tensor: torch.Tensor, stage_col: int, layer_idx: int) -> None:
     """Called per-layer inside compiled/cudagraph region.
     All ops stay on GPU — no .item(), no sync, no graph break.
-    stage_col: 0 = attn, 1 = moe
     """
     global _nan_counts
     if _nan_counts is None:
         return
     _nan_counts[layer_idx, stage_col] = tensor.isnan().sum()
+
+
+def mark_attn(tensor: torch.Tensor, stage_col: int, layer_idx: int) -> None:
+    """Called inside MLA attention forward for detailed tracking.
+    Columns: 0=qkv_proj, 1=q_norm, 2=kv_norm, 3=rope, 4=mla_attn, 5=o_proj
+    """
+    global _attn_detail
+    if _attn_detail is None:
+        return
+    _attn_detail[layer_idx, stage_col] = tensor.isnan().sum()
 
 
 def _get_log():
@@ -72,6 +87,9 @@ def report_if_nan(hidden_states: torch.Tensor) -> None:
     _reported = True
     counts_cpu = _nan_counts.cpu()
     _nan_counts.zero_()
+    attn_cpu = _attn_detail.cpu() if _attn_detail is not None else None
+    if _attn_detail is not None:
+        _attn_detail.zero_()
 
     nc = hidden_states.isnan().sum().item()
     numel = hidden_states.numel()
@@ -101,3 +119,16 @@ def report_if_nan(hidden_states: torch.Tensor) -> None:
             f.write(msg)
             f.flush()
             print(msg, file=sys.stderr, end="", flush=True)
+
+            # Print attention detail for this layer if available
+            if attn_cpu is not None and attn_nan > 0:
+                ad = attn_cpu[layer_idx]
+                msg = (
+                    f"[NAN_FIRST] layer={layer_idx} attn_detail: "
+                    f"qkv_proj={ad[0].item()} q_norm={ad[1].item()} "
+                    f"kv_norm={ad[2].item()} rope={ad[3].item()} "
+                    f"mla_attn={ad[4].item()} o_proj={ad[5].item()}\n"
+                )
+                f.write(msg)
+                f.flush()
+                print(msg, file=sys.stderr, end="", flush=True)
