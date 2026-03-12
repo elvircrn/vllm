@@ -234,6 +234,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.nan_check_helper import mark_attn as _nan_mark_mla
 from vllm.model_executor.models.nan_check_helper import report_scales as _nan_report_scales
+from vllm.model_executor.models.nan_check_helper import report_batch_info as _nan_report_batch
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
@@ -722,6 +723,13 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 k_scale=getattr(self, '_k_scale_float', None),
                 bmm1_scale=getattr(self.impl, 'bmm1_scale', None),
                 bmm2_scale=getattr(self.impl, 'bmm2_scale', None),
+            )
+            _nan_report_batch(
+                self._nan_layer_idx,
+                num_actual_toks=num_actual_toks,
+                padded_size=output_padded.shape[0],
+                num_decode_tokens=num_mqa_tokens,
+                num_mha_tokens=num_mha_tokens,
             )
 
             # correct dcp attn_out with lse.

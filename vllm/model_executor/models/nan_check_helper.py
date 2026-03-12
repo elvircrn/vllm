@@ -81,6 +81,42 @@ def mark_attn(tensor: torch.Tensor, stage_col: int, layer_idx: int) -> None:
         _inf_attn_detail[layer_idx, stage_col] = tensor.isinf().sum()
 
 
+_saved_batch_info: dict | None = None
+
+
+def report_batch_info(layer_idx: int, num_actual_toks: int,
+                      padded_size: int, num_decode_tokens: int,
+                      num_mha_tokens: int) -> None:
+    """Capture batch sizing info (logged later only when NaN/Inf detected)."""
+    global _saved_batch_info
+    if _saved_batch_info is not None:
+        return
+    _saved_batch_info = {
+        "layer_idx": layer_idx,
+        "num_actual_toks": num_actual_toks,
+        "padded_size": padded_size,
+        "num_decode_tokens": num_decode_tokens,
+        "num_mha_tokens": num_mha_tokens,
+    }
+
+
+def _emit_batch_info(tag: str) -> None:
+    if _saved_batch_info is None:
+        return
+    b = _saved_batch_info
+    f = _get_log()
+    msg = (
+        f"[BATCH_{tag}] layer={b['layer_idx']} "
+        f"num_actual_toks={b['num_actual_toks']} "
+        f"padded_size={b['padded_size']} "
+        f"num_decode_tokens={b['num_decode_tokens']} "
+        f"num_mha_tokens={b['num_mha_tokens']}\n"
+    )
+    f.write(msg)
+    f.flush()
+    print(msg, file=sys.stderr, end="", flush=True)
+
+
 _saved_scales: dict | None = None
 
 
@@ -226,9 +262,11 @@ def report_if_nan(hidden_states: torch.Tensor) -> None:
         nc = hidden_states.isnan().sum().item()
         _emit_report("NAN_FIRST", hidden_states, nan_cpu, attn_nan_cpu, nc)
         _emit_scales("NAN")
+        _emit_batch_info("NAN")
 
     if hs_has_inf and not _inf_reported:
         _inf_reported = True
         ic = hidden_states.isinf().sum().item()
         _emit_report("INF_FIRST", hidden_states, inf_cpu, attn_inf_cpu, ic)
         _emit_scales("INF")
+        _emit_batch_info("INF")
