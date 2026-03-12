@@ -65,22 +65,32 @@ def mark_attn(tensor: torch.Tensor, stage_col: int, layer_idx: int) -> None:
     _inf_attn_detail[layer_idx, stage_col] = tensor.isinf().sum()
 
 
-_scales_reported = False
+_saved_scales: dict | None = None
 
 
 def report_scales(layer_idx: int, scale: float, q_scale: float | None,
                   k_scale: float | None, bmm1_scale: float | None,
                   bmm2_scale: float | None) -> None:
-    """Log attention scale factors once per process."""
-    global _scales_reported
-    if _scales_reported:
+    """Capture scale factors (logged later only when NaN/Inf is detected)."""
+    global _saved_scales
+    if _saved_scales is not None:
         return
-    _scales_reported = True
+    _saved_scales = {
+        "layer_idx": layer_idx, "scale": scale,
+        "q_scale": q_scale, "k_scale": k_scale,
+        "bmm1_scale": bmm1_scale, "bmm2_scale": bmm2_scale,
+    }
+
+
+def _emit_scales(tag: str) -> None:
+    if _saved_scales is None:
+        return
+    s = _saved_scales
     f = _get_log()
     msg = (
-        f"[SCALES] layer={layer_idx} "
-        f"scale={scale} q_scale={q_scale} k_scale={k_scale} "
-        f"bmm1_scale={bmm1_scale} bmm2_scale={bmm2_scale}\n"
+        f"[SCALES_{tag}] layer={s['layer_idx']} "
+        f"scale={s['scale']} q_scale={s['q_scale']} k_scale={s['k_scale']} "
+        f"bmm1_scale={s['bmm1_scale']} bmm2_scale={s['bmm2_scale']}\n"
     )
     f.write(msg)
     f.flush()
@@ -197,8 +207,10 @@ def report_if_nan(hidden_states: torch.Tensor) -> None:
         _nan_reported = True
         nc = hidden_states.isnan().sum().item()
         _emit_report("NAN_FIRST", hidden_states, nan_cpu, attn_nan_cpu, nc)
+        _emit_scales("NAN")
 
     if hs_has_inf and not _inf_reported:
         _inf_reported = True
         ic = hidden_states.isinf().sum().item()
         _emit_report("INF_FIRST", hidden_states, inf_cpu, attn_inf_cpu, ic)
+        _emit_scales("INF")
