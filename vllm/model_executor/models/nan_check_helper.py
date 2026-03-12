@@ -59,7 +59,7 @@ def mark(tensor: torch.Tensor, stage_col: int, layer_idx: int) -> None:
     if _nan_counts is None:
         return
     if _is_fp8(tensor.dtype):
-        flat = tensor.reshape(-1)[:8192].to(torch.float16)
+        flat = tensor.reshape(-1).to(torch.float16)
         _nan_counts[layer_idx, stage_col] = flat.isnan().sum()
         _inf_counts[layer_idx, stage_col] = flat.isinf().sum()
     else:
@@ -75,7 +75,7 @@ def mark_attn(tensor: torch.Tensor, stage_col: int, layer_idx: int) -> None:
     if _attn_detail is None:
         return
     if _is_fp8(tensor.dtype):
-        flat = tensor.reshape(-1)[:8192].to(torch.float16)
+        flat = tensor.reshape(-1).to(torch.float16)
         _attn_detail[layer_idx, stage_col] = flat.isnan().sum()
         _inf_attn_detail[layer_idx, stage_col] = flat.isinf().sum()
     else:
