@@ -93,8 +93,6 @@ def report_batch_info(layer_idx: int, num_actual_toks: int,
     """Capture batch sizing info (logged later only when NaN/Inf detected)."""
     global _saved_batch_info, _last_num_actual_toks
     _last_num_actual_toks = num_actual_toks
-    if _saved_batch_info is not None:
-        return
     _saved_batch_info = {
         "layer_idx": layer_idx,
         "num_actual_toks": num_actual_toks,
@@ -129,8 +127,6 @@ def report_scales(layer_idx: int, scale: float, q_scale: float | None,
                   bmm2_scale: float | None) -> None:
     """Capture scale factors (logged later only when NaN/Inf is detected)."""
     global _saved_scales
-    if _saved_scales is not None:
-        return
     _saved_scales = {
         "layer_idx": layer_idx, "scale": scale,
         "q_scale": q_scale, "k_scale": k_scale,
