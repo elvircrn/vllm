@@ -51,6 +51,22 @@ def _is_fp8(dtype: torch.dtype) -> bool:
                      torch.float8_e4m3fnuz, torch.float8_e5m2fnuz)
 
 
+_FP8_CHUNK = 65536  # check FP8 tensors in 64K-element chunks to avoid OOM
+
+
+def _fp8_nan_inf(tensor: torch.Tensor):
+    """Count NaN and Inf in an FP8 tensor without allocating a full copy."""
+    flat = tensor.reshape(-1)
+    n = flat.shape[0]
+    nan_total = torch.zeros(1, dtype=torch.int64, device=flat.device)
+    inf_total = torch.zeros(1, dtype=torch.int64, device=flat.device)
+    for start in range(0, n, _FP8_CHUNK):
+        chunk = flat[start:start + _FP8_CHUNK].to(torch.float16)
+        nan_total += chunk.isnan().sum()
+        inf_total += chunk.isinf().sum()
+    return nan_total, inf_total
+
+
 def mark(tensor: torch.Tensor, stage_col: int, layer_idx: int) -> None:
     """Called per-layer inside compiled/cudagraph region.
     All ops stay on GPU — no .item(), no sync, no graph break.
@@ -59,9 +75,9 @@ def mark(tensor: torch.Tensor, stage_col: int, layer_idx: int) -> None:
     if _nan_counts is None:
         return
     if _is_fp8(tensor.dtype):
-        flat = tensor.reshape(-1).to(torch.float16)
-        _nan_counts[layer_idx, stage_col] = flat.isnan().sum()
-        _inf_counts[layer_idx, stage_col] = flat.isinf().sum()
+        nc, ic = _fp8_nan_inf(tensor)
+        _nan_counts[layer_idx, stage_col] = nc
+        _inf_counts[layer_idx, stage_col] = ic
     else:
         _nan_counts[layer_idx, stage_col] = tensor.isnan().sum()
         _inf_counts[layer_idx, stage_col] = tensor.isinf().sum()
@@ -75,9 +91,9 @@ def mark_attn(tensor: torch.Tensor, stage_col: int, layer_idx: int) -> None:
     if _attn_detail is None:
         return
     if _is_fp8(tensor.dtype):
-        flat = tensor.reshape(-1).to(torch.float16)
-        _attn_detail[layer_idx, stage_col] = flat.isnan().sum()
-        _inf_attn_detail[layer_idx, stage_col] = flat.isinf().sum()
+        nc, ic = _fp8_nan_inf(tensor)
+        _attn_detail[layer_idx, stage_col] = nc
+        _inf_attn_detail[layer_idx, stage_col] = ic
     else:
         _attn_detail[layer_idx, stage_col] = tensor.isnan().sum()
         _inf_attn_detail[layer_idx, stage_col] = tensor.isinf().sum()
