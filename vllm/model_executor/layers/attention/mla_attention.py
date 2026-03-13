@@ -740,6 +740,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 seq_lens=attn_metadata.decode.seq_lens,
                 num_actual_toks=num_actual_toks,
                 attn_output=attn_out,
+                mqa_ql_nope=mqa_ql_nope,
+                mqa_q_pe=mqa_q_pe,
             )
 
             # correct dcp attn_out with lse.

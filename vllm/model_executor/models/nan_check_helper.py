@@ -261,7 +261,8 @@ _stashed_attn_inputs: dict[int, dict] = {}
 
 def stash_attn_inputs(layer_idx: int, mqa_q, kv_cache,
                       block_table, seq_lens, num_actual_toks: int,
-                      attn_output=None) -> None:
+                      attn_output=None,
+                      mqa_ql_nope=None, mqa_q_pe=None) -> None:
     """Called inside mla_attention forward_impl after fwd_mqa.
     Keeps references (+ cloned mqa_q) for the NaN repro dump.
     """
@@ -281,6 +282,10 @@ def stash_attn_inputs(layer_idx: int, mqa_q, kv_cache,
     }
     if attn_output is not None:
         _stashed_attn_inputs[layer_idx]["attn_output"] = attn_output.clone()
+    if mqa_ql_nope is not None:
+        _stashed_attn_inputs[layer_idx]["mqa_ql_nope_prequant"] = mqa_ql_nope.clone()
+    if mqa_q_pe is not None:
+        _stashed_attn_inputs[layer_idx]["mqa_q_pe_prequant"] = mqa_q_pe.clone()
 
 
 def _find_origin_layer(nan_cpu: torch.Tensor) -> int | None:
