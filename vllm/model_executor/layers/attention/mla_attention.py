@@ -237,6 +237,7 @@ from vllm.model_executor.models.nan_check_helper import report_scales as _nan_re
 from vllm.model_executor.models.nan_check_helper import report_batch_info as _nan_report_batch
 from vllm.model_executor.models.nan_check_helper import stash_if_nan as _nan_stash_if_nan
 from vllm.model_executor.models.nan_check_helper import mark_fwd_mqa_real as _nan_mark_fwd_mqa_real
+from vllm.model_executor.models.nan_check_helper import set_context as _nan_set_context
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
@@ -592,6 +593,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         fp8_attention = self.kv_cache_dtype.startswith("fp8")
 
         num_actual_toks = attn_metadata.num_actual_tokens
+        _nan_set_context(num_actual_toks)
 
         # Inputs and outputs may be padded for CUDA graphs
         output_padded = output
@@ -618,7 +620,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             num_mqa_tokens = attn_metadata.num_decode_tokens
             num_mha_tokens = q.size(0) - num_mqa_tokens
 
-        _nan_mark_mla(kv_cache, 11, self._nan_layer_idx)  # kv_cache before attn
+        _nan_mark_mla(kv_cache, 11, self._nan_layer_idx, skip_filter=True)  # kv_cache before attn
 
         if num_mha_tokens > 0:
             _nan_mark_mla(q[num_mqa_tokens:], 14, self._nan_layer_idx)  # mha q input
@@ -638,6 +640,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         if num_mqa_tokens > 0:
             mqa_q = q[:num_mqa_tokens]
             mqa_output_slice = output[:num_mqa_tokens]
+            _decode_seq_lens = attn_metadata.decode.seq_lens if attn_metadata.decode is not None else None
 
             mqa_q_nope, mqa_q_pe = mqa_q.split(
                 [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
@@ -690,7 +693,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 # Convert from (N, B, L) to (B, N, L)
                 mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
 
-            _nan_mark_mla(mqa_ql_nope, 7, self._nan_layer_idx)  # after W_UK bmm
+            _nan_mark_mla(mqa_ql_nope, 7, self._nan_layer_idx, seq_lens=_decode_seq_lens)  # after W_UK bmm
 
             # Save refs to bf16 tensors for stash_if_nan (called after fwd_mqa)
             _nan_q_input = mqa_q
@@ -716,14 +719,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             if not is_sparse_impl:
                 assert attn_metadata.decode is not None
             if isinstance(mqa_q, tuple):
-                _nan_mark_mla(mqa_q[0], 12, self._nan_layer_idx)  # mqa_q_nope before fwd_mqa
+                _nan_mark_mla(mqa_q[0], 12, self._nan_layer_idx, seq_lens=_decode_seq_lens)  # mqa_q_nope before fwd_mqa
             else:
-                _nan_mark_mla(mqa_q, 12, self._nan_layer_idx)  # mqa_q before fwd_mqa
+                _nan_mark_mla(mqa_q, 12, self._nan_layer_idx, seq_lens=_decode_seq_lens)  # mqa_q before fwd_mqa
             attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, attn_metadata, self)
-            _nan_mark_mla(attn_out, 8, self._nan_layer_idx)  # after fwd_mqa
+            _nan_mark_mla(attn_out, 8, self._nan_layer_idx, seq_lens=_decode_seq_lens)  # after fwd_mqa
             _nan_mark_fwd_mqa_real(attn_out, self._nan_layer_idx, attn_metadata.decode.seq_lens)
             if lse is not None:
-                _nan_mark_mla(lse, 13, self._nan_layer_idx)  # lse after fwd_mqa
+                _nan_mark_mla(lse, 13, self._nan_layer_idx, seq_lens=_decode_seq_lens)  # lse after fwd_mqa
             _nan_report_scales(
                 self._nan_layer_idx,
                 scale=self.scale,
@@ -770,7 +773,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
             # v_up projection
             self._v_up_proj(attn_out, out=mqa_output_slice)
-            _nan_mark_mla(mqa_output_slice, 9, self._nan_layer_idx)  # after v_up_proj
+            _nan_mark_mla(mqa_output_slice, 9, self._nan_layer_idx, seq_lens=_decode_seq_lens)  # after v_up_proj
         return output_padded
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
