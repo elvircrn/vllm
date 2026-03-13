@@ -35,10 +35,14 @@ _inf_attn_detail: torch.Tensor | None = None
 # Used by stash_if_nan to gate on real NaN only.
 _fwd_mqa_real_nan: torch.Tensor | None = None
 
+# Pre-allocated layer index scalars on GPU — avoids CPU→GPU transfer
+# during CUDA graph capture (torch.tensor(int, device=cuda) is illegal).
+_layer_idx_gpu: torch.Tensor | None = None
+
 
 def ensure_flags(num_layers: int, device: torch.device) -> None:
     global _nan_counts, _inf_counts, _attn_detail, _inf_attn_detail
-    global _fwd_mqa_real_nan
+    global _fwd_mqa_real_nan, _layer_idx_gpu
     if _nan_counts is None or _nan_counts.shape[0] < num_layers:
         _nan_counts = torch.zeros(num_layers, 4, dtype=torch.int64, device=device)
     if _inf_counts is None or _inf_counts.shape[0] < num_layers:
@@ -49,6 +53,8 @@ def ensure_flags(num_layers: int, device: torch.device) -> None:
         _inf_attn_detail = torch.zeros(num_layers, 17, dtype=torch.int64, device=device)
     if _fwd_mqa_real_nan is None or _fwd_mqa_real_nan.shape[0] < num_layers:
         _fwd_mqa_real_nan = torch.zeros(num_layers, dtype=torch.int64, device=device)
+    if _layer_idx_gpu is None or _layer_idx_gpu.shape[0] < num_layers:
+        _layer_idx_gpu = torch.arange(num_layers, dtype=torch.int64, device=device)
 
 
 def _is_fp8(dtype: torch.dtype) -> bool:
@@ -353,7 +359,7 @@ def stash_if_nan(layer_idx: int, q_input, q_nope_post_bmm, q_pe,
     # Record which layer was captured (in-place)
     _stash_layer_idx[bkey].copy_(
         torch.where(first_nan,
-                    torch.tensor(layer_idx, device=captured.device),
+                    _layer_idx_gpu[layer_idx],
                     _stash_layer_idx[bkey]))
 
     # Block subsequent layers from writing (in-place)
