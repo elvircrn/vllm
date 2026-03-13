@@ -262,6 +262,9 @@ _stashed_attn_inputs: dict[int, dict] = {}
 _prequant_bufs: dict[tuple[int, int], list[torch.Tensor]] = {}
 
 
+_MAX_STASH_BATCH = 4
+
+
 def stash_prequant(layer_idx: int, q_input,
                    q_nope_post_bmm, q_pe) -> None:
     """Copy bf16 tensors into pre-allocated buffers BEFORE FP8 quant.
@@ -270,10 +273,13 @@ def stash_prequant(layer_idx: int, q_input,
     torch.compile (fullgraph=True) / CUDA graph capture.  Buffers are
     keyed by (layer_idx, batch_size) since each CUDA graph batch size
     is compiled separately (dynamic=False).
+    Only allocates for batch sizes <= _MAX_STASH_BATCH to avoid OOM.
     """
     if _nan_real_reported:
         return
     B = q_input.shape[0]
+    if B > _MAX_STASH_BATCH:
+        return
     key = (layer_idx, B)
     bufs = _prequant_bufs.get(key)
     if bufs is None:
@@ -306,6 +312,8 @@ def stash_attn_inputs(layer_idx: int, mqa_q, kv_cache,
         B = mqa_q[0].shape[0]
     else:
         B = mqa_q.shape[0]
+    if B > _MAX_STASH_BATCH:
+        return
     key = (layer_idx, B)
     bufs = _attn_input_bufs.get(key)
     if bufs is None:
@@ -344,8 +352,15 @@ def _dump_repro(origin_layer: int, hidden_states: torch.Tensor,
     """Save stashed attention inputs to disk for NaN reproduction."""
     if origin_layer not in _stashed_attn_inputs:
         f = _get_log()
-        msg = (f"[NAN_REPRO] origin layer {origin_layer} not in stash "
-               f"(stashed: {list(_stashed_attn_inputs.keys())})\n")
+        B = _last_num_actual_toks or hidden_states.shape[0]
+        if B > _MAX_STASH_BATCH:
+            msg = (f"[NAN_REPRO] MISSED DUMP — batch_size={B} exceeds "
+                   f"_MAX_STASH_BATCH={_MAX_STASH_BATCH}. "
+                   f"Increase _MAX_STASH_BATCH in nan_check_helper.py "
+                   f"to capture this event.\n")
+        else:
+            msg = (f"[NAN_REPRO] origin layer {origin_layer} not in stash "
+                   f"(stashed: {list(_stashed_attn_inputs.keys())})\n")
         f.write(msg)
         f.flush()
         print(msg, file=sys.stderr, end="", flush=True)
