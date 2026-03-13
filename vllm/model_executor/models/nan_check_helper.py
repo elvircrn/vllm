@@ -259,10 +259,23 @@ def _emit_report(tag: str, hidden_states: torch.Tensor,
 _stashed_attn_inputs: dict[int, dict] = {}
 
 
+def stash_prequant(layer_idx: int, q_input, q_nope_pre_bmm,
+                   q_nope_post_bmm, q_pe) -> None:
+    """Clone bf16 tensors BEFORE FP8 quant consumes and frees them.
+    Must be called before _decode_concat_quant_fp8_op.
+    """
+    if _nan_real_reported:
+        return
+    _stashed_attn_inputs.setdefault(layer_idx, {})
+    _stashed_attn_inputs[layer_idx]["q_input"] = q_input.clone()
+    _stashed_attn_inputs[layer_idx]["q_nope_pre_bmm"] = q_nope_pre_bmm.clone()
+    _stashed_attn_inputs[layer_idx]["q_nope_post_bmm"] = q_nope_post_bmm.clone()
+    _stashed_attn_inputs[layer_idx]["q_pe"] = q_pe.clone()
+
+
 def stash_attn_inputs(layer_idx: int, mqa_q, kv_cache,
                       block_table, seq_lens, num_actual_toks: int,
-                      attn_output=None,
-                      mqa_ql_nope=None, mqa_q_pe=None) -> None:
+                      attn_output=None) -> None:
     """Called inside mla_attention forward_impl after fwd_mqa.
     Keeps references (+ cloned mqa_q) for the NaN repro dump.
     """
@@ -273,19 +286,16 @@ def stash_attn_inputs(layer_idx: int, mqa_q, kv_cache,
         mqa_q_save = tuple(t.clone() for t in mqa_q)
     else:
         mqa_q_save = mqa_q.clone()
-    _stashed_attn_inputs[layer_idx] = {
+    d = _stashed_attn_inputs.setdefault(layer_idx, {})
+    d.update({
         "mqa_q": mqa_q_save,
         "kv_cache": kv_cache,           # persistent, no clone needed
         "block_table": block_table,     # persistent
         "seq_lens": seq_lens,           # persistent
         "num_actual_toks": num_actual_toks,
-    }
+    })
     if attn_output is not None:
-        _stashed_attn_inputs[layer_idx]["attn_output"] = attn_output.clone()
-    if mqa_ql_nope is not None:
-        _stashed_attn_inputs[layer_idx]["mqa_ql_nope_prequant"] = mqa_ql_nope.clone()
-    if mqa_q_pe is not None:
-        _stashed_attn_inputs[layer_idx]["mqa_q_pe_prequant"] = mqa_q_pe.clone()
+        d["attn_output"] = attn_output.clone()
 
 
 def _find_origin_layer(nan_cpu: torch.Tensor) -> int | None:

@@ -236,6 +236,7 @@ from vllm.model_executor.models.nan_check_helper import mark_attn as _nan_mark_m
 from vllm.model_executor.models.nan_check_helper import report_scales as _nan_report_scales
 from vllm.model_executor.models.nan_check_helper import report_batch_info as _nan_report_batch
 from vllm.model_executor.models.nan_check_helper import stash_attn_inputs as _nan_stash_attn
+from vllm.model_executor.models.nan_check_helper import stash_prequant as _nan_stash_prequant
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
@@ -691,6 +692,15 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
             _nan_mark_mla(mqa_ql_nope, 7, self._nan_layer_idx)  # after W_UK bmm
 
+            # Clone bf16 tensors NOW before FP8 quant frees them
+            _nan_stash_prequant(
+                self._nan_layer_idx,
+                q_input=mqa_q,              # raw q after QKV+norm+RoPE
+                q_nope_pre_bmm=mqa_q_nope,  # nope before W_UK BMM (transposed)
+                q_nope_post_bmm=mqa_ql_nope,  # nope after W_UK BMM
+                q_pe=mqa_q_pe,              # pe after RoPE (+ head padding)
+            )
+
             if fp8_attention and self.impl.supports_quant_query_input:
                 assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
                 assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
@@ -740,8 +750,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 seq_lens=attn_metadata.decode.seq_lens,
                 num_actual_toks=num_actual_toks,
                 attn_output=attn_out,
-                mqa_ql_nope=mqa_ql_nope,
-                mqa_q_pe=mqa_q_pe,
             )
 
             # correct dcp attn_out with lse.
