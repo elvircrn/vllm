@@ -237,7 +237,6 @@ from vllm.model_executor.models.nan_check_helper import report_scales as _nan_re
 from vllm.model_executor.models.nan_check_helper import report_batch_info as _nan_report_batch
 from vllm.model_executor.models.nan_check_helper import stash_if_nan as _nan_stash_if_nan
 from vllm.model_executor.models.nan_check_helper import mark_fwd_mqa_real as _nan_mark_fwd_mqa_real
-from vllm.model_executor.models.nan_check_helper import set_context as _nan_set_context
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
@@ -593,7 +592,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         fp8_attention = self.kv_cache_dtype.startswith("fp8")
 
         num_actual_toks = attn_metadata.num_actual_tokens
-        _nan_set_context(num_actual_toks)
 
         # Inputs and outputs may be padded for CUDA graphs
         output_padded = output

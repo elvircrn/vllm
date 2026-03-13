@@ -15,12 +15,6 @@ _nan_reported = False
 _inf_reported = False
 _log_fh = None
 
-# Forward-pass context: set once per layer by set_context().
-# num_actual_toks is a Python int baked at compile time (same for all
-# layers in a CUDA graph), so the stale value from the previous layer
-# is identical.  Used by mark() and mark_attn() to filter out padding.
-_ctx_num_actual_toks: int = 0
-
 # Count tensors: shape (num_layers, 4)
 # column 0 = input (before layernorm), column 1 = pre_attn (after layernorm),
 # column 2 = attn, column 3 = moe
@@ -57,14 +51,6 @@ def ensure_flags(num_layers: int, device: torch.device) -> None:
         _fwd_mqa_real_nan = torch.zeros(num_layers, dtype=torch.int64, device=device)
 
 
-def set_context(num_actual_toks: int) -> None:
-    """Store the real-token count for the current forward pass.
-    Called from mla_attention.py at the start of forward_impl.
-    """
-    global _ctx_num_actual_toks
-    _ctx_num_actual_toks = num_actual_toks
-
-
 def _is_fp8(dtype: torch.dtype) -> bool:
     return dtype in (torch.float8_e4m3fn, torch.float8_e5m2,
                      torch.float8_e4m3fnuz, torch.float8_e5m2fnuz)
@@ -72,7 +58,7 @@ def _is_fp8(dtype: torch.dtype) -> bool:
 
 def mark(tensor: torch.Tensor, stage_col: int, layer_idx: int) -> None:
     """Called per-layer inside compiled/cudagraph region.
-    Only counts NaN/Inf in real tokens ([:_ctx_num_actual_toks]).
+    Only counts NaN/Inf in real tokens ([:_last_num_actual_toks]).
     All ops stay on GPU — no .item(), no sync, no graph break.
     """
     global _nan_counts, _inf_counts
@@ -80,8 +66,8 @@ def mark(tensor: torch.Tensor, stage_col: int, layer_idx: int) -> None:
         return
     if _is_fp8(tensor.dtype):
         return
-    n = _ctx_num_actual_toks
-    if n > 0 and n < tensor.shape[0]:
+    n = _last_num_actual_toks
+    if n is not None and n > 0 and n < tensor.shape[0]:
         tensor = tensor[:n]
     _nan_counts[layer_idx, stage_col] = tensor.isnan().sum()
     _inf_counts[layer_idx, stage_col] = tensor.isinf().sum()
@@ -94,7 +80,7 @@ def mark_attn(tensor: torch.Tensor, stage_col: int, layer_idx: int,
     Only counts NaN/Inf in real tokens.
     - seq_lens: pass for decode [B,...] tensors — masks with seq_lens > 0
     - skip_filter: pass True for kv_cache (different shape, no filtering)
-    - otherwise: auto-slices by _ctx_num_actual_toks for [N,...] tensors
+    - otherwise: auto-slices by _last_num_actual_toks for [N,...] tensors
     """
     global _attn_detail, _inf_attn_detail
     if _attn_detail is None:
@@ -105,14 +91,13 @@ def mark_attn(tensor: torch.Tensor, stage_col: int, layer_idx: int,
         nan_count = tensor.isnan().sum()
         inf_count = tensor.isinf().sum()
     elif seq_lens is not None:
-        real_mask = (seq_lens > 0)
-        for _ in range(tensor.dim() - 1):
-            real_mask = real_mask.unsqueeze(-1)
+        # Broadcast [B] mask to tensor shape: [B] → [B, 1, 1, ...]
+        real_mask = (seq_lens > 0).view(-1, *([1] * (tensor.dim() - 1)))
         nan_count = (tensor.isnan() & real_mask).sum()
         inf_count = (tensor.isinf() & real_mask).sum()
     else:
-        n = _ctx_num_actual_toks
-        if n > 0 and n < tensor.shape[0]:
+        n = _last_num_actual_toks
+        if n is not None and n > 0 and n < tensor.shape[0]:
             tensor = tensor[:n]
         nan_count = tensor.isnan().sum()
         inf_count = tensor.isinf().sum()
