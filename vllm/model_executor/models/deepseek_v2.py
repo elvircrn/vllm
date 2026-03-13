@@ -37,6 +37,7 @@ from vllm.model_executor.models.nan_check_helper import (
     ensure_flags as _nan_ensure_flags,
     mark as _nan_mark,
     report_if_nan as _nan_report,
+    stash_model_inputs as _nan_stash_model_inputs,
 )
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
@@ -1362,6 +1363,8 @@ class DeepseekV2ForCausalLM(
     ) -> torch.Tensor | IntermediateTensors:
         # Init NaN flags before layers so mark() is captured with flags present
         _nan_ensure_flags(62, positions.device)
+        # Stash model inputs for NaN repro — refs only, zero GPU overhead
+        _nan_stash_model_inputs(self.model, input_ids, positions, inputs_embeds)
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )

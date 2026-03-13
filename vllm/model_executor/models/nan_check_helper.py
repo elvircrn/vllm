@@ -250,84 +250,40 @@ def _emit_report(tag: str, hidden_states: torch.Tensor,
 
 
 # ---------------------------------------------------------------------------
-# Stash latest attention inputs per layer for NaN repro dump.
-# Only tensor references (no copy) — nearly free.
-# kv_cache and block_table/seq_lens are persistent across layers so the
-# last-stashed reference is still valid at compute_logits time.
-# mqa_q is ephemeral (reused by CUDA graph), so we clone it.
+# Model-input stashing for NaN repro dump.
+#
+# Instead of cloning per-layer intermediates inside torch.compile (which
+# causes OOM and compile issues), we save refs to model-level inputs
+# OUTSIDE the compiled region.  Everything here is either a ref to a
+# persistent tensor (KV cache, block_table) or a tiny tensor (positions,
+# input_ids).  Zero GPU memory overhead.
+#
+# At dump time we extract KV cache pages actually used by the batch,
+# keeping the .pt file small (~100-200 MB for typical decode).
 # ---------------------------------------------------------------------------
-_stashed_attn_inputs: dict[int, dict] = {}
+_stashed_model: "torch.nn.Module | None" = None
+_stashed_input_ids: torch.Tensor | None = None
+_stashed_positions: torch.Tensor | None = None
+_stashed_inputs_embeds: torch.Tensor | None = None
 
 
-_prequant_bufs: dict[tuple[int, int], list[torch.Tensor]] = {}
+def stash_model_inputs(model: "torch.nn.Module",
+                       input_ids: "torch.Tensor | None",
+                       positions: torch.Tensor,
+                       inputs_embeds: "torch.Tensor | None" = None) -> None:
+    """Called OUTSIDE torch.compile in DeepseekV2ForCausalLM.forward().
 
-
-def stash_prequant(layer_idx: int, q_input,
-                   q_nope_post_bmm, q_pe) -> None:
-    """Copy bf16 tensors into pre-allocated buffers BEFORE FP8 quant.
-
-    Uses .copy_() instead of .clone() to avoid tensor allocations inside
-    torch.compile (fullgraph=True) / CUDA graph capture.  Buffers are
-    keyed by (layer_idx, batch_size) since each CUDA graph batch size
-    is compiled separately (dynamic=False).
+    Saves refs only — zero GPU memory overhead.  The model ref lets us
+    walk layers to grab KV caches at dump time.
     """
+    global _stashed_model, _stashed_input_ids, _stashed_positions
+    global _stashed_inputs_embeds
     if _nan_real_reported:
         return
-    B = q_input.shape[0]
-    key = (layer_idx, B)
-    bufs = _prequant_bufs.get(key)
-    if bufs is None:
-        bufs = [
-            torch.empty_like(q_input),
-            torch.empty_like(q_nope_post_bmm),
-            torch.empty_like(q_pe),
-        ]
-        _prequant_bufs[key] = bufs
-    bufs[0].copy_(q_input)
-    bufs[1].copy_(q_nope_post_bmm)
-    bufs[2].copy_(q_pe)
-
-
-_attn_input_bufs: dict[tuple[int, int], list[torch.Tensor]] = {}
-
-
-def stash_attn_inputs(layer_idx: int, mqa_q, kv_cache,
-                      block_table, seq_lens, num_actual_toks: int) -> None:
-    """Called inside mla_attention forward_impl after fwd_mqa.
-
-    Uses .copy_() into pre-allocated buffers (keyed by layer+batch_size)
-    instead of .clone() to avoid tensor allocations inside
-    torch.compile (fullgraph=True) / CUDA graph capture.
-    kv_cache, block_table, seq_lens are persistent — refs are fine.
-    """
-    if _nan_real_reported:
-        return
-    if isinstance(mqa_q, tuple):
-        B = mqa_q[0].shape[0]
-    else:
-        B = mqa_q.shape[0]
-    key = (layer_idx, B)
-    bufs = _attn_input_bufs.get(key)
-    if bufs is None:
-        if isinstance(mqa_q, tuple):
-            bufs = [torch.empty_like(t) for t in mqa_q]
-        else:
-            bufs = [torch.empty_like(mqa_q)]
-        _attn_input_bufs[key] = bufs
-    if isinstance(mqa_q, tuple):
-        for i, t in enumerate(mqa_q):
-            bufs[i].copy_(t)
-    else:
-        bufs[0].copy_(mqa_q)
-    # Store refs to persistent tensors + layout metadata for dump
-    _stashed_attn_inputs[layer_idx] = {
-        "kv_cache": kv_cache,
-        "block_table": block_table,
-        "seq_lens": seq_lens,
-        "num_actual_toks": num_actual_toks,
-        "mqa_q_is_tuple": isinstance(mqa_q, tuple),
-        "mqa_q_count": len(mqa_q) if isinstance(mqa_q, tuple) else 1,
-    }
+    _stashed_model = model
+    _stashed_input_ids = input_ids
+    _stashed_positions = positions
+    _stashed_inputs_embeds = inputs_embeds
 
 
 def _find_origin_layer(nan_cpu: torch.Tensor) -> int | None:
@@ -341,24 +297,14 @@ def _find_origin_layer(nan_cpu: torch.Tensor) -> int | None:
 def _dump_repro(origin_layer: int, hidden_states: torch.Tensor,
                 nan_cpu: torch.Tensor,
                 attn_nan_cpu: torch.Tensor | None) -> None:
-    """Save stashed attention inputs to disk for NaN reproduction."""
-    if origin_layer not in _stashed_attn_inputs:
-        f = _get_log()
-        msg = (f"[NAN_REPRO] origin layer {origin_layer} not in stash "
-               f"(stashed: {list(_stashed_attn_inputs.keys())})\n")
-        f.write(msg)
-        f.flush()
-        print(msg, file=sys.stderr, end="", flush=True)
-        return
-
+    """Save model inputs + KV cache to disk for full forward-pass replay."""
     log_dir = "/mnt/lustre/vllm-vlm-elvircrn/logs/nan_check"
     hostname = os.environ.get("HOSTNAME", "unknown")
     gpu = os.environ.get("CUDA_VISIBLE_DEVICES", "x")
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     save_path = f"{log_dir}/{hostname}_gpu{gpu}_{ts}_repro_layer{origin_layer}.pt"
 
-    stashed = _stashed_attn_inputs[origin_layer]
-    save_dict = {
+    save_dict: dict = {
         "origin_layer": origin_layer,
         "hidden_states": hidden_states.cpu(),
         "nan_counts": nan_cpu,
@@ -369,30 +315,77 @@ def _dump_repro(origin_layer: int, hidden_states: torch.Tensor,
     if _saved_scales is not None:
         save_dict["scales"] = _saved_scales
 
-    # Persistent tensor refs from stash (kv_cache, block_table, seq_lens)
-    for k, v in stashed.items():
-        if isinstance(v, torch.Tensor):
-            save_dict[k] = v.cpu()
-        else:
-            save_dict[k] = v
+    # Model inputs (tiny — token ids + positions)
+    if _stashed_input_ids is not None:
+        save_dict["input_ids"] = _stashed_input_ids.cpu()
+    if _stashed_positions is not None:
+        save_dict["positions"] = _stashed_positions.cpu()
+    if _stashed_inputs_embeds is not None:
+        save_dict["inputs_embeds"] = _stashed_inputs_embeds.cpu()
 
-    # Recover mqa_q from pre-allocated attn_input_bufs
-    nq = stashed.get("mqa_q_count", 1)
-    for akey, abufs in _attn_input_bufs.items():
-        if akey[0] == origin_layer:
-            if stashed.get("mqa_q_is_tuple", False):
-                save_dict["mqa_q"] = tuple(abufs[i].cpu() for i in range(nq))
-            else:
-                save_dict["mqa_q"] = abufs[0].cpu()
-            break
+    # Walk model layers to grab KV caches and attention metadata
+    model = _stashed_model
+    if model is not None:
+        from vllm.forward_context import get_forward_context
+        try:
+            fwd_ctx = get_forward_context()
+            ve = fwd_ctx.virtual_engine
+        except Exception:
+            ve = 0
 
-    # Add prequant buffers (bf16 tensors copied before FP8 quant)
-    prequant_names = ["q_input", "q_nope_post_bmm", "q_pe"]
-    for pkey, pbufs in _prequant_bufs.items():
-        if pkey[0] == origin_layer:
-            for i, name in enumerate(prequant_names):
-                save_dict[name] = pbufs[i].cpu()
-            break
+        kv_caches = {}
+        block_tables = {}
+        seq_lens_dict = {}
+        for layer in model.layers:
+            idx = layer.layer_idx
+            attn = getattr(layer, "self_attn", None)
+            if attn is None:
+                continue
+            mla = getattr(attn, "mla_attn", None)
+            if mla is None:
+                continue
+            # KV cache — persistent tensor, just .cpu() the used pages
+            kv = mla.kv_cache[ve] if len(mla.kv_cache) > ve else None
+            if kv is not None and kv.numel() > 0:
+                # Get block_table and seq_lens from forward context
+                layer_name = mla.layer_name
+                try:
+                    meta = fwd_ctx.attn_metadata
+                    if isinstance(meta, dict):
+                        meta = meta[layer_name]
+                    if hasattr(meta, "decode") and meta.decode is not None:
+                        bt = meta.decode.block_table
+                        sl = meta.decode.seq_lens
+                        if idx == 0:
+                            # Save once — same for all layers
+                            block_tables["block_table"] = bt.cpu()
+                            seq_lens_dict["seq_lens"] = sl.cpu()
+                        # Extract only used pages to keep dump small
+                        page_size = kv.shape[1] if kv.dim() >= 2 else 128
+                        used_pages = set()
+                        for b in range(sl.shape[0]):
+                            slen = sl[b].item()
+                            if slen == 0:
+                                continue
+                            n_pages = (slen + page_size - 1) // page_size
+                            for p in bt[b, :n_pages].tolist():
+                                if 0 <= p < kv.shape[0]:
+                                    used_pages.add(p)
+                        if used_pages:
+                            page_list = sorted(used_pages)
+                            kv_caches[f"kv_cache_layer{idx}"] = kv[page_list].cpu()
+                            kv_caches[f"kv_pages_layer{idx}"] = page_list
+                        else:
+                            kv_caches[f"kv_cache_layer{idx}"] = kv[:1].cpu()
+                            kv_caches[f"kv_pages_layer{idx}"] = []
+                except Exception as e:
+                    f = _get_log()
+                    f.write(f"[NAN_REPRO] layer {idx} kv extract failed: {e}\n")
+                    f.flush()
+
+        save_dict.update(block_tables)
+        save_dict.update(seq_lens_dict)
+        save_dict.update(kv_caches)
 
     try:
         torch.save(save_dict, save_path)
@@ -407,8 +400,6 @@ def _dump_repro(origin_layer: int, hidden_states: torch.Tensor,
         f.write(msg)
         f.flush()
         print(msg, file=sys.stderr, end="", flush=True)
-
-    _stashed_attn_inputs.clear()
 
 
 def _all_reported() -> bool:
