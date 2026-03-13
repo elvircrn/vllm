@@ -262,7 +262,7 @@ _stashed_attn_inputs: dict[int, dict] = {}
 _prequant_bufs: dict[tuple[int, int], list[torch.Tensor]] = {}
 
 
-_MAX_STASH_BATCH = 4
+_MAX_STASH_BATCH = 16
 
 
 def stash_prequant(layer_idx: int, q_input,
