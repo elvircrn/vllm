@@ -67,7 +67,7 @@ def mark(tensor: torch.Tensor, stage_col: int, layer_idx: int) -> None:
     if _is_fp8(tensor.dtype):
         return
     n = _last_num_actual_toks
-    if n is not None and n > 0 and n < tensor.shape[0]:
+    if n > 0 and n < tensor.shape[0]:
         tensor = tensor[:n]
     _nan_counts[layer_idx, stage_col] = tensor.isnan().sum()
     _inf_counts[layer_idx, stage_col] = tensor.isinf().sum()
@@ -97,7 +97,7 @@ def mark_attn(tensor: torch.Tensor, stage_col: int, layer_idx: int,
         inf_count = (tensor.isinf() & real_mask).sum()
     else:
         n = _last_num_actual_toks
-        if n is not None and n > 0 and n < tensor.shape[0]:
+        if n > 0 and n < tensor.shape[0]:
             tensor = tensor[:n]
         nan_count = tensor.isnan().sum()
         inf_count = tensor.isinf().sum()
@@ -125,7 +125,7 @@ def mark_fwd_mqa_real(attn_out: torch.Tensor, layer_idx: int,
 
 
 _saved_batch_info: dict | None = None
-_last_num_actual_toks: int | None = None
+_last_num_actual_toks: int = 0
 
 
 def report_batch_info(layer_idx: int, num_actual_toks: int,
@@ -460,7 +460,7 @@ def report_if_nan(hidden_states: torch.Tensor) -> None:
     n = _last_num_actual_toks
     total = hidden_states.shape[0]
 
-    if n is not None and n < total:
+    if n > 0 and n < total:
         real = hidden_states[:n]
     else:
         real = hidden_states
