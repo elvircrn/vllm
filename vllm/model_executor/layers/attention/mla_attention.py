@@ -235,8 +235,8 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.nan_check_helper import mark_attn as _nan_mark_mla
 from vllm.model_executor.models.nan_check_helper import report_scales as _nan_report_scales
 from vllm.model_executor.models.nan_check_helper import report_batch_info as _nan_report_batch
-from vllm.model_executor.models.nan_check_helper import stash_attn_inputs as _nan_stash_attn
-from vllm.model_executor.models.nan_check_helper import stash_prequant as _nan_stash_prequant
+from vllm.model_executor.models.nan_check_helper import stash_if_nan as _nan_stash_if_nan
+from vllm.model_executor.models.nan_check_helper import mark_fwd_mqa_real as _nan_mark_fwd_mqa_real
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
@@ -692,13 +692,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
             _nan_mark_mla(mqa_ql_nope, 7, self._nan_layer_idx)  # after W_UK bmm
 
-            # Clone bf16 tensors NOW before FP8 quant frees them
-            _nan_stash_prequant(
-                self._nan_layer_idx,
-                q_input=mqa_q,              # raw q after QKV+norm+RoPE
-                q_nope_post_bmm=mqa_ql_nope,  # nope after W_UK BMM
-                q_pe=mqa_q_pe,              # pe after RoPE (+ head padding)
-            )
+            # Save refs to bf16 tensors for stash_if_nan (called after fwd_mqa)
+            _nan_q_input = mqa_q
+            _nan_q_nope_post_bmm = mqa_ql_nope
+            _nan_q_pe = mqa_q_pe
 
             if fp8_attention and self.impl.supports_quant_query_input:
                 assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
@@ -724,6 +721,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 _nan_mark_mla(mqa_q, 12, self._nan_layer_idx)  # mqa_q before fwd_mqa
             attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, attn_metadata, self)
             _nan_mark_mla(attn_out, 8, self._nan_layer_idx)  # after fwd_mqa
+            _nan_mark_fwd_mqa_real(attn_out, self._nan_layer_idx, attn_metadata.decode.seq_lens)
             if lse is not None:
                 _nan_mark_mla(lse, 13, self._nan_layer_idx)  # lse after fwd_mqa
             _nan_report_scales(
@@ -741,8 +739,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 num_decode_tokens=num_mqa_tokens,
                 num_mha_tokens=num_mha_tokens,
             )
-            _nan_stash_attn(
+            _nan_stash_if_nan(
                 self._nan_layer_idx,
+                q_input=_nan_q_input,
+                q_nope_post_bmm=_nan_q_nope_post_bmm,
+                q_pe=_nan_q_pe,
                 mqa_q=mqa_q,
                 kv_cache=kv_cache,
                 block_table=attn_metadata.decode.block_table,
