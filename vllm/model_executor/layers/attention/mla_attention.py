@@ -696,7 +696,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             _nan_stash_prequant(
                 self._nan_layer_idx,
                 q_input=mqa_q,              # raw q after QKV+norm+RoPE
-                q_nope_pre_bmm=mqa_q_nope,  # nope before W_UK BMM (transposed)
                 q_nope_post_bmm=mqa_ql_nope,  # nope after W_UK BMM
                 q_pe=mqa_q_pe,              # pe after RoPE (+ head padding)
             )
@@ -749,7 +748,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 block_table=attn_metadata.decode.block_table,
                 seq_lens=attn_metadata.decode.seq_lens,
                 num_actual_toks=num_actual_toks,
-                attn_output=attn_out,
             )
 
             # correct dcp attn_out with lse.

@@ -262,7 +262,7 @@ _stashed_attn_inputs: dict[int, dict] = {}
 _prequant_bufs: dict[tuple[int, int], list[torch.Tensor]] = {}
 
 
-def stash_prequant(layer_idx: int, q_input, q_nope_pre_bmm,
+def stash_prequant(layer_idx: int, q_input,
                    q_nope_post_bmm, q_pe) -> None:
     """Copy bf16 tensors into pre-allocated buffers BEFORE FP8 quant.
 
@@ -279,23 +279,20 @@ def stash_prequant(layer_idx: int, q_input, q_nope_pre_bmm,
     if bufs is None:
         bufs = [
             torch.empty_like(q_input),
-            torch.empty_like(q_nope_pre_bmm),
             torch.empty_like(q_nope_post_bmm),
             torch.empty_like(q_pe),
         ]
         _prequant_bufs[key] = bufs
     bufs[0].copy_(q_input)
-    bufs[1].copy_(q_nope_pre_bmm)
-    bufs[2].copy_(q_nope_post_bmm)
-    bufs[3].copy_(q_pe)
+    bufs[1].copy_(q_nope_post_bmm)
+    bufs[2].copy_(q_pe)
 
 
 _attn_input_bufs: dict[tuple[int, int], list[torch.Tensor]] = {}
 
 
 def stash_attn_inputs(layer_idx: int, mqa_q, kv_cache,
-                      block_table, seq_lens, num_actual_toks: int,
-                      attn_output=None) -> None:
+                      block_table, seq_lens, num_actual_toks: int) -> None:
     """Called inside mla_attention forward_impl after fwd_mqa.
 
     Uses .copy_() into pre-allocated buffers (keyed by layer+batch_size)
@@ -316,16 +313,12 @@ def stash_attn_inputs(layer_idx: int, mqa_q, kv_cache,
             bufs = [torch.empty_like(t) for t in mqa_q]
         else:
             bufs = [torch.empty_like(mqa_q)]
-        if attn_output is not None:
-            bufs.append(torch.empty_like(attn_output))
         _attn_input_bufs[key] = bufs
     if isinstance(mqa_q, tuple):
         for i, t in enumerate(mqa_q):
             bufs[i].copy_(t)
     else:
         bufs[0].copy_(mqa_q)
-    if attn_output is not None and len(bufs) > (len(mqa_q) if isinstance(mqa_q, tuple) else 1):
-        bufs[-1].copy_(attn_output)
     # Store refs to persistent tensors + layout metadata for dump
     _stashed_attn_inputs[layer_idx] = {
         "kv_cache": kv_cache,
@@ -334,7 +327,6 @@ def stash_attn_inputs(layer_idx: int, mqa_q, kv_cache,
         "num_actual_toks": num_actual_toks,
         "mqa_q_is_tuple": isinstance(mqa_q, tuple),
         "mqa_q_count": len(mqa_q) if isinstance(mqa_q, tuple) else 1,
-        "has_attn_output": attn_output is not None,
     }
 
 
@@ -384,21 +376,18 @@ def _dump_repro(origin_layer: int, hidden_states: torch.Tensor,
         else:
             save_dict[k] = v
 
-    # Recover mqa_q and attn_output from pre-allocated attn_input_bufs
+    # Recover mqa_q from pre-allocated attn_input_bufs
     nq = stashed.get("mqa_q_count", 1)
-    has_ao = stashed.get("has_attn_output", False)
     for akey, abufs in _attn_input_bufs.items():
         if akey[0] == origin_layer:
             if stashed.get("mqa_q_is_tuple", False):
                 save_dict["mqa_q"] = tuple(abufs[i].cpu() for i in range(nq))
             else:
                 save_dict["mqa_q"] = abufs[0].cpu()
-            if has_ao and len(abufs) > nq:
-                save_dict["attn_output"] = abufs[nq].cpu()
             break
 
     # Add prequant buffers (bf16 tensors copied before FP8 quant)
-    prequant_names = ["q_input", "q_nope_pre_bmm", "q_nope_post_bmm", "q_pe"]
+    prequant_names = ["q_input", "q_nope_post_bmm", "q_pe"]
     for pkey, pbufs in _prequant_bufs.items():
         if pkey[0] == origin_layer:
             for i, name in enumerate(prequant_names):
