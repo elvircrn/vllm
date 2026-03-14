@@ -481,24 +481,30 @@ _kv_poison_reported = False
 def _emit_kv_poison(hidden_states: torch.Tensor,
                     nan_cpu: torch.Tensor,
                     attn_nan_cpu: torch.Tensor | None,
+                    attn_inf_cpu: torch.Tensor | None,
                     num_actual_toks: int) -> None:
-    """Emit [KV_POISON_FIRST] when kv_c_normed_real first has NaN.
+    """Emit [KV_POISON_FIRST] when kv_c_normed_real first has NaN or Inf.
 
     This fires independently of hidden_states NaN — catches the
-    initial write of NaN to the KV cache.
+    initial write of NaN/Inf to the KV cache. Inf matters because
+    FP8 e4m3fn has no Inf representation and bf16 Inf may become
+    FP8 NaN.
     """
     f = _get_log()
-    h = hidden_states.shape[-1]
 
+    first_nan_layer = -1
+    first_inf_layer = -1
     if attn_nan_cpu is not None:
         poison_layers = (attn_nan_cpu[:, 17] > 0).nonzero(as_tuple=True)[0]
-        first_layer = poison_layers[0].item() if len(poison_layers) > 0 else -1
-    else:
-        first_layer = -1
+        first_nan_layer = poison_layers[0].item() if len(poison_layers) > 0 else -1
+    if attn_inf_cpu is not None:
+        poison_layers = (attn_inf_cpu[:, 17] > 0).nonzero(as_tuple=True)[0]
+        first_inf_layer = poison_layers[0].item() if len(poison_layers) > 0 else -1
 
     msg = (
-        f"[KV_POISON_FIRST] kv_c_normed has NaN for real tokens! "
-        f"first_layer={first_layer} "
+        f"[KV_POISON_FIRST] kv_c_normed has NaN/Inf for real tokens! "
+        f"first_nan_layer={first_nan_layer} "
+        f"first_inf_layer={first_inf_layer} "
         f"num_actual_toks={num_actual_toks} "
         f"shape={list(hidden_states.shape)}\n"
     )
@@ -506,29 +512,38 @@ def _emit_kv_poison(hidden_states: torch.Tensor,
     f.flush()
     print(msg, file=sys.stderr, end="", flush=True)
 
-    # Emit full detail for all layers with nonzero kv_c_normed_real
-    if attn_nan_cpu is not None:
-        for layer_idx in range(attn_nan_cpu.shape[0]):
-            ad = attn_nan_cpu[layer_idx]
-            kv_c_real = ad[17].item()
-            kv_fp8 = ad[18].item()
-            fwd_mqa_c = ad[8].item()
-            if kv_c_real + kv_fp8 + fwd_mqa_c == 0:
-                continue
-            nc = nan_cpu[layer_idx] if nan_cpu is not None else None
-            msg = (
-                f"[KV_POISON_FIRST] layer={layer_idx} "
-                f"kv_c_normed_real={kv_c_real} "
-                f"kv_cache_fp8_nan={kv_fp8} "
-                f"fwd_mqa={fwd_mqa_c} "
-                f"W_UK_bmm={ad[7].item()} "
-                f"mqa_q_pre={ad[12].item()} "
-                f"input={nc[0].item() if nc is not None else '?'} "
-                f"kv_norm={ad[2].item()}\n"
-            )
-            f.write(msg)
-            f.flush()
-            print(msg, file=sys.stderr, end="", flush=True)
+    # Emit full detail for all layers with nonzero kv_c_normed_real NaN or Inf
+    num_layers = max(
+        attn_nan_cpu.shape[0] if attn_nan_cpu is not None else 0,
+        attn_inf_cpu.shape[0] if attn_inf_cpu is not None else 0,
+    )
+    for layer_idx in range(num_layers):
+        ad = attn_nan_cpu[layer_idx] if attn_nan_cpu is not None else None
+        ai = attn_inf_cpu[layer_idx] if attn_inf_cpu is not None else None
+        kv_c_nan = ad[17].item() if ad is not None else 0
+        kv_c_inf = ai[17].item() if ai is not None else 0
+        kv_fp8 = ad[18].item() if ad is not None else 0
+        fwd_mqa_nan = ad[8].item() if ad is not None else 0
+        fwd_mqa_inf = ai[8].item() if ai is not None else 0
+        if kv_c_nan + kv_c_inf + kv_fp8 + fwd_mqa_nan + fwd_mqa_inf == 0:
+            continue
+        nc = nan_cpu[layer_idx] if nan_cpu is not None else None
+        msg = (
+            f"[KV_POISON_FIRST] layer={layer_idx} "
+            f"kv_c_normed_nan={kv_c_nan} "
+            f"kv_c_normed_inf={kv_c_inf} "
+            f"kv_cache_fp8_nan={kv_fp8} "
+            f"fwd_mqa_nan={fwd_mqa_nan} "
+            f"fwd_mqa_inf={fwd_mqa_inf} "
+            f"W_UK_bmm={ad[7].item() if ad is not None else 0} "
+            f"mqa_q_pre={ad[12].item() if ad is not None else 0} "
+            f"input={nc[0].item() if nc is not None else '?'} "
+            f"kv_norm_nan={ad[2].item() if ad is not None else 0} "
+            f"kv_norm_inf={ai[2].item() if ai is not None else 0}\n"
+        )
+        f.write(msg)
+        f.flush()
+        print(msg, file=sys.stderr, end="", flush=True)
 
     _emit_scales("KV_POISON")
     _emit_batch_info("KV_POISON")
@@ -560,11 +575,15 @@ def report_if_nan(hidden_states: torch.Tensor) -> None:
     real_has_nan = (not _nan_reported and real.isnan().any().item())
     real_has_inf = (not _inf_reported and real.isinf().any().item())
 
-    # Check kv_c_normed_real (col 17) — seq_lens-filtered, reliable
-    # during graph replay. Catches the initial poisoning event even
-    # when hidden_states[:1] looks clean.
+    # Check kv_c_normed_real (col 17) for NaN OR Inf — seq_lens-filtered,
+    # reliable during graph replay. Catches the initial poisoning event
+    # even when hidden_states[:1] looks clean.
+    # Inf matters because FP8 e4m3fn has no Inf representation — bf16 Inf
+    # may become FP8 NaN if __NV_SATFINITE has a hardware bug on Blackwell.
     kv_poison = (not _kv_poison_reported and _attn_detail is not None
-                 and _attn_detail[:, 17].any().item())
+                 and (_attn_detail[:, 17].any().item()
+                      or (_inf_attn_detail is not None
+                          and _inf_attn_detail[:, 17].any().item())))
 
     if not (real_has_nan or real_has_inf or kv_poison):
         _zero_all()
@@ -579,7 +598,7 @@ def report_if_nan(hidden_states: torch.Tensor) -> None:
 
     if kv_poison and not _kv_poison_reported:
         _kv_poison_reported = True
-        _emit_kv_poison(hidden_states, nan_cpu, attn_nan_cpu, n)
+        _emit_kv_poison(hidden_states, nan_cpu, attn_nan_cpu, attn_inf_cpu, n)
 
     if real_has_nan:
         _nan_reported = True
