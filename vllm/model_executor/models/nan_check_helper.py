@@ -21,13 +21,15 @@ _log_fh = None
 _nan_counts: torch.Tensor | None = None
 _inf_counts: torch.Tensor | None = None
 
-# Attention detail tensors: shape (num_layers, 17)
+# Attention detail tensors: shape (num_layers, 19)
 # Outer MLA wrapper (mla.py):
 #   0=qkv_proj, 1=q_norm, 2=kv_norm, 3=rope, 4=mla_attn, 5=o_proj
 # Inner MLAAttention (mla_attention.py):
 #   6=after_kv_cache_update, 7=after_W_UK_bmm, 8=after_fwd_mqa, 9=after_v_up
 #   10=after_fwd_mha, 11=kv_cache, 12=mqa_q_pre_fwd, 13=lse_post_fwd_mqa
 #   14=mha_q, 15=mha_kv_c_normed, 16=mha_k_pe
+#   17=kv_c_normed_decode_real (bf16, seq_lens-filtered)
+#   18=kv_cache_fp8_nan (FP8 NaN via uint8 bit pattern check)
 _attn_detail: torch.Tensor | None = None
 _inf_attn_detail: torch.Tensor | None = None
 
@@ -48,9 +50,9 @@ def ensure_flags(num_layers: int, device: torch.device) -> None:
     if _inf_counts is None or _inf_counts.shape[0] < num_layers:
         _inf_counts = torch.zeros(num_layers, 4, dtype=torch.int64, device=device)
     if _attn_detail is None or _attn_detail.shape[0] < num_layers:
-        _attn_detail = torch.zeros(num_layers, 17, dtype=torch.int64, device=device)
+        _attn_detail = torch.zeros(num_layers, 19, dtype=torch.int64, device=device)
     if _inf_attn_detail is None or _inf_attn_detail.shape[0] < num_layers:
-        _inf_attn_detail = torch.zeros(num_layers, 17, dtype=torch.int64, device=device)
+        _inf_attn_detail = torch.zeros(num_layers, 19, dtype=torch.int64, device=device)
     if _fwd_mqa_real_nan is None or _fwd_mqa_real_nan.shape[0] < num_layers:
         _fwd_mqa_real_nan = torch.zeros(num_layers, dtype=torch.int64, device=device)
     if _layer_idx_gpu is None or _layer_idx_gpu.shape[0] < num_layers:
@@ -109,6 +111,23 @@ def mark_attn(tensor: torch.Tensor, stage_col: int, layer_idx: int,
         inf_count = tensor.isinf().sum()
     _attn_detail[layer_idx, stage_col] = nan_count
     _inf_attn_detail[layer_idx, stage_col] = inf_count
+
+
+def mark_fp8_nan(tensor: torch.Tensor, stage_col: int, layer_idx: int) -> None:
+    """Count FP8 NaN values by checking uint8 bit patterns.
+
+    FP8 e4m3fn NaN: 0x7F (positive) and 0xFF (negative).
+    Only runs on FP8 tensors; no-op for other dtypes.
+    All ops stay on GPU — no .item(), no sync, no graph break.
+    """
+    if _attn_detail is None:
+        return
+    if not _is_fp8(tensor.dtype):
+        return
+    raw = tensor.view(torch.uint8)
+    # e4m3fn NaN: 0x7F or 0xFF (S111_1111)
+    nan_count = ((raw == 0x7F) | (raw == 0xFF)).sum()
+    _attn_detail[layer_idx, stage_col] = nan_count
 
 
 def mark_fwd_mqa_real(attn_out: torch.Tensor, layer_idx: int,
@@ -273,10 +292,12 @@ def _emit_report(tag: str, hidden_states: torch.Tensor,
                 f"[{tag}] layer={layer_idx} mla_inner: "
                 f"kv_cache_upd={ad[6].item()} W_UK_bmm={ad[7].item()} "
                 f"fwd_mqa={ad[8].item()} v_up_proj={ad[9].item()} "
-                f"fwd_mha={ad[10].item()} kv_cache={ad[11].item()} "
+                f"fwd_mha={ad[10].item()} kv_cache_bf16={ad[11].item()} "
                 f"mqa_q_pre={ad[12].item()} lse={ad[13].item()} "
                 f"mha_q={ad[14].item()} mha_kv_c={ad[15].item()} "
-                f"mha_k_pe={ad[16].item()}\n"
+                f"mha_k_pe={ad[16].item()} "
+                f"kv_c_normed_real={ad[17].item()} "
+                f"kv_cache_fp8_nan={ad[18].item()}\n"
             )
             f.write(msg)
             f.flush()

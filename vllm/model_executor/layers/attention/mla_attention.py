@@ -237,6 +237,7 @@ from vllm.model_executor.models.nan_check_helper import report_scales as _nan_re
 from vllm.model_executor.models.nan_check_helper import report_batch_info as _nan_report_batch
 from vllm.model_executor.models.nan_check_helper import stash_if_nan as _nan_stash_if_nan
 from vllm.model_executor.models.nan_check_helper import mark_fwd_mqa_real as _nan_mark_fwd_mqa_real
+from vllm.model_executor.models.nan_check_helper import mark_fp8_nan as _nan_mark_fp8
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
@@ -618,7 +619,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             num_mqa_tokens = attn_metadata.num_decode_tokens
             num_mha_tokens = q.size(0) - num_mqa_tokens
 
-        _nan_mark_mla(kv_cache, 11, self._nan_layer_idx, skip_filter=True)  # kv_cache before attn
+        _nan_mark_mla(kv_cache, 11, self._nan_layer_idx, skip_filter=True)  # kv_cache bf16 (skipped if FP8)
+        _nan_mark_fp8(kv_cache, 18, self._nan_layer_idx)  # kv_cache FP8 NaN (bit pattern check)
 
         if num_mha_tokens > 0:
             _nan_mark_mla(q[num_mqa_tokens:], 14, self._nan_layer_idx)  # mha q input
@@ -639,6 +641,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             mqa_q = q[:num_mqa_tokens]
             mqa_output_slice = output[:num_mqa_tokens]
             _decode_seq_lens = attn_metadata.decode.seq_lens if attn_metadata.decode is not None else None
+            # Check kv_c_normed for decode tokens with seq_lens filter (reliable during graph replay)
+            _nan_mark_mla(k_c_normed[:num_mqa_tokens], 17, self._nan_layer_idx, seq_lens=_decode_seq_lens)
 
             mqa_q_nope, mqa_q_pe = mqa_q.split(
                 [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
