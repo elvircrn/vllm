@@ -620,7 +620,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             num_mha_tokens = q.size(0) - num_mqa_tokens
 
         _nan_mark_mla(kv_cache, 11, self._nan_layer_idx, skip_filter=True)  # kv_cache bf16 (skipped if FP8)
-        _nan_mark_fp8(kv_cache, 18, self._nan_layer_idx)  # kv_cache FP8 NaN (bit pattern check)
 
         if num_mha_tokens > 0:
             _nan_mark_mla(q[num_mqa_tokens:], 14, self._nan_layer_idx)  # mha q input
