@@ -4,8 +4,10 @@
 
 import torch
 import torch.nn as nn
+from prometheus_client import Counter
 
 from vllm.config.model import LogprobsMode
+from vllm.logger import init_logger
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -14,7 +16,18 @@ from vllm.v1.sample.ops.logprobs import batched_count_greater_than
 from vllm.v1.sample.ops.penalties import apply_all_penalties
 from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
 
+logger = init_logger(__name__)
+
 _SAMPLING_EPS = 1e-5
+
+_NUM_LOGIT_NAN_REQUESTS = Counter(
+    "vllm:num_logit_nan_requests_total",
+    "Number of requests where model output logits contained NaN.",
+)
+_NUM_LOGIT_INF_REQUESTS = Counter(
+    "vllm:num_logit_inf_requests_total",
+    "Number of requests where model output logits contained Inf.",
+)
 
 
 class Sampler(nn.Module):
@@ -71,6 +84,19 @@ class Sampler(nn.Module):
         predict_bonus_token: bool = False,
         logprobs_mode_override: LogprobsMode | None = None,
     ) -> SamplerOutput:
+        # Check for NaN/Inf in logits. Per-request check: any NaN or Inf
+        # in a row means that request's logits are corrupted.
+        nan_mask = torch.any(torch.isnan(logits), dim=-1)
+        inf_mask = torch.any(torch.isinf(logits), dim=-1)
+        num_nan = nan_mask.sum().item()
+        num_inf = inf_mask.sum().item()
+        if num_nan > 0:
+            _NUM_LOGIT_NAN_REQUESTS.inc(num_nan)
+            logger.warning("NaN logits detected in %d requests", num_nan)
+        if num_inf > 0:
+            _NUM_LOGIT_INF_REQUESTS.inc(num_inf)
+            logger.warning("Inf logits detected in %d requests", num_inf)
+
         logprobs_mode = logprobs_mode_override or self.logprobs_mode
         # NOTE(woosuk): Use the original logits (before any penalties or
         # temperature scaling) for the top-k logprobs.
