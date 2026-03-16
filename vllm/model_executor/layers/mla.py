@@ -154,7 +154,10 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         # Add head dim of 1 to k_pe
         k_pe = k_pe.unsqueeze(1)
 
-        if self.rotary_emb is not None:
+        # When the fused path is active, skip upfront RoPE — it will
+        # be applied inside the fused kernel in forward_impl.
+        use_fused = getattr(self.mla_attn.impl, "use_fused_rope_quant", False)
+        if self.rotary_emb is not None and not use_fused:
             q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
                 positions, q[..., self.qk_nope_head_dim :], k_pe
             )
@@ -172,6 +175,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             kv_c_normed,
             k_pe,
             output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
+            positions=positions,
         )
 
         return self.o_proj(attn_out)[0]
