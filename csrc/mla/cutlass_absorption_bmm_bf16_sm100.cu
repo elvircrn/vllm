@@ -1,6 +1,12 @@
+// Enable GDC (Grid Dependency Control) for PDL on SM100.
+// This activates griddepcontrol.wait (consumer) and
+// griddepcontrol.launch_dependents (producer) in CUTLASS kernels.
+#define CUTLASS_ENABLE_GDC_FOR_SM100
+
 // clang-format off
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <cstdlib>
 
 #include "cutlass/cutlass.h"
 #include "cute/tensor.hpp"
@@ -16,9 +22,6 @@
 #include "core/math.hpp"
 #include "cutlass_extensions/common.hpp"
 #include "cutlass_extensions/epilogue/scaled_mm_epilogues_c3x.hpp"
-
-// For cutlass_gemm_caller
-#include "quantization/w8a8/cutlass/c3x/cutlass_gemm_caller.cuh"
 // clang-format on
 
 /*
@@ -36,6 +39,14 @@
  *
  * The ScaledEpilogue applies scale_a and casts the FP32 accumulator to FP8.
  * This avoids runtime FP8 quantization of q_nope entirely.
+ *
+ * PDL (Programmatic Dependent Launch):
+ *   When VLLM_MLA_PDL=1, this kernel is launched as a PDL consumer of the
+ *   preceding DeepGEMM q_b_proj kernel.  CUTLASS_ENABLE_GDC_FOR_SM100 enables
+ *   griddepcontrol.wait in the mainloop (waits for producer's TMA stores)
+ *   and griddepcontrol.launch_dependents in the epilogue (signals downstream).
+ *   The launch uses cudaLaunchAttributeProgrammaticStreamSerialization so the
+ *   consumer grid can begin scheduling before the producer grid fully retires.
  */
 
 using namespace cute;
@@ -94,7 +105,7 @@ struct cutlass_3x_bmm_sm100_bf16 {
 };
 
 // ============================================================
-// Batched GEMM caller for BF16×BF16→FP8
+// Batched GEMM caller for BF16×BF16→FP8 (with optional PDL)
 // ============================================================
 
 template <typename Gemm>
@@ -103,8 +114,8 @@ void cutlass_bmm_caller_sm100_bf16(
     torch::Tensor const& a,        // [N_heads, B, K] bf16 (may be strided)
     torch::Tensor const& b,        // [N_heads, N, K] bf16
     torch::Tensor const& scale_a,  // [1] float
-    torch::Tensor const& scale_b   // [1] float
-) {
+    torch::Tensor const& scale_b,  // [1] float
+    bool launch_with_pdl = false) {
   using GemmKernel = typename Gemm::GemmKernel;
   using StrideA = typename GemmKernel::StrideA;
   using StrideB = typename GemmKernel::StrideB;
@@ -153,8 +164,30 @@ void cutlass_bmm_caller_sm100_bf16(
       Gemm::Epilogue::prepare_args(scale_a, scale_b), d_ptr, c_stride, d_ptr,
       d_stride};
 
-  c3x::cutlass_gemm_caller<GemmKernel>(a.device(), prob_shape, mainloop_args,
-                                       epilogue_args);
+  // --- Launch (with optional PDL consumer attributes) ---
+  cutlass::KernelHardwareInfo hw_info;
+  typename GemmKernel::Arguments args{cutlass::gemm::GemmUniversalMode::kGemm,
+                                      prob_shape, mainloop_args, epilogue_args,
+                                      hw_info};
+
+  using GemmOp = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+  GemmOp gemm_op;
+  CUTLASS_CHECK(gemm_op.can_implement(args));
+
+  size_t workspace_size = gemm_op.get_workspace_size(args);
+  auto const workspace_options =
+      torch::TensorOptions().dtype(torch::kUInt8).device(a.device());
+  auto workspace = torch::empty(workspace_size, workspace_options);
+
+  auto stream = at::cuda::getCurrentCUDAStream(a.device().index());
+
+  // GemmUniversalAdapter::run() supports launch_with_pdl natively on SM100.
+  // When true, it sets cudaLaunchAttributeProgrammaticStreamSerialization
+  // and the kernel uses griddepcontrol.wait before loading A from GMEM.
+  cutlass::Status status =
+      gemm_op.run(args, workspace.data_ptr(), stream,
+                  /*cuda_adapter=*/nullptr, launch_with_pdl);
+  CUTLASS_CHECK(status);
 }
 
 // ============================================================
@@ -221,19 +254,25 @@ void mla_absorption_bmm_bf16(torch::Tensor& out, torch::Tensor const& a,
   TORCH_CHECK(out.size(2) >= b.size(1), "out cols ", out.size(2),
               " must be >= N=", b.size(1));
 
+  // PDL: launch as consumer of preceding DeepGEMM q_b_proj
+  static const bool use_pdl = []() {
+    const char* env = std::getenv("VLLM_MLA_PDL");
+    return env && std::string(env) == "1";
+  }();
+
   uint32_t M = a.size(1);
 
   if (M <= 16) {
     return vllm::cutlass_bmm_caller_sm100_bf16<vllm::BmmGemm_BF16_M16>(
-        out, a, b, scale_a, scale_b);
+        out, a, b, scale_a, scale_b, use_pdl);
   } else if (M <= 64) {
     return vllm::cutlass_bmm_caller_sm100_bf16<vllm::BmmGemm_BF16_M64>(
-        out, a, b, scale_a, scale_b);
+        out, a, b, scale_a, scale_b, use_pdl);
   } else if (M <= 256) {
     return vllm::cutlass_bmm_caller_sm100_bf16<vllm::BmmGemm_BF16_M256>(
-        out, a, b, scale_a, scale_b);
+        out, a, b, scale_a, scale_b, use_pdl);
   } else {
     return vllm::cutlass_bmm_caller_sm100_bf16<vllm::BmmGemm_BF16_Default>(
-        out, a, b, scale_a, scale_b);
+        out, a, b, scale_a, scale_b, use_pdl);
   }
 }
