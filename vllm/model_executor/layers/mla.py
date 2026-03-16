@@ -108,6 +108,11 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             indexer=self.indexer,
         )
 
+        # Expose rotary_emb on the impl so the fused RoPE+FP8 path
+        # can access inv_freq directly (checked via getattr in forward_impl).
+        if self.rotary_emb is not None and hasattr(self.mla_attn, "impl"):
+            self.mla_attn.impl.rotary_emb = self.rotary_emb
+
         self.prefix = prefix
 
     def forward(
