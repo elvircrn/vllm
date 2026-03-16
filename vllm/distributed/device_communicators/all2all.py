@@ -25,14 +25,6 @@ if has_flashinfer_nvlink_two_sided():
         MnnvlMoe,  # type: ignore[import-not-found]
     )
 
-if has_flashinfer_nvlink_one_sided():
-    from flashinfer.comm import Mapping  # type: ignore[import-not-found]
-    from flashinfer.comm.mnnvl import MnnvlConfig  # type: ignore[import-not-found]
-    from flashinfer.comm.trtllm_moe_alltoall import (
-        MoeAlltoAll,  # type: ignore[import-not-found]
-        moe_a2a_get_workspace_size_per_rank,
-    )
-
 
 logger = init_logger(__name__)
 
@@ -668,7 +660,7 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
             self.world_size,
         )
         self.initialized = False
-        self.moe_alltoall: MoeAlltoAll | None = None
+        self.moe_alltoall = None
         self.mapping = None
 
     def initialize(
@@ -689,7 +681,14 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
             self.rank,
             self.world_size,
         )
-        self.mapping = Mapping(
+        from flashinfer.comm import (
+            Mapping as Mapping_,  # type: ignore[import-not-found]
+        )
+        from flashinfer.comm.mnnvl import (
+            MnnvlConfig as MnnvlConfig_,  # type: ignore[import-not-found]
+        )
+
+        self.mapping = Mapping_(
             self.world_size,
             self.rank,
             gpus_per_node,
@@ -701,7 +700,7 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
             CustomCommunicator,
         )
 
-        dp_config = MnnvlConfig(
+        dp_config = MnnvlConfig_(
             comm_backend=CustomCommunicator(get_dp_group().cpu_group),
         )
         total_dispatch_payload_size_per_token = (
@@ -711,6 +710,11 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
             + top_k * 4  # float32 topk weights
         )
         combine_payload_size_per_token = hidden_size * 2  # bf16 hidden states
+        from flashinfer.comm.trtllm_moe_alltoall import (  # type: ignore[import-not-found]
+            MoeAlltoAll,
+            moe_a2a_get_workspace_size_per_rank,
+        )
+
         self.workspace_size = moe_a2a_get_workspace_size_per_rank(
             ep_size=self.world_size,
             max_num_tokens=max_num_tokens,
