@@ -68,7 +68,7 @@ class CutlassMLABackend(MLACommonBackend):
 
 class SM100Workspace:
     def __init__(self, initial_workspace_size):
-        self._workspace_buf = torch.empty(
+        self._workspace_buf = torch.zeros(
             initial_workspace_size, device="cuda", dtype=torch.uint8
         )
 
@@ -162,6 +162,12 @@ class CutlassMLAImpl(MLACommonImpl[MLACommonMetadata]):
         # Share workspace buffer across all executions
         self._workspace = g_sm100_workspace
 
+        # Pre-allocated output buffer, lazily sized on first call.
+        # Zero-init once to prevent NaN in padding slots (seq_lens=0)
+        # from contaminating downstream per-tensor reductions.
+        self._decode_out: torch.Tensor | None = None
+        self._decode_lse: torch.Tensor | None = None
+
     def _sm100_cutlass_mla_decode(
         self,
         q_nope: torch.Tensor,
@@ -218,12 +224,26 @@ class CutlassMLAImpl(MLACommonImpl[MLACommonMetadata]):
             if is_quantized_kv_cache(self.kv_cache_dtype)
             else q_nope.dtype
         )
-        out = q_nope.new_empty((B_q, MAX_HEADS, D_latent), dtype=dtype)
-        lse = (
-            torch.empty((B_q, MAX_HEADS), dtype=torch.float32, device=q_nope.device)
-            if self.need_to_return_lse_for_decode
-            else torch.Tensor()
-        )
+        # Reuse pre-allocated zero-init output buffer to avoid a memset
+        # kernel on every CUDA graph replay.
+        if (
+            self._decode_out is None
+            or self._decode_out.shape[0] < B_q
+            or self._decode_out.dtype != dtype
+        ):
+            self._decode_out = q_nope.new_zeros((B_q, MAX_HEADS, D_latent), dtype=dtype)
+            if self.need_to_return_lse_for_decode:
+                self._decode_lse = torch.zeros(
+                    (B_q, MAX_HEADS),
+                    dtype=torch.float32,
+                    device=q_nope.device,
+                )
+        out = self._decode_out[:B_q]
+        if self.need_to_return_lse_for_decode:
+            assert self._decode_lse is not None
+            lse = self._decode_lse[:B_q]
+        else:
+            lse = torch.Tensor()
 
         ops.sm100_cutlass_mla_decode(
             out,
