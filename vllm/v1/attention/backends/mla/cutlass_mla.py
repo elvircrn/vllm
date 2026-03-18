@@ -218,7 +218,10 @@ class CutlassMLAImpl(MLACommonImpl[MLACommonMetadata]):
             if is_quantized_kv_cache(self.kv_cache_dtype)
             else q_nope.dtype
         )
-        out = q_nope.new_empty((B_q, MAX_HEADS, D_latent), dtype=dtype)
+        # NaN canary: fill output with NaN to detect contamination
+        out = torch.full(
+            (B_q, MAX_HEADS, D_latent), float("nan"), dtype=dtype, device=q_nope.device
+        )
         lse = (
             torch.empty((B_q, MAX_HEADS), dtype=torch.float32, device=q_nope.device)
             if self.need_to_return_lse_for_decode

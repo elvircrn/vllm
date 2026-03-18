@@ -181,6 +181,15 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
         if self.bmm2_scale is None:
             self.bmm2_scale = layer._v_scale_float
 
+        # NaN canary: fill output with NaN to detect contamination
+        B = q.shape[0]
+        out = torch.full(
+            (B, q.shape[2], self.kv_lora_rank),
+            float("nan"),
+            dtype=q.dtype,
+            device=q.device,
+        )
+
         o = trtllm_batch_decode_with_kv_cache_mla(
             query=q,
             kv_cache=kv_c_and_k_pe_cache.unsqueeze(1),
@@ -193,6 +202,7 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
             max_seq_len=attn_metadata.max_seq_len,
             bmm1_scale=self.bmm1_scale,
             bmm2_scale=self.bmm2_scale,
+            out=out,
         )
 
         # Flatten the output for consistent shape

@@ -88,7 +88,8 @@ def init_attn_backend(
 def _allocate_kv_cache(kv_cache_config: KVCacheConfig, device: torch.device):
     kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-        tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
+        # NaN canary: fill with 0xFF bytes (NaN in bf16/fp16/fp8)
+        tensor = torch.full(kv_cache_tensor.size, -1, dtype=torch.int8, device=device)
         for layer_name in kv_cache_tensor.shared_by:
             kv_cache_raw_tensors[layer_name] = tensor
 
