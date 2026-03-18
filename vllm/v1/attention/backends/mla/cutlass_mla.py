@@ -230,7 +230,12 @@ class CutlassMLAImpl(MLACommonImpl[MLACommonMetadata]):
             or self._decode_out.shape[0] < B_q
             or self._decode_out.dtype != dtype
         ):
-            self._decode_out = q_nope.new_zeros((B_q, MAX_HEADS, D_latent), dtype=dtype)
+            self._decode_out = torch.full(
+                (B_q, MAX_HEADS, D_latent),
+                float("nan"),
+                dtype=dtype,
+                device=q_nope.device,
+            )
         out = self._decode_out[:B_q]
         lse = (
             torch.empty((B_q, MAX_HEADS), dtype=torch.float32, device=q_nope.device)

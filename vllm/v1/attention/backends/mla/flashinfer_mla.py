@@ -198,10 +198,9 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
             or self._decode_out.shape[0] < B
             or self._decode_out.dtype != dtype
         ):
-            self._decode_out = torch.zeros(
-                B,
-                q.shape[2],
-                self.kv_lora_rank,
+            self._decode_out = torch.full(
+                (B, q.shape[2], self.kv_lora_rank),
+                float("nan"),
                 dtype=dtype,
                 device=q.device,
             )
