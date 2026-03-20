@@ -172,18 +172,7 @@ class WeightServerLoader(BaseModelLoader):
         os.environ.setdefault("UCX_TLS", "all")
         os.environ.setdefault("UCX_NET_DEVICES", "all")
 
-        # Use physical device ID (not logical) for NIXL registration,
-        # so it matches the server's physical IDs.
-        cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
-        if cvd:
-            phys_map = [int(x.strip()) for x in cvd.split(",")]
-            local_device_id = phys_map[device.index]
-        else:
-            local_device_id = device.index
-        logger.info(
-            "Local device: %s (logical %d, physical %d)",
-            device, device.index, local_device_id,
-        )
+        local_device_id = device.index
         local_expert_ids = _get_ep_filter(model_config)
 
         # --- 1. Create local NIXL agent first (need metadata for handshake) ---
