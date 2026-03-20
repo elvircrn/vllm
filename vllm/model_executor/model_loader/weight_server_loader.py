@@ -35,7 +35,6 @@ from vllm.tracing import instrument
 
 logger = init_logger(__name__)
 
-# Map string dtype names to torch dtypes.
 _STR_TO_DTYPE = {
     "torch.float16": torch.float16,
     "torch.bfloat16": torch.bfloat16,
@@ -47,23 +46,15 @@ _STR_TO_DTYPE = {
     "torch.int64": torch.int64,
 }
 
-# Number of tensors to transfer in a single NIXL batch.
-# Large batches amortize per-transfer overhead (registration, prep, polling).
 _BATCH_SIZE = 4096
 
-# Regex to extract expert ID from tensor names like
-# "model.layers.0.mlp.experts.42.gate_proj.weight"
 _EXPERT_ID_RE = re.compile(r"\.experts\.(\d+)\.")
-
 
 
 def _compute_local_expert_ids(ep_rank: int, ep_size: int,
                               num_experts: int,
                               strategy: str) -> set[int]:
-    """Compute which global expert IDs belong to this EP rank.
-
-    Mirrors vllm.model_executor.layers.fused_moe.layer.determine_expert_map.
-    """
+    """Compute which global expert IDs belong to this EP rank."""
     base = num_experts // ep_size
     remainder = num_experts % ep_size
     count = base + (1 if ep_rank < remainder else 0)
@@ -92,7 +83,6 @@ def _get_ep_filter(model_config: ModelConfig) -> set[int] | None:
 
     ep_rank = ep_group.rank_in_group
     hf = model_config.hf_config
-    # Different models use different attribute names for expert count.
     num_experts = getattr(hf, "n_routed_experts",
                           getattr(hf, "num_local_experts",
                                   getattr(hf, "num_experts", 0)))
@@ -107,7 +97,6 @@ def _get_ep_filter(model_config: ModelConfig) -> set[int] | None:
     if num_experts <= 0:
         return None
 
-    # Read placement strategy from parallel config.
     from vllm.config import get_current_vllm_config
     vllm_config = get_current_vllm_config()
     strategy = vllm_config.parallel_config.expert_placement_strategy
@@ -124,41 +113,43 @@ def _get_ep_filter(model_config: ModelConfig) -> set[int] | None:
 
 
 def _should_skip_tensor(name: str, local_expert_ids: set[int] | None) -> bool:
-    """Return True if this tensor should be skipped (non-local expert).
-
-    Only filters actual weight matrices (``*.weight``). Scale tensors
-    (``*_scale*``, ``*input_scale*``) are always included because some
-    quantization schemes (e.g. NVFP4) compute a global scale factor
-    across all experts.
-    """
+    """Return True if this tensor should be skipped (non-local expert)."""
     if local_expert_ids is None:
         return False
     m = _EXPERT_ID_RE.search(name)
     if m is None:
-        # Not an expert tensor — always include.
         return False
-    # Only filter main weight matrices, not scales/biases/etc.
-    # Scales are tiny and some (input_scale) are needed globally.
     if not name.endswith(".weight"):
         return False
     expert_id = int(m.group(1))
     return expert_id not in local_expert_ids
 
 
-class WeightServerLoader(BaseModelLoader):
-    """Loads weights from a multi-GPU weight server via NIXL READ transfers.
+def _expand_cuda_visible_devices():
+    """Expand CUDA_VISIBLE_DEVICES to include all GPUs.
 
-    The server holds checkpoint tensors across N GPUs and registers them
-    with NIXL. This loader pulls tensors directly via NVLink — the
-    server doesn't actively participate in data movement.
+    The weight server unsets CUDA_VISIBLE_DEVICES and uses physical GPU
+    indices. For NIXL/UCX CUDA IPC to work, the client must also see
+    those GPUs. We keep the assigned GPU(s) first so PyTorch's device
+    mapping stays correct.
 
-    When expert parallelism is active, only tensors for local experts
-    are transferred, reducing bandwidth by ~ep_size×.
-
-    Config via --model-loader-extra-config:
-        host: Weight server hostname/IP (default: localhost)
-        port: ZMQ metadata port (default: 29500)
+    Must be called BEFORE CUDA is initialized (i.e. at import time or
+    before any torch.cuda calls).
     """
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cvd is None:
+        return
+    assigned = [g.strip() for g in cvd.split(",")]
+    all_gpus = [str(i) for i in range(8)]
+    missing = [g for g in all_gpus if g not in assigned]
+    if missing:
+        expanded = ",".join(assigned + missing)
+        os.environ["CUDA_VISIBLE_DEVICES"] = expanded
+        logger.info("Expanded CUDA_VISIBLE_DEVICES: %s → %s", cvd, expanded)
+
+
+class WeightServerLoader(BaseModelLoader):
+    """Loads weights from a multi-GPU weight server via NIXL READ transfers."""
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
@@ -167,6 +158,8 @@ class WeightServerLoader(BaseModelLoader):
             extra = {}
         self.server_host = extra.get("host", "localhost")
         self.server_port = int(extra.get("port", 29500))
+        # Expand CUDA_VISIBLE_DEVICES early so workers see all GPUs.
+        _expand_cuda_visible_devices()
 
     def download_model(self, model_config: ModelConfig) -> None:
         pass
@@ -189,39 +182,10 @@ class WeightServerLoader(BaseModelLoader):
         local_device_id = device.index
         local_expert_ids = _get_ep_filter(model_config)
 
-        # --- 1. Create local NIXL agent first (need metadata for handshake) ---
-        # Expand CUDA_VISIBLE_DEVICES to include all GPUs so NIXL/UCX
-        # can access the server's GPUs via CUDA IPC.  The server unsets
-        # CUDA_VISIBLE_DEVICES and uses physical GPU indices; the client
-        # must also see those GPUs.  We keep the client's assigned GPU
-        # first so PyTorch's cuda:0 stays correct.
-        cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
-        if cvd is not None:
-            assigned = [g.strip() for g in cvd.split(",")]
-            num_gpus = torch.cuda.device_count()
-            # If restrictive (fewer GPUs than physically available),
-            # expand to include all GPUs.
-            all_gpus = [str(i) for i in range(8)]  # DGX has 8 GPUs
-            missing = [g for g in all_gpus if g not in assigned]
-            if missing:
-                expanded = ",".join(assigned + missing)
-                os.environ["CUDA_VISIBLE_DEVICES"] = expanded
-                logger.info(
-                    "Expanded CUDA_VISIBLE_DEVICES: %s → %s",
-                    cvd, expanded,
-                )
-                cvd = expanded
-            else:
-                cvd = os.environ["CUDA_VISIBLE_DEVICES"]
-        else:
-            cvd = "<unset>"
-
-        ucx_tls = os.environ.get("UCX_TLS", "all")
-        ucx_net = os.environ.get("UCX_NET_DEVICES", "all")
+        cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>")
         logger.info(
-            "UCX_TLS=%s, UCX_NET_DEVICES=%s, CUDA_VISIBLE_DEVICES=%s, "
-            "local_device=%s (index=%d)",
-            ucx_tls, ucx_net, cvd, device, local_device_id,
+            "CUDA_VISIBLE_DEVICES=%s, local_device=%s (index=%d)",
+            cvd, device, local_device_id,
         )
 
         local_agent = nixl_agent(
@@ -229,7 +193,7 @@ class WeightServerLoader(BaseModelLoader):
         )
         local_agent_metadata = local_agent.get_agent_metadata()
 
-        # --- 2. Handshake with server via ZMQ ---
+        # --- Handshake with server via ZMQ ---
         logger.info(
             "Connecting to weight server at %s:%d ...",
             self.server_host, self.server_port,
@@ -246,27 +210,24 @@ class WeightServerLoader(BaseModelLoader):
 
         server_gpu_ids = sorted({b["device_id"] for b in buffer_metadata})
         logger.info(
-            "Server GPU device IDs (physical): %s (client local device: %d, "
-            "CUDA_VISIBLE_DEVICES=%s)",
-            server_gpu_ids, local_device_id, cvd,
+            "Server GPUs (physical): %s, client device: %d",
+            server_gpu_ids, local_device_id,
         )
 
-        # --- 3. Register remote server agent ---
         remote_agent_name = local_agent.add_remote_agent(server_agent_metadata)
         logger.info("Registered remote agent: %s", remote_agent_name)
 
-        # --- 4. Filter tensors (EP-aware) ---
+        # --- Filter tensors (EP-aware) ---
         tensor_metadata = [
             meta for meta in all_tensor_metadata
             if not _should_skip_tensor(meta["name"], local_expert_ids)
         ]
         skipped = len(all_tensor_metadata) - len(tensor_metadata)
         logger.info(
-            "Server has %d tensors — pulling %d (skipped %d non-local expert tensors)",
+            "Server has %d tensors — pulling %d (skipped %d non-local)",
             len(all_tensor_metadata), len(tensor_metadata), skipped,
         )
 
-        # --- 5. Choose transfer strategy ---
         use_bulk = (skipped == 0)
 
         try:
@@ -281,7 +242,6 @@ class WeightServerLoader(BaseModelLoader):
                     device, buffer_metadata, tensor_metadata,
                 )
         finally:
-            # Notify server we're done so it can clean up our remote agent.
             try:
                 socket.send(b"__disconnect__")
                 socket.recv()
@@ -299,14 +259,13 @@ class WeightServerLoader(BaseModelLoader):
         buffer_metadata: list[dict],
         tensor_metadata: list[dict],
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """Transfer entire server GPU buffers (fastest, no EP filtering)."""
+        """Transfer entire server GPU buffers (one READ per source GPU)."""
         total_bytes = sum(b["size"] for b in buffer_metadata)
         logger.info(
             "Bulk transfer: %d server buffers (%.2f GiB)",
             len(buffer_metadata), total_bytes / (1 << 30),
         )
 
-        # Allocate one receive buffer per source GPU.
         client_bufs: list[torch.Tensor] = []
         local_reg_data = []
         for buf_meta in buffer_metadata:
@@ -322,7 +281,6 @@ class WeightServerLoader(BaseModelLoader):
         start_time = time.perf_counter()
 
         try:
-            # Fire one READ per source GPU buffer.
             xfer_handles = []
             for i, buf_meta in enumerate(buffer_metadata):
                 local_xfer = local_agent.get_xfer_descs(
@@ -345,7 +303,6 @@ class WeightServerLoader(BaseModelLoader):
                 local_agent.transfer(xh)
                 xfer_handles.append((xh, local_h, remote_h, buf_meta["size"]))
 
-            # Poll all transfers.
             for i, (xh, lh, rh, size) in enumerate(xfer_handles):
                 while True:
                     try:
@@ -369,13 +326,11 @@ class WeightServerLoader(BaseModelLoader):
 
             elapsed = time.perf_counter() - start_time
             logger.info(
-                "All %d weights received (bulk): %.2f GiB in %.3fs "
-                "(%.2f GiB/s)",
-                len(tensor_metadata), total_bytes / (1 << 30),
-                elapsed, total_bytes / (1 << 30) / max(elapsed, 1e-9),
+                "Bulk transfer done: %.2f GiB in %.3fs (%.2f GiB/s)",
+                total_bytes / (1 << 30), elapsed,
+                total_bytes / (1 << 30) / max(elapsed, 1e-9),
             )
 
-            # Yield tensor views.
             server_base_to_client = {
                 buf_meta["addr"]: client_bufs[i]
                 for i, buf_meta in enumerate(buffer_metadata)
@@ -408,7 +363,7 @@ class WeightServerLoader(BaseModelLoader):
         buffer_metadata: list[dict],
         tensor_metadata: list[dict],
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """Transfer only needed tensors (EP-aware, skips non-local experts)."""
+        """Transfer only needed tensors (EP-aware)."""
         total_bytes = sum(m["size"] for m in tensor_metadata)
         total = len(tensor_metadata)
         logger.info(
@@ -416,26 +371,22 @@ class WeightServerLoader(BaseModelLoader):
             total, total_bytes / (1 << 30),
         )
 
-        # Allocate one contiguous client buffer for all needed tensors.
         client_buf = torch.empty(
             total_bytes, dtype=torch.uint8, device=device)
         buf_base = client_buf.data_ptr()
 
-        # Compute packed offsets.
         offsets: list[int] = []
         offset = 0
         for meta in tensor_metadata:
             offsets.append(offset)
             offset += meta["size"]
 
-        # Register once.
         local_descs = local_agent.get_reg_descs(
             [(buf_base, total_bytes, local_device_id, "")], "VRAM")
         local_agent.register_memory(local_descs)
         start_time = time.perf_counter()
 
         try:
-            # Transfer in batches.
             num_batches = (total + _BATCH_SIZE - 1) // _BATCH_SIZE
             for batch_idx in range(num_batches):
                 batch_start = batch_idx * _BATCH_SIZE
@@ -487,31 +438,13 @@ class WeightServerLoader(BaseModelLoader):
                 local_agent.release_dlist_handle(local_h)
                 local_agent.release_dlist_handle(remote_h)
 
-                elapsed = time.perf_counter() - start_time
-                logger.info(
-                    "Batch %d/%d: %d tensors | %d/%d done, "
-                    "%.2f/%.2f GiB in %.2fs (%.2f GiB/s)",
-                    batch_idx + 1, num_batches,
-                    batch_end - batch_start,
-                    batch_end, total,
-                    sum(tensor_metadata[i]["size"]
-                        for i in range(batch_end)) / (1 << 30),
-                    total_bytes / (1 << 30),
-                    elapsed,
-                    sum(tensor_metadata[i]["size"]
-                        for i in range(batch_end)) / (1 << 30)
-                    / max(elapsed, 1e-9),
-                )
-
             elapsed = time.perf_counter() - start_time
             logger.info(
-                "All %d weights received (selective): %.2f GiB in %.3fs "
-                "(%.2f GiB/s)",
-                total, total_bytes / (1 << 30),
-                elapsed, total_bytes / (1 << 30) / max(elapsed, 1e-9),
+                "Selective transfer done: %.2f GiB in %.3fs (%.2f GiB/s)",
+                total_bytes / (1 << 30), elapsed,
+                total_bytes / (1 << 30) / max(elapsed, 1e-9),
             )
 
-            # Yield tensor views.
             for i, meta in enumerate(tensor_metadata):
                 dtype = _STR_TO_DTYPE[meta["dtype"]]
                 t = client_buf[offsets[i]:offsets[i] + meta["size"]].view(
@@ -538,7 +471,7 @@ class WeightServerLoader(BaseModelLoader):
                     wait = attempt * 2
                     logger.warning(
                         "Weight transfer attempt %d/%d failed: %s. "
-                        "Retrying in %ds with fresh connection...",
+                        "Retrying in %ds...",
                         attempt, max_retries, e, wait,
                     )
                     time.sleep(wait)
@@ -553,9 +486,6 @@ class WeightServerLoader(BaseModelLoader):
             f"cuda:{current_platform.current_device_index or torch.cuda.current_device()}"
         )
 
-        # Serialize weight loading across workers to avoid concurrent
-        # NIXL connections (CUDA IPC doesn't support multiple concurrent
-        # clients reading from the same server agent).
         import torch.distributed as dist
         if dist.is_initialized() and dist.get_world_size() > 1:
             rank = dist.get_rank()
