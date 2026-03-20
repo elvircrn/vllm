@@ -214,6 +214,7 @@ def serve_metadata(
     agent: "nixl_agent",
     agent_metadata: bytes,
     tensor_metadata: list[dict],
+    buffer_metadata: list[dict],
     host: str,
     port: int,
 ) -> None:
@@ -228,6 +229,7 @@ def serve_metadata(
     payload = pickle.dumps({
         "agent_metadata": agent_metadata,
         "tensors": tensor_metadata,
+        "buffers": buffer_metadata,
     })
     logger.info(
         "Metadata payload: %d tensors, %.1f KiB",
@@ -334,6 +336,15 @@ def main():
 
     agent, all_descs, agent_metadata = register_with_nixl(gpu_buffers, devices)
 
+    # Build per-GPU buffer metadata for bulk transfers.
+    buffer_metadata = []
+    for gpu_idx, buf in enumerate(gpu_buffers):
+        buffer_metadata.append({
+            "addr": buf.data_ptr(),
+            "size": buf.nelement(),
+            "device_id": devices[gpu_idx].index,
+        })
+
     logger.info(
         "Weight server ready — %d GPUs, %d tensors, "
         "metadata on %s:%d. Clients pull via NIXL READ.",
@@ -341,7 +352,8 @@ def main():
     )
 
     try:
-        serve_metadata(agent, agent_metadata, tensor_metadata, args.host, args.port)
+        serve_metadata(agent, agent_metadata, tensor_metadata,
+                       buffer_metadata, args.host, args.port)
     finally:
         for descs in all_descs:
             agent.deregister_memory(descs)
