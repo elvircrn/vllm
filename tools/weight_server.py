@@ -117,14 +117,16 @@ def load_weights_to_gpus(
     return per_gpu_weights, tensor_metadata
 
 
-_REG_BATCH_SIZE = 4096
-
-
 def register_with_nixl(
     per_gpu_weights: list[list[tuple[str, torch.Tensor]]],
     devices: list[torch.device],
 ):
-    """Create a NIXL agent and register all tensor memory regions."""
+    """Create a NIXL agent and register GPU memory regions.
+
+    Registers one contiguous region per GPU (min_addr to max_addr+size)
+    instead of one region per tensor, making registration O(num_gpus)
+    instead of O(num_tensors).
+    """
     from nixl._api import nixl_agent
 
     try:
@@ -155,36 +157,41 @@ def register_with_nixl(
                 "available" if can_p2p else "NOT available",
             )
 
+    # Compute one contiguous region per GPU (min_addr .. max_addr+size).
     reg_data = []
+    start = time.perf_counter()
     for gpu_idx, gpu_weights in enumerate(per_gpu_weights):
+        if not gpu_weights:
+            continue
         device_id = devices[gpu_idx].index
+        min_addr = None
+        max_end = 0
         for _name, tensor in gpu_weights:
             addr = tensor.data_ptr()
-            size = tensor.nelement() * tensor.element_size()
-            reg_data.append((addr, size, device_id, ""))
-
-    # Register in batches so the process stays interruptible and
-    # we can log progress.
-    all_descs = []
-    total = len(reg_data)
-    start = time.perf_counter()
-    for i in range(0, total, _REG_BATCH_SIZE):
-        batch = reg_data[i:i + _REG_BATCH_SIZE]
-        descs = agent.get_reg_descs(batch, "VRAM")
-        agent.register_memory(descs)
-        all_descs.append(descs)
+            end = addr + tensor.nelement() * tensor.element_size()
+            if min_addr is None or addr < min_addr:
+                min_addr = addr
+            if end > max_end:
+                max_end = end
+        region_size = max_end - min_addr
+        reg_data.append((min_addr, region_size, device_id, ""))
         logger.info(
-            "Registered %d/%d memory regions (%.1fs)",
-            min(i + _REG_BATCH_SIZE, total), total,
-            time.perf_counter() - start,
+            "GPU %d (cuda:%d): registering %.2f GiB region "
+            "(addr 0x%x, %d tensors)",
+            gpu_idx, device_id, region_size / (1 << 30),
+            min_addr, len(gpu_weights),
         )
 
+    descs = agent.get_reg_descs(reg_data, "VRAM")
+    agent.register_memory(descs)
+
+    elapsed = time.perf_counter() - start
     agent_metadata = agent.get_agent_metadata()
     logger.info(
-        "NIXL agent ready, %d memory regions registered in %.1fs",
-        total, time.perf_counter() - start,
+        "NIXL agent ready, %d GPU regions registered in %.1fs",
+        len(reg_data), elapsed,
     )
-    return agent, all_descs, agent_metadata
+    return agent, [descs], agent_metadata
 
 
 def serve_metadata(
