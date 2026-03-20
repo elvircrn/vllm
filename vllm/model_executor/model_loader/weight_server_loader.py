@@ -222,6 +222,7 @@ class WeightServerLoader(BaseModelLoader):
 
         try:
             for batch_start in range(0, total, _BATCH_SIZE):
+                batch_start_time = time.perf_counter()
                 batch = tensor_metadata[batch_start:batch_start + _BATCH_SIZE]
                 batch_size = len(batch)
 
@@ -297,18 +298,33 @@ class WeightServerLoader(BaseModelLoader):
                 local_agent.release_dlist_handle(local_handle)
                 local_agent.release_dlist_handle(remote_handle)
 
+                batch_elapsed = time.perf_counter() - batch_start_time
+                batch_bytes = sum(
+                    t.nelement() * t.element_size() for _, t in local_tensors
+                )
+
                 # Yield tensors (on GPU, no CPU copy).
                 for name, t in local_tensors:
                     total_bytes += t.nelement() * t.element_size()
                     yield name, t
 
-                if (batch_start + batch_size) % (_BATCH_SIZE * 10) == 0:
-                    logger.info(
-                        "Progress: %d/%d tensors (%.1f GiB)",
-                        batch_start + batch_size,
-                        total,
-                        total_bytes / (1 << 30),
-                    )
+                done = batch_start + batch_size
+                elapsed = time.perf_counter() - start_time
+                logger.info(
+                    "Batch %d/%d: %d tensors, %.2f MiB in %.3fs "
+                    "(%.2f GiB/s) | Total: %d/%d tensors, "
+                    "%.2f GiB in %.2fs (%.2f GiB/s)",
+                    batch_start // _BATCH_SIZE + 1,
+                    (total + _BATCH_SIZE - 1) // _BATCH_SIZE,
+                    batch_size,
+                    batch_bytes / (1 << 20),
+                    batch_elapsed,
+                    batch_bytes / (1 << 30) / max(batch_elapsed, 1e-9),
+                    done, total,
+                    total_bytes / (1 << 30),
+                    elapsed,
+                    total_bytes / (1 << 30) / max(elapsed, 1e-9),
+                )
         finally:
             for descs in registered_descs:
                 local_agent.deregister_memory(descs)
