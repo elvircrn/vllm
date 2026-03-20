@@ -90,15 +90,18 @@ def _get_ep_filter(model_config: ModelConfig) -> set[int] | None:
         return None
 
     ep_rank = ep_group.rank_in_group
-    num_experts = getattr(model_config.hf_config, "n_routed_experts",
-                          getattr(model_config.hf_config, "num_local_experts",
-                                  0))
+    hf = model_config.hf_config
+    # Different models use different attribute names for expert count.
+    num_experts = getattr(hf, "n_routed_experts",
+                          getattr(hf, "num_local_experts",
+                                  getattr(hf, "num_experts", 0)))
     logger.info(
         "EP group: rank=%d, size=%d, num_experts=%d "
-        "(n_routed_experts=%s, num_local_experts=%s)",
+        "(n_routed_experts=%s, num_local_experts=%s, num_experts=%s)",
         ep_rank, ep_size, num_experts,
-        getattr(model_config.hf_config, "n_routed_experts", "N/A"),
-        getattr(model_config.hf_config, "num_local_experts", "N/A"),
+        getattr(hf, "n_routed_experts", "N/A"),
+        getattr(hf, "num_local_experts", "N/A"),
+        getattr(hf, "num_experts", "N/A"),
     )
     if num_experts <= 0:
         return None
