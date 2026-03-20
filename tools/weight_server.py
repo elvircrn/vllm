@@ -317,12 +317,15 @@ def main():
 
     # Unset CUDA_VISIBLE_DEVICES so we see all GPUs and use physical indices.
     # CUDA IPC requires both server and client to have source GPUs visible.
-    # canhazgpu sets this restrictively; we override it here.
+    # If CUDA_VISIBLE_DEVICES is set (e.g. by canhazgpu), remember the
+    # assigned GPUs, then unset it so we can address physical GPU indices.
+    assigned_gpus = None
     if "CUDA_VISIBLE_DEVICES" in os.environ:
+        cvd = os.environ["CUDA_VISIBLE_DEVICES"]
+        assigned_gpus = [int(g.strip()) for g in cvd.split(",")]
         logger.info(
-            "Unsetting CUDA_VISIBLE_DEVICES=%s (was set by launcher). "
-            "Use --devices with physical GPU indices (e.g. cuda:0 cuda:6).",
-            os.environ["CUDA_VISIBLE_DEVICES"],
+            "CUDA_VISIBLE_DEVICES=%s → using physical GPUs %s",
+            cvd, assigned_gpus,
         )
         del os.environ["CUDA_VISIBLE_DEVICES"]
 
@@ -342,13 +345,17 @@ def main():
         help="ZMQ metadata port (default: 29500)",
     )
     parser.add_argument(
-        "--devices", nargs="+",
-        default=["cuda:0", "cuda:1", "cuda:2", "cuda:3"],
-        help="GPU devices to hold weights (default: cuda:0..3)",
+        "--devices", nargs="+", default=None,
+        help="GPU devices (default: from CUDA_VISIBLE_DEVICES or cuda:0..3)",
     )
     args = parser.parse_args()
 
-    devices = [torch.device(d) for d in args.devices]
+    if args.devices is not None:
+        devices = [torch.device(d) for d in args.devices]
+    elif assigned_gpus is not None:
+        devices = [torch.device(f"cuda:{g}") for g in assigned_gpus]
+    else:
+        devices = [torch.device(f"cuda:{i}") for i in range(4)]
     torch.cuda.set_device(devices[0])
 
     safetensors_files = discover_safetensors(args.model)
