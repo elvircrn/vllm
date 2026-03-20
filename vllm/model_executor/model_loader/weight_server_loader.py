@@ -164,6 +164,11 @@ class WeightServerLoader(BaseModelLoader):
             cvd, device, local_device_id,
         )
 
+        # Ensure CUDA context is active on this thread before NIXL init.
+        # UCX disables cuda_ipc if no valid CUDA context exists during
+        # agent creation (see nixl_connector.py L1267-1275).
+        current_platform.set_device(device)
+
         local_agent = nixl_agent(
             f"weight_client_{uuid.uuid4()}", config
         )
