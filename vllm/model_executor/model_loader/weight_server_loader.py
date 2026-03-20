@@ -176,6 +176,10 @@ class WeightServerLoader(BaseModelLoader):
         local_expert_ids = _get_ep_filter(model_config)
 
         # --- 1. Create local NIXL agent first (need metadata for handshake) ---
+        ucx_tls = os.environ.get("UCX_TLS", "all")
+        ucx_net = os.environ.get("UCX_NET_DEVICES", "all")
+        logger.info("UCX_TLS=%s, UCX_NET_DEVICES=%s", ucx_tls, ucx_net)
+
         local_agent = nixl_agent(
             f"weight_client_{uuid.uuid4()}", config
         )
@@ -202,6 +206,26 @@ class WeightServerLoader(BaseModelLoader):
         # --- 3. Register remote server agent ---
         remote_agent_name = local_agent.add_remote_agent(server_agent_metadata)
         logger.info("Registered remote agent: %s", remote_agent_name)
+
+        # Log transport info: check P2P to remote devices.
+        remote_device_ids = sorted({m["device_id"] for m in all_tensor_metadata})
+        logger.info(
+            "Local device: %s (index %d), remote devices: %s",
+            device, local_device_id, remote_device_ids,
+        )
+        for rd in remote_device_ids:
+            try:
+                can_p2p = torch.cuda.can_device_access_peer(device.index, rd)
+                logger.info(
+                    "P2P access cuda:%d -> cuda:%d: %s (NVLink %s)",
+                    device.index, rd, can_p2p,
+                    "available" if can_p2p else "NOT available — will use IB/host",
+                )
+            except Exception:
+                logger.info(
+                    "P2P check cuda:%d -> cuda:%d: N/A (device not visible)",
+                    device.index, rd,
+                )
 
         # --- 4. Filter tensors (EP-aware) ---
         tensor_metadata = [

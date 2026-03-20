@@ -138,6 +138,23 @@ def register_with_nixl(
 
     agent = nixl_agent(f"weight_server_{uuid.uuid4()}", config)
 
+    # Log transport info.
+    ucx_tls = os.environ.get("UCX_TLS", "all")
+    ucx_net = os.environ.get("UCX_NET_DEVICES", "all")
+    logger.info("UCX_TLS=%s, UCX_NET_DEVICES=%s", ucx_tls, ucx_net)
+
+    # Check P2P / NVLink connectivity between GPUs.
+    for i, dev_a in enumerate(devices):
+        for j, dev_b in enumerate(devices):
+            if i >= j:
+                continue
+            can_p2p = torch.cuda.can_device_access_peer(dev_a, dev_b)
+            logger.info(
+                "P2P access %s -> %s: %s (NVLink %s)",
+                dev_a, dev_b, can_p2p,
+                "available" if can_p2p else "NOT available",
+            )
+
     reg_data = []
     for gpu_idx, gpu_weights in enumerate(per_gpu_weights):
         device_id = devices[gpu_idx].index
