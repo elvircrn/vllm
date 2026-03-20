@@ -56,23 +56,6 @@ _BATCH_SIZE = 4096
 _EXPERT_ID_RE = re.compile(r"\.experts\.(\d+)\.")
 
 
-def _build_physical_to_logical_map() -> dict[int, int]:
-    """Build physical GPU index → logical CUDA device index mapping.
-
-    When CUDA_VISIBLE_DEVICES is set (e.g. by canhazgpu), CUDA remaps
-    device indices. The weight server uses physical indices (it unsets
-    CUDA_VISIBLE_DEVICES), so clients must translate server device IDs
-    to their local logical indices for NIXL/UCX to address the correct GPU.
-    """
-    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if not cvd:
-        return {}
-    try:
-        physical_ids = [int(x.strip()) for x in cvd.split(",")]
-    except ValueError:
-        return {}
-    return {phys: logical for logical, phys in enumerate(physical_ids)}
-
 
 def _compute_local_expert_ids(ep_rank: int, ep_size: int,
                               num_experts: int,
@@ -242,25 +225,6 @@ class WeightServerLoader(BaseModelLoader):
             "CUDA_VISIBLE_DEVICES=%s)",
             server_gpu_ids, local_device_id, cvd,
         )
-
-        # Translate server physical device IDs → client logical indices.
-        # The server unsets CUDA_VISIBLE_DEVICES and uses physical GPU
-        # indices.  When the client has a remapped CUDA_VISIBLE_DEVICES,
-        # NIXL/UCX interprets device IDs in the client's CUDA context,
-        # so we must translate.
-        phys_to_logical = _build_physical_to_logical_map()
-        if phys_to_logical:
-            for buf in buffer_metadata:
-                orig = buf["device_id"]
-                buf["device_id"] = phys_to_logical.get(orig, orig)
-            for meta in all_tensor_metadata:
-                orig = meta["device_id"]
-                meta["device_id"] = phys_to_logical.get(orig, orig)
-            logger.info(
-                "Translated server device IDs: physical %s → logical %s",
-                server_gpu_ids,
-                sorted({b["device_id"] for b in buffer_metadata}),
-            )
 
         # --- 3. Register remote server agent ---
         remote_agent_name = local_agent.add_remote_agent(server_agent_metadata)
