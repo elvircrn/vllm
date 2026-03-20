@@ -203,17 +203,11 @@ class WeightServerLoader(BaseModelLoader):
 
         server_agent_metadata: bytes = payload["agent_metadata"]
         all_tensor_metadata: list[dict] = payload["tensors"]
+        buffer_metadata: list[dict] = payload["buffers"]
 
         # --- 3. Register remote server agent ---
         remote_agent_name = local_agent.add_remote_agent(server_agent_metadata)
         logger.info("Registered remote agent: %s", remote_agent_name)
-
-        # Log transport info: remote devices use physical IDs.
-        remote_device_ids = sorted({m["device_id"] for m in all_tensor_metadata})
-        logger.info(
-            "Local physical device: %d, remote physical devices: %s",
-            local_device_id, remote_device_ids,
-        )
 
         # --- 4. Filter tensors (EP-aware) ---
         tensor_metadata = [
@@ -226,135 +220,121 @@ class WeightServerLoader(BaseModelLoader):
             len(all_tensor_metadata), len(tensor_metadata), skipped,
         )
 
-        # --- 5. Pre-allocate contiguous client buffer & register once ---
-        total = len(tensor_metadata)
-        total_bytes = sum(m["size"] for m in tensor_metadata)
+        # --- 5. Bulk transfer: one READ per source GPU ---
+        # The server has one contiguous buffer per GPU. We allocate
+        # one contiguous receive buffer per source GPU on the client,
+        # then do one large NIXL READ per GPU (2 transfers for 2 GPUs
+        # instead of thousands of small ones).
+        total_bytes = sum(b["size"] for b in buffer_metadata)
         logger.info(
-            "Allocating %.2f GiB contiguous buffer on %s for %d tensors",
-            total_bytes / (1 << 30), device, total,
+            "Pulling %d server buffers (%.2f GiB total) via bulk transfer",
+            len(buffer_metadata), total_bytes / (1 << 30),
         )
-        client_buf = torch.empty(total_bytes, dtype=torch.uint8, device=device)
-        buf_base = client_buf.data_ptr()
 
-        # Compute offsets for each tensor in the contiguous buffer.
-        offsets: list[int] = []
-        offset = 0
-        for meta in tensor_metadata:
-            offsets.append(offset)
-            offset += meta["size"]
+        # Allocate one receive buffer per source GPU on the client device.
+        client_bufs: list[torch.Tensor] = []
+        local_reg_data = []
+        for buf_meta in buffer_metadata:
+            cbuf = torch.empty(buf_meta["size"], dtype=torch.uint8,
+                               device=device)
+            client_bufs.append(cbuf)
+            local_reg_data.append((
+                cbuf.data_ptr(), buf_meta["size"], local_device_id, "",
+            ))
 
-        # Register the entire client buffer once.
-        local_descs = local_agent.get_reg_descs(
-            [(buf_base, total_bytes, local_device_id, "")], "VRAM"
-        )
+        # Register all client buffers at once.
+        local_descs = local_agent.get_reg_descs(local_reg_data, "VRAM")
         local_agent.register_memory(local_descs)
 
         start_time = time.perf_counter()
-        transferred_bytes = 0
 
         try:
-            # --- 6. Transfer in large batches ---
-            num_batches = (total + _BATCH_SIZE - 1) // _BATCH_SIZE
-            for batch_idx, batch_start in enumerate(
-                range(0, total, _BATCH_SIZE)
-            ):
-                batch_start_time = time.perf_counter()
-                batch_end = min(batch_start + _BATCH_SIZE, total)
-                batch_size = batch_end - batch_start
-
-                # Build transfer descriptors (local → into buffer, remote).
-                local_xfer_data = []
-                remote_xfer_data = []
-                for i in range(batch_start, batch_end):
-                    meta = tensor_metadata[i]
-                    local_xfer_data.append((
-                        buf_base + offsets[i],
-                        meta["size"],
-                        local_device_id,
-                    ))
-                    remote_xfer_data.append((
-                        meta["addr"],
-                        meta["size"],
-                        meta["device_id"],
-                    ))
-
-                local_xfer_descs = local_agent.get_xfer_descs(
-                    local_xfer_data, "VRAM"
+            # Fire one READ per source GPU buffer.
+            xfer_handles = []
+            for i, buf_meta in enumerate(buffer_metadata):
+                local_xfer = local_agent.get_xfer_descs(
+                    [(client_bufs[i].data_ptr(), buf_meta["size"],
+                      local_device_id)],
+                    "VRAM",
                 )
-                remote_xfer_descs = local_agent.get_xfer_descs(
-                    remote_xfer_data, "VRAM"
+                remote_xfer = local_agent.get_xfer_descs(
+                    [(buf_meta["addr"], buf_meta["size"],
+                      buf_meta["device_id"])],
+                    "VRAM",
                 )
-
-                local_handle = local_agent.prep_xfer_dlist(
-                    "NIXL_INIT_AGENT", local_xfer_descs
+                local_h = local_agent.prep_xfer_dlist(
+                    "NIXL_INIT_AGENT", local_xfer,
                 )
-                remote_handle = local_agent.prep_xfer_dlist(
-                    remote_agent_name, remote_xfer_descs
+                remote_h = local_agent.prep_xfer_dlist(
+                    remote_agent_name, remote_xfer,
                 )
-
-                desc_ids = list(range(batch_size))
                 xfer_handle = local_agent.make_prepped_xfer(
-                    "READ",
-                    local_handle,
-                    desc_ids,
-                    remote_handle,
-                    desc_ids,
-                    notif_msg=b"",
+                    "READ", local_h, [0], remote_h, [0], notif_msg=b"",
                 )
                 local_agent.transfer(xfer_handle)
+                xfer_handles.append(
+                    (xfer_handle, local_h, remote_h, buf_meta["size"])
+                )
+                logger.info(
+                    "Started bulk READ %d/%d: %.2f GiB from device %d",
+                    i + 1, len(buffer_metadata),
+                    buf_meta["size"] / (1 << 30), buf_meta["device_id"],
+                )
 
+            # Poll all transfers to completion.
+            for i, (xh, lh, rh, size) in enumerate(xfer_handles):
                 while True:
-                    state = local_agent.check_xfer_state(xfer_handle)
+                    state = local_agent.check_xfer_state(xh)
                     if state == "DONE":
                         break
                     if state != "PROC":
                         raise RuntimeError(
-                            f"NIXL transfer failed with state: {state}"
+                            f"NIXL transfer {i} failed: {state}"
                         )
-
-                local_agent.release_xfer_handle(xfer_handle)
-                local_agent.release_dlist_handle(local_handle)
-                local_agent.release_dlist_handle(remote_handle)
-
-                batch_bytes = sum(
-                    tensor_metadata[i]["size"]
-                    for i in range(batch_start, batch_end)
-                )
-                transferred_bytes += batch_bytes
-                batch_elapsed = time.perf_counter() - batch_start_time
                 elapsed = time.perf_counter() - start_time
                 logger.info(
-                    "Batch %d/%d: %d tensors, %.2f MiB in %.3fs "
-                    "(%.2f GiB/s) | Total: %d/%d, "
-                    "%.2f/%.2f GiB in %.2fs (%.2f GiB/s)",
-                    batch_idx + 1, num_batches,
-                    batch_size,
-                    batch_bytes / (1 << 20),
-                    batch_elapsed,
-                    batch_bytes / (1 << 30) / max(batch_elapsed, 1e-9),
-                    batch_end, total,
-                    transferred_bytes / (1 << 30),
-                    total_bytes / (1 << 30),
-                    elapsed,
-                    transferred_bytes / (1 << 30) / max(elapsed, 1e-9),
+                    "Bulk READ %d/%d done: %.2f GiB in %.3fs (%.2f GiB/s)",
+                    i + 1, len(xfer_handles),
+                    size / (1 << 30), elapsed,
+                    size / (1 << 30) / max(elapsed, 1e-9),
                 )
+                local_agent.release_xfer_handle(xh)
+                local_agent.release_dlist_handle(lh)
+                local_agent.release_dlist_handle(rh)
 
             elapsed = time.perf_counter() - start_time
             logger.info(
-                "All %d weights received via NIXL: %.2f GiB in %.2f s "
+                "All %d weights received via NIXL: %.2f GiB in %.3f s "
                 "(%.2f GiB/s)",
-                total,
+                len(tensor_metadata),
                 total_bytes / (1 << 30),
                 elapsed,
                 total_bytes / (1 << 30) / max(elapsed, 1e-9),
             )
 
-            # --- 7. Yield tensors as views into the contiguous buffer ---
-            for i, meta in enumerate(tensor_metadata):
+            # --- 6. Yield tensors as views ---
+            # Build a map: server buffer base_addr → client buffer.
+            server_base_to_client = {}
+            for i, buf_meta in enumerate(buffer_metadata):
+                server_base_to_client[buf_meta["addr"]] = client_bufs[i]
+
+            # For each tensor, find which server buffer it belongs to
+            # and compute the offset within that buffer.
+            buf_bases = sorted(server_base_to_client.keys())
+            for meta in tensor_metadata:
+                # Find the buffer this tensor belongs to (largest base ≤ addr).
+                buf_base = None
+                for b in buf_bases:
+                    if b <= meta["addr"]:
+                        buf_base = b
+                    else:
+                        break
+                cbuf = server_base_to_client[buf_base]
+                offset = meta["addr"] - buf_base
                 dtype = _STR_TO_DTYPE[meta["dtype"]]
-                t = client_buf[offsets[i]:offsets[i] + meta["size"]].view(
-                    dtype
-                ).reshape(meta["shape"])
+                t = cbuf[offset:offset + meta["size"]].view(dtype).reshape(
+                    meta["shape"]
+                )
                 yield meta["name"], t
 
         finally:
