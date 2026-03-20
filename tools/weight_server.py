@@ -29,6 +29,8 @@ import argparse
 import logging
 import os
 import pickle
+import signal
+import time
 import uuid
 
 import torch
@@ -115,6 +117,9 @@ def load_weights_to_gpus(
     return per_gpu_weights, tensor_metadata
 
 
+_REG_BATCH_SIZE = 4096
+
+
 def register_with_nixl(
     per_gpu_weights: list[list[tuple[str, torch.Tensor]]],
     devices: list[torch.device],
@@ -141,14 +146,28 @@ def register_with_nixl(
             size = tensor.nelement() * tensor.element_size()
             reg_data.append((addr, size, device_id, ""))
 
-    descs = agent.get_reg_descs(reg_data, "VRAM")
-    agent.register_memory(descs)
+    # Register in batches so the process stays interruptible and
+    # we can log progress.
+    all_descs = []
+    total = len(reg_data)
+    start = time.perf_counter()
+    for i in range(0, total, _REG_BATCH_SIZE):
+        batch = reg_data[i:i + _REG_BATCH_SIZE]
+        descs = agent.get_reg_descs(batch, "VRAM")
+        agent.register_memory(descs)
+        all_descs.append(descs)
+        logger.info(
+            "Registered %d/%d memory regions (%.1fs)",
+            min(i + _REG_BATCH_SIZE, total), total,
+            time.perf_counter() - start,
+        )
 
     agent_metadata = agent.get_agent_metadata()
     logger.info(
-        "NIXL agent created, registered %d memory regions", len(reg_data)
+        "NIXL agent ready, %d memory regions registered in %.1fs",
+        total, time.perf_counter() - start,
     )
-    return agent, descs, agent_metadata
+    return agent, all_descs, agent_metadata
 
 
 def serve_metadata(
@@ -224,6 +243,12 @@ def serve_metadata(
 
 
 def main():
+    # Force-exit on Ctrl+C even when blocked in C extensions (NIXL/UCX).
+    signal.signal(signal.SIGINT, lambda *_: (
+        logger.info("SIGINT received, exiting."),
+        os._exit(1),
+    ))
+
     parser = argparse.ArgumentParser(
         description="Multi-GPU Weight Server for vLLM (NIXL)"
     )
@@ -256,7 +281,7 @@ def main():
         safetensors_files, devices
     )
 
-    agent, descs, agent_metadata = register_with_nixl(per_gpu_weights, devices)
+    agent, all_descs, agent_metadata = register_with_nixl(per_gpu_weights, devices)
 
     logger.info(
         "Weight server ready — %d GPUs, %d tensors, "
@@ -267,7 +292,8 @@ def main():
     try:
         serve_metadata(agent, agent_metadata, tensor_metadata, args.host, args.port)
     finally:
-        agent.deregister_memory(descs)
+        for descs in all_descs:
+            agent.deregister_memory(descs)
 
 
 if __name__ == "__main__":
