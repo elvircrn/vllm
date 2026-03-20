@@ -220,18 +220,40 @@ class WeightServerLoader(BaseModelLoader):
             len(all_tensor_metadata), len(tensor_metadata), skipped,
         )
 
-        # --- 5. Bulk transfer: one READ per source GPU ---
-        # The server has one contiguous buffer per GPU. We allocate
-        # one contiguous receive buffer per source GPU on the client,
-        # then do one large NIXL READ per GPU (2 transfers for 2 GPUs
-        # instead of thousands of small ones).
+        # --- 5. Choose transfer strategy ---
+        use_bulk = (skipped == 0)
+        total_bytes = sum(m["size"] for m in tensor_metadata)
+
+        if use_bulk:
+            # No EP filtering → bulk transfer entire server buffers.
+            yield from self._bulk_transfer(
+                local_agent, remote_agent_name, local_device_id,
+                device, buffer_metadata, tensor_metadata,
+            )
+        else:
+            # EP active → selective per-tensor transfer.
+            yield from self._selective_transfer(
+                local_agent, remote_agent_name, local_device_id,
+                device, buffer_metadata, tensor_metadata,
+            )
+
+    def _bulk_transfer(
+        self,
+        local_agent,
+        remote_agent_name: str,
+        local_device_id: int,
+        device: torch.device,
+        buffer_metadata: list[dict],
+        tensor_metadata: list[dict],
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """Transfer entire server GPU buffers (fastest, no EP filtering)."""
         total_bytes = sum(b["size"] for b in buffer_metadata)
         logger.info(
-            "Pulling %d server buffers (%.2f GiB total) via bulk transfer",
+            "Bulk transfer: %d server buffers (%.2f GiB)",
             len(buffer_metadata), total_bytes / (1 << 30),
         )
 
-        # Allocate one receive buffer per source GPU on the client device.
+        # Allocate one receive buffer per source GPU.
         client_bufs: list[torch.Tensor] = []
         local_reg_data = []
         for buf_meta in buffer_metadata:
@@ -242,10 +264,8 @@ class WeightServerLoader(BaseModelLoader):
                 cbuf.data_ptr(), buf_meta["size"], local_device_id, "",
             ))
 
-        # Register all client buffers at once.
         local_descs = local_agent.get_reg_descs(local_reg_data, "VRAM")
         local_agent.register_memory(local_descs)
-
         start_time = time.perf_counter()
 
         try:
@@ -254,13 +274,11 @@ class WeightServerLoader(BaseModelLoader):
             for i, buf_meta in enumerate(buffer_metadata):
                 local_xfer = local_agent.get_xfer_descs(
                     [(client_bufs[i].data_ptr(), buf_meta["size"],
-                      local_device_id)],
-                    "VRAM",
+                      local_device_id)], "VRAM",
                 )
                 remote_xfer = local_agent.get_xfer_descs(
                     [(buf_meta["addr"], buf_meta["size"],
-                      buf_meta["device_id"])],
-                    "VRAM",
+                      buf_meta["device_id"])], "VRAM",
                 )
                 local_h = local_agent.prep_xfer_dlist(
                     "NIXL_INIT_AGENT", local_xfer,
@@ -268,20 +286,13 @@ class WeightServerLoader(BaseModelLoader):
                 remote_h = local_agent.prep_xfer_dlist(
                     remote_agent_name, remote_xfer,
                 )
-                xfer_handle = local_agent.make_prepped_xfer(
+                xh = local_agent.make_prepped_xfer(
                     "READ", local_h, [0], remote_h, [0], notif_msg=b"",
                 )
-                local_agent.transfer(xfer_handle)
-                xfer_handles.append(
-                    (xfer_handle, local_h, remote_h, buf_meta["size"])
-                )
-                logger.info(
-                    "Started bulk READ %d/%d: %.2f GiB from device %d",
-                    i + 1, len(buffer_metadata),
-                    buf_meta["size"] / (1 << 30), buf_meta["device_id"],
-                )
+                local_agent.transfer(xh)
+                xfer_handles.append((xh, local_h, remote_h, buf_meta["size"]))
 
-            # Poll all transfers to completion.
+            # Poll all transfers.
             for i, (xh, lh, rh, size) in enumerate(xfer_handles):
                 while True:
                     state = local_agent.check_xfer_state(xh)
@@ -289,40 +300,26 @@ class WeightServerLoader(BaseModelLoader):
                         break
                     if state != "PROC":
                         raise RuntimeError(
-                            f"NIXL transfer {i} failed: {state}"
-                        )
-                elapsed = time.perf_counter() - start_time
-                logger.info(
-                    "Bulk READ %d/%d done: %.2f GiB in %.3fs (%.2f GiB/s)",
-                    i + 1, len(xfer_handles),
-                    size / (1 << 30), elapsed,
-                    size / (1 << 30) / max(elapsed, 1e-9),
-                )
+                            f"NIXL bulk transfer {i} failed: {state}")
                 local_agent.release_xfer_handle(xh)
                 local_agent.release_dlist_handle(lh)
                 local_agent.release_dlist_handle(rh)
 
             elapsed = time.perf_counter() - start_time
             logger.info(
-                "All %d weights received via NIXL: %.2f GiB in %.3f s "
+                "All %d weights received (bulk): %.2f GiB in %.3fs "
                 "(%.2f GiB/s)",
-                len(tensor_metadata),
-                total_bytes / (1 << 30),
-                elapsed,
-                total_bytes / (1 << 30) / max(elapsed, 1e-9),
+                len(tensor_metadata), total_bytes / (1 << 30),
+                elapsed, total_bytes / (1 << 30) / max(elapsed, 1e-9),
             )
 
-            # --- 6. Yield tensors as views ---
-            # Build a map: server buffer base_addr → client buffer.
-            server_base_to_client = {}
-            for i, buf_meta in enumerate(buffer_metadata):
-                server_base_to_client[buf_meta["addr"]] = client_bufs[i]
-
-            # For each tensor, find which server buffer it belongs to
-            # and compute the offset within that buffer.
+            # Yield tensor views.
+            server_base_to_client = {
+                buf_meta["addr"]: client_bufs[i]
+                for i, buf_meta in enumerate(buffer_metadata)
+            }
             buf_bases = sorted(server_base_to_client.keys())
             for meta in tensor_metadata:
-                # Find the buffer this tensor belongs to (largest base ≤ addr).
                 buf_base = None
                 for b in buf_bases:
                     if b <= meta["addr"]:
@@ -332,9 +329,125 @@ class WeightServerLoader(BaseModelLoader):
                 cbuf = server_base_to_client[buf_base]
                 offset = meta["addr"] - buf_base
                 dtype = _STR_TO_DTYPE[meta["dtype"]]
-                t = cbuf[offset:offset + meta["size"]].view(dtype).reshape(
-                    meta["shape"]
+                t = cbuf[offset:offset + meta["size"]].view(
+                    dtype).reshape(meta["shape"])
+                yield meta["name"], t
+
+        finally:
+            local_agent.deregister_memory(local_descs)
+            local_agent.remove_remote_agent(remote_agent_name)
+
+    def _selective_transfer(
+        self,
+        local_agent,
+        remote_agent_name: str,
+        local_device_id: int,
+        device: torch.device,
+        buffer_metadata: list[dict],
+        tensor_metadata: list[dict],
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """Transfer only needed tensors (EP-aware, skips non-local experts)."""
+        total_bytes = sum(m["size"] for m in tensor_metadata)
+        total = len(tensor_metadata)
+        logger.info(
+            "Selective transfer (EP): %d tensors, %.2f GiB",
+            total, total_bytes / (1 << 30),
+        )
+
+        # Allocate one contiguous client buffer for all needed tensors.
+        client_buf = torch.empty(
+            total_bytes, dtype=torch.uint8, device=device)
+        buf_base = client_buf.data_ptr()
+
+        # Compute packed offsets.
+        offsets: list[int] = []
+        offset = 0
+        for meta in tensor_metadata:
+            offsets.append(offset)
+            offset += meta["size"]
+
+        # Register once.
+        local_descs = local_agent.get_reg_descs(
+            [(buf_base, total_bytes, local_device_id, "")], "VRAM")
+        local_agent.register_memory(local_descs)
+        start_time = time.perf_counter()
+
+        try:
+            # Transfer in batches.
+            num_batches = (total + _BATCH_SIZE - 1) // _BATCH_SIZE
+            for batch_idx in range(num_batches):
+                batch_start = batch_idx * _BATCH_SIZE
+                batch_end = min(batch_start + _BATCH_SIZE, total)
+
+                local_xfer_data = []
+                remote_xfer_data = []
+                for i in range(batch_start, batch_end):
+                    meta = tensor_metadata[i]
+                    local_xfer_data.append((
+                        buf_base + offsets[i], meta["size"], local_device_id,
+                    ))
+                    remote_xfer_data.append((
+                        meta["addr"], meta["size"], meta["device_id"],
+                    ))
+
+                local_xfer = local_agent.get_xfer_descs(
+                    local_xfer_data, "VRAM")
+                remote_xfer = local_agent.get_xfer_descs(
+                    remote_xfer_data, "VRAM")
+                local_h = local_agent.prep_xfer_dlist(
+                    "NIXL_INIT_AGENT", local_xfer)
+                remote_h = local_agent.prep_xfer_dlist(
+                    remote_agent_name, remote_xfer)
+
+                desc_ids = list(range(batch_end - batch_start))
+                xh = local_agent.make_prepped_xfer(
+                    "READ", local_h, desc_ids, remote_h, desc_ids,
+                    notif_msg=b"",
                 )
+                local_agent.transfer(xh)
+
+                while True:
+                    state = local_agent.check_xfer_state(xh)
+                    if state == "DONE":
+                        break
+                    if state != "PROC":
+                        raise RuntimeError(
+                            f"NIXL selective transfer batch {batch_idx} "
+                            f"failed: {state}")
+
+                local_agent.release_xfer_handle(xh)
+                local_agent.release_dlist_handle(local_h)
+                local_agent.release_dlist_handle(remote_h)
+
+                elapsed = time.perf_counter() - start_time
+                logger.info(
+                    "Batch %d/%d: %d tensors | %d/%d done, "
+                    "%.2f/%.2f GiB in %.2fs (%.2f GiB/s)",
+                    batch_idx + 1, num_batches,
+                    batch_end - batch_start,
+                    batch_end, total,
+                    sum(tensor_metadata[i]["size"]
+                        for i in range(batch_end)) / (1 << 30),
+                    total_bytes / (1 << 30),
+                    elapsed,
+                    sum(tensor_metadata[i]["size"]
+                        for i in range(batch_end)) / (1 << 30)
+                    / max(elapsed, 1e-9),
+                )
+
+            elapsed = time.perf_counter() - start_time
+            logger.info(
+                "All %d weights received (selective): %.2f GiB in %.3fs "
+                "(%.2f GiB/s)",
+                total, total_bytes / (1 << 30),
+                elapsed, total_bytes / (1 << 30) / max(elapsed, 1e-9),
+            )
+
+            # Yield tensor views.
+            for i, meta in enumerate(tensor_metadata):
+                dtype = _STR_TO_DTYPE[meta["dtype"]]
+                t = client_buf[offsets[i]:offsets[i] + meta["size"]].view(
+                    dtype).reshape(meta["shape"])
                 yield meta["name"], t
 
         finally:
