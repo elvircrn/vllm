@@ -14,19 +14,19 @@
 #
 # Usage:
 #   canhazgpu run -g 1 -- bash tools/run-weight-client.sh \
-#       <model> --host <server-ip> --port 29500 [extra vllm args...]
+#       <model> [--ws-host <server-ip>] [--ws-port 29500] [extra vllm args...]
 
 set -euo pipefail
 
 MODEL="$1"; shift
 
-HOST="localhost"
-PORT=29500
+WS_HOST="localhost"
+WS_PORT=29500
 VLLM_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --host) HOST="$2"; shift 2 ;;
-        --port) PORT="$2"; shift 2 ;;
+        --ws-host) WS_HOST="$2"; shift 2 ;;
+        --ws-port) WS_PORT="$2"; shift 2 ;;
         *) VLLM_ARGS+=("$1"); shift ;;
     esac
 done
@@ -52,5 +52,5 @@ echo "[run-weight-client] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 
 exec vllm serve "$MODEL" \
     --load-format weight_server \
-    --model-loader-extra-config "{\"host\":\"${HOST}\",\"port\":${PORT}}" \
+    --model-loader-extra-config "{\"host\":\"${WS_HOST}\",\"port\":${WS_PORT}}" \
     "${VLLM_ARGS[@]}"
