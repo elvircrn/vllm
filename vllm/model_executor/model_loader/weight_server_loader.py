@@ -125,28 +125,6 @@ def _should_skip_tensor(name: str, local_expert_ids: set[int] | None) -> bool:
     return expert_id not in local_expert_ids
 
 
-def _expand_cuda_visible_devices():
-    """Expand CUDA_VISIBLE_DEVICES to include all GPUs.
-
-    The weight server unsets CUDA_VISIBLE_DEVICES and uses physical GPU
-    indices. For NIXL/UCX CUDA IPC to work, the client must also see
-    those GPUs. We keep the assigned GPU(s) first so PyTorch's device
-    mapping stays correct.
-
-    Must be called BEFORE CUDA is initialized (i.e. at import time or
-    before any torch.cuda calls).
-    """
-    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if cvd is None:
-        return
-    assigned = [g.strip() for g in cvd.split(",")]
-    all_gpus = [str(i) for i in range(8)]
-    missing = [g for g in all_gpus if g not in assigned]
-    if missing:
-        expanded = ",".join(assigned + missing)
-        os.environ["CUDA_VISIBLE_DEVICES"] = expanded
-        logger.info("Expanded CUDA_VISIBLE_DEVICES: %s → %s", cvd, expanded)
-
 
 class WeightServerLoader(BaseModelLoader):
     """Loads weights from a multi-GPU weight server via NIXL READ transfers."""
@@ -158,8 +136,6 @@ class WeightServerLoader(BaseModelLoader):
             extra = {}
         self.server_host = extra.get("host", "localhost")
         self.server_port = int(extra.get("port", 29500))
-        # Expand CUDA_VISIBLE_DEVICES early so workers see all GPUs.
-        _expand_cuda_visible_devices()
 
     def download_model(self, model_config: ModelConfig) -> None:
         pass
