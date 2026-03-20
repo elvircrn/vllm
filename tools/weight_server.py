@@ -70,63 +70,91 @@ def discover_safetensors(model_path: str) -> list[str]:
 def load_weights_to_gpus(
     safetensors_files: list[str],
     devices: list[torch.device],
-) -> tuple[list[list[tuple[str, torch.Tensor]]], list[dict]]:
-    """Load all safetensors tensors, distributing round-robin across GPUs.
+) -> tuple[list[torch.Tensor], list[dict]]:
+    """Load all safetensors tensors into contiguous GPU buffers.
+
+    First pass: load to CPU and assign to GPUs (greedy by bytes).
+    Second pass: allocate one contiguous buffer per GPU, pack tensors
+    into it. This ensures a single cudaMalloc per GPU, which is required
+    for CUDA IPC to work correctly across processes.
 
     Returns:
-        per_gpu_weights: list of (name, tensor) pairs per GPU
+        gpu_buffers: list of contiguous GPU buffers (one per GPU)
         tensor_metadata: list of dicts with name/shape/dtype/addr/size/device_id
     """
     num_gpus = len(devices)
-    per_gpu_weights: list[list[tuple[str, torch.Tensor]]] = [
+
+    # First pass: load to CPU, assign GPUs.
+    per_gpu_tensors: list[list[tuple[str, torch.Tensor]]] = [
         [] for _ in range(num_gpus)
     ]
-    tensor_metadata: list[dict] = []
     per_gpu_bytes = [0] * num_gpus
-    tensor_idx = 0
 
-    for st_file in tqdm(safetensors_files, desc="Loading to GPUs"):
-        with safe_open(st_file, framework="pt") as f:
+    for st_file in tqdm(safetensors_files, desc="Loading from disk"):
+        with safe_open(st_file, framework="pt", device="cpu") as f:
             for name in f.keys():  # noqa: SIM118
+                tensor = f.get_tensor(name)
+                size = tensor.nelement() * tensor.element_size()
                 # Place on GPU with least bytes so far (greedy balance).
                 gpu_idx = min(range(num_gpus), key=lambda i: per_gpu_bytes[i])
-                device = devices[gpu_idx]
-                tensor = f.get_tensor(name).to(device, non_blocking=True)
-                per_gpu_weights[gpu_idx].append((name, tensor))
-                tensor_metadata.append({
-                    "name": name,
-                    "shape": list(tensor.shape),
-                    "dtype": str(tensor.dtype),
-                    "addr": tensor.data_ptr(),
-                    "size": tensor.nelement() * tensor.element_size(),
-                    "device_id": device.index,
-                })
-                per_gpu_bytes[gpu_idx] += tensor.nelement() * tensor.element_size()
-                tensor_idx += 1
+                per_gpu_tensors[gpu_idx].append((name, tensor))
+                per_gpu_bytes[gpu_idx] += size
 
-    for i, device in enumerate(devices):
+    # Second pass: allocate one contiguous buffer per GPU, pack tensors.
+    gpu_buffers: list[torch.Tensor] = []
+    tensor_metadata: list[dict] = []
+    total_tensors = 0
+
+    for gpu_idx, device in enumerate(devices):
+        total_size = per_gpu_bytes[gpu_idx]
+        buf = torch.empty(total_size, dtype=torch.uint8, device=device)
+        gpu_buffers.append(buf)
+        offset = 0
+
+        for name, cpu_tensor in per_gpu_tensors[gpu_idx]:
+            size = cpu_tensor.nelement() * cpu_tensor.element_size()
+            # Copy raw bytes into contiguous buffer.
+            dst = buf[offset:offset + size]
+            src = cpu_tensor.view(-1).view(torch.uint8)
+            dst.copy_(src)
+            tensor_metadata.append({
+                "name": name,
+                "shape": list(cpu_tensor.shape),
+                "dtype": str(cpu_tensor.dtype),
+                "addr": buf.data_ptr() + offset,
+                "size": size,
+                "device_id": device.index,
+            })
+            offset += size
+            total_tensors += 1
+
         torch.cuda.synchronize(device)
         logger.info(
-            "GPU %d (%s): %d tensors, %.2f GiB",
-            i, device, len(per_gpu_weights[i]), per_gpu_bytes[i] / (1 << 30),
+            "GPU %d (%s): %d tensors packed into %.2f GiB contiguous buffer "
+            "(addr 0x%x)",
+            gpu_idx, device, len(per_gpu_tensors[gpu_idx]),
+            total_size / (1 << 30), buf.data_ptr(),
         )
 
+    # Free CPU tensors.
+    del per_gpu_tensors
+
     logger.info(
-        "Total: %d tensors (%.2f GiB) across %d GPUs",
-        tensor_idx, sum(per_gpu_bytes) / (1 << 30), num_gpus,
+        "Total: %d tensors (%.2f GiB) across %d GPUs "
+        "(contiguous buffers for CUDA IPC)",
+        total_tensors, sum(per_gpu_bytes) / (1 << 30), num_gpus,
     )
-    return per_gpu_weights, tensor_metadata
+    return gpu_buffers, tensor_metadata
 
 
 def register_with_nixl(
-    per_gpu_weights: list[list[tuple[str, torch.Tensor]]],
+    gpu_buffers: list[torch.Tensor],
     devices: list[torch.device],
 ):
-    """Create a NIXL agent and register GPU memory regions.
+    """Create a NIXL agent and register contiguous GPU buffers.
 
-    Registers one contiguous region per GPU (min_addr to max_addr+size)
-    instead of one region per tensor, making registration O(num_gpus)
-    instead of O(num_tensors).
+    Each GPU has one contiguous buffer (single cudaMalloc allocation),
+    so we register one region per GPU. This is fast and CUDA IPC safe.
     """
     from nixl._api import nixl_agent
 
@@ -158,29 +186,16 @@ def register_with_nixl(
                 "available" if can_p2p else "NOT available",
             )
 
-    # Compute one contiguous region per GPU (min_addr .. max_addr+size).
+    # Register one contiguous buffer per GPU.
     reg_data = []
     start = time.perf_counter()
-    for gpu_idx, gpu_weights in enumerate(per_gpu_weights):
-        if not gpu_weights:
-            continue
+    for gpu_idx, buf in enumerate(gpu_buffers):
         device_id = devices[gpu_idx].index
-        min_addr = None
-        max_end = 0
-        for _name, tensor in gpu_weights:
-            addr = tensor.data_ptr()
-            end = addr + tensor.nelement() * tensor.element_size()
-            if min_addr is None or addr < min_addr:
-                min_addr = addr
-            if end > max_end:
-                max_end = end
-        region_size = max_end - min_addr
-        reg_data.append((min_addr, region_size, device_id, ""))
+        reg_data.append((buf.data_ptr(), buf.nelement(), device_id, ""))
         logger.info(
-            "GPU %d (cuda:%d): registering %.2f GiB region "
-            "(addr 0x%x, %d tensors)",
-            gpu_idx, device_id, region_size / (1 << 30),
-            min_addr, len(gpu_weights),
+            "GPU %d (cuda:%d): registering %.2f GiB contiguous buffer "
+            "(addr 0x%x)",
+            gpu_idx, device_id, buf.nelement() / (1 << 30), buf.data_ptr(),
         )
 
     descs = agent.get_reg_descs(reg_data, "VRAM")
@@ -313,11 +328,11 @@ def main():
     safetensors_files = discover_safetensors(args.model)
     logger.info("Found %d safetensors files for %s",
                 len(safetensors_files), args.model)
-    per_gpu_weights, tensor_metadata = load_weights_to_gpus(
+    gpu_buffers, tensor_metadata = load_weights_to_gpus(
         safetensors_files, devices
     )
 
-    agent, all_descs, agent_metadata = register_with_nixl(per_gpu_weights, devices)
+    agent, all_descs, agent_metadata = register_with_nixl(gpu_buffers, devices)
 
     logger.info(
         "Weight server ready — %d GPUs, %d tensors, "
