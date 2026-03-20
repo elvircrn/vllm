@@ -45,13 +45,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def _get_physical_device_map() -> list[int] | None:
-    """Parse CUDA_VISIBLE_DEVICES to map logical → physical GPU indices."""
-    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if not cvd:
-        return None
-    return [int(x.strip()) for x in cvd.split(",")]
-
 
 def discover_safetensors(model_path: str) -> list[str]:
     """Find all safetensors files for a model."""
@@ -85,19 +78,12 @@ def load_weights_to_gpus(
         tensor_metadata: list of dicts with name/shape/dtype/addr/size/device_id
     """
     num_gpus = len(devices)
-    phys_map = _get_physical_device_map()
     per_gpu_weights: list[list[tuple[str, torch.Tensor]]] = [
         [] for _ in range(num_gpus)
     ]
     tensor_metadata: list[dict] = []
     per_gpu_bytes = [0] * num_gpus
     tensor_idx = 0
-
-    if phys_map:
-        logger.info(
-            "CUDA_VISIBLE_DEVICES=%s → physical device map: %s",
-            os.environ.get("CUDA_VISIBLE_DEVICES"), phys_map,
-        )
 
     for st_file in tqdm(safetensors_files, desc="Loading to GPUs"):
         with safe_open(st_file, framework="pt") as f:
@@ -107,17 +93,13 @@ def load_weights_to_gpus(
                 device = devices[gpu_idx]
                 tensor = f.get_tensor(name).to(device, non_blocking=True)
                 per_gpu_weights[gpu_idx].append((name, tensor))
-                # Store physical device ID so clients with different
-                # CUDA_VISIBLE_DEVICES can address the correct GPU.
-                physical_id = (phys_map[device.index]
-                               if phys_map else device.index)
                 tensor_metadata.append({
                     "name": name,
                     "shape": list(tensor.shape),
                     "dtype": str(tensor.dtype),
                     "addr": tensor.data_ptr(),
                     "size": tensor.nelement() * tensor.element_size(),
-                    "device_id": physical_id,
+                    "device_id": device.index,
                 })
                 per_gpu_bytes[gpu_idx] += tensor.nelement() * tensor.element_size()
                 tensor_idx += 1
@@ -177,14 +159,12 @@ def register_with_nixl(
             )
 
     # Compute one contiguous region per GPU (min_addr .. max_addr+size).
-    phys_map = _get_physical_device_map()
     reg_data = []
     start = time.perf_counter()
     for gpu_idx, gpu_weights in enumerate(per_gpu_weights):
         if not gpu_weights:
             continue
-        logical_id = devices[gpu_idx].index
-        device_id = phys_map[logical_id] if phys_map else logical_id
+        device_id = devices[gpu_idx].index
         min_addr = None
         max_end = 0
         for _name, tensor in gpu_weights:
@@ -293,6 +273,17 @@ def main():
         logger.info("SIGINT received, exiting."),
         os._exit(1),
     ))
+
+    # Unset CUDA_VISIBLE_DEVICES so we see all GPUs and use physical indices.
+    # CUDA IPC requires both server and client to have source GPUs visible.
+    # canhazgpu sets this restrictively; we override it here.
+    if "CUDA_VISIBLE_DEVICES" in os.environ:
+        logger.info(
+            "Unsetting CUDA_VISIBLE_DEVICES=%s (was set by launcher). "
+            "Use --devices with physical GPU indices (e.g. cuda:0 cuda:6).",
+            os.environ["CUDA_VISIBLE_DEVICES"],
+        )
+        del os.environ["CUDA_VISIBLE_DEVICES"]
 
     parser = argparse.ArgumentParser(
         description="Multi-GPU Weight Server for vLLM (NIXL)"
