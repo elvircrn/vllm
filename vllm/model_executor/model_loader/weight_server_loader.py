@@ -153,7 +153,7 @@ class WeightServerLoader(BaseModelLoader):
             config = None
 
         # Use local transports only (NVLink via CUDA IPC, no InfiniBand).
-        os.environ.setdefault("UCX_TLS", "cuda_ipc,cuda_copy,shm,self")
+        os.environ.setdefault("UCX_TLS", "cuda_ipc,cuda_copy,tcp,shm,self")
         os.environ.setdefault("UCX_NET_DEVICES", "all")
 
         local_device_id = device.index
