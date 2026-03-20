@@ -245,7 +245,9 @@ def serve_metadata(
     poller.register(socket, zmq.POLLIN)
 
     clients_served = 0
-    remote_agents: list[str] = []
+    # Track remote agents with timestamps for cleanup.
+    remote_agents: list[tuple[str, float]] = []
+    _STALE_AGENT_SECONDS = 120  # Remove agents older than this.
     try:
         while True:
             # Poll with 1s timeout so Ctrl+C is responsive.
@@ -253,15 +255,37 @@ def serve_metadata(
                 continue
             # ROUTER recv: [identity, delimiter, message]
             identity, _, msg = socket.recv_multipart()
+
+            # Check if this is a disconnect notification.
+            if msg == b"__disconnect__":
+                # Client is done; identity matches original connection.
+                logger.info("Client disconnect notification received")
+                socket.send_multipart([identity, b"", b"ok"])
+                continue
+
             clients_served += 1
+
+            # Clean up stale remote agents before adding new ones.
+            now = time.time()
+            fresh: list[tuple[str, float]] = []
+            for name, ts in remote_agents:
+                if now - ts > _STALE_AGENT_SECONDS:
+                    try:
+                        agent.remove_remote_agent(name)
+                        logger.info("Cleaned up stale remote agent: %s", name)
+                    except Exception:
+                        pass
+                else:
+                    fresh.append((name, ts))
+            remote_agents = fresh
 
             # The message is the client's NIXL agent metadata.
             client_agent_metadata = msg
             remote_name = agent.add_remote_agent(client_agent_metadata)
-            remote_agents.append(remote_name)
+            remote_agents.append((remote_name, now))
             logger.info(
-                "Client %d registered as remote agent: %s",
-                clients_served, remote_name,
+                "Client %d registered as remote agent: %s (active: %d)",
+                clients_served, remote_name, len(remote_agents),
             )
 
             # ROUTER send: [identity, delimiter, payload]
@@ -274,7 +298,7 @@ def serve_metadata(
         logger.info("Shutting down (%d clients served)", clients_served)
 
     # Cleanup remote agents.
-    for name in remote_agents:
+    for name, _ in remote_agents:
         try:
             agent.remove_remote_agent(name)
         except Exception:

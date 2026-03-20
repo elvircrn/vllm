@@ -196,8 +196,6 @@ class WeightServerLoader(BaseModelLoader):
         local_agent_metadata = local_agent.get_agent_metadata()
 
         # --- 2. Handshake with server via ZMQ ---
-        # Send our NIXL agent metadata so the server can register us
-        # (bidirectional registration required for UCX connection).
         logger.info(
             "Connecting to weight server at %s:%d ...",
             self.server_host, self.server_port,
@@ -207,8 +205,6 @@ class WeightServerLoader(BaseModelLoader):
         socket.connect(f"tcp://{self.server_host}:{self.server_port}")
         socket.send(local_agent_metadata)
         payload = pickle.loads(socket.recv())
-        socket.close()
-        ctx.term()
 
         server_agent_metadata: bytes = payload["agent_metadata"]
         all_tensor_metadata: list[dict] = payload["tensors"]
@@ -231,20 +227,27 @@ class WeightServerLoader(BaseModelLoader):
 
         # --- 5. Choose transfer strategy ---
         use_bulk = (skipped == 0)
-        total_bytes = sum(m["size"] for m in tensor_metadata)
 
-        if use_bulk:
-            # No EP filtering → bulk transfer entire server buffers.
-            yield from self._bulk_transfer(
-                local_agent, remote_agent_name, local_device_id,
-                device, buffer_metadata, tensor_metadata,
-            )
-        else:
-            # EP active → selective per-tensor transfer.
-            yield from self._selective_transfer(
-                local_agent, remote_agent_name, local_device_id,
-                device, buffer_metadata, tensor_metadata,
-            )
+        try:
+            if use_bulk:
+                yield from self._bulk_transfer(
+                    local_agent, remote_agent_name, local_device_id,
+                    device, buffer_metadata, tensor_metadata,
+                )
+            else:
+                yield from self._selective_transfer(
+                    local_agent, remote_agent_name, local_device_id,
+                    device, buffer_metadata, tensor_metadata,
+                )
+        finally:
+            # Notify server we're done so it can clean up our remote agent.
+            try:
+                socket.send(b"__disconnect__")
+                socket.recv()
+            except Exception:
+                pass
+            socket.close()
+            ctx.term()
 
     def _bulk_transfer(
         self,
@@ -463,6 +466,29 @@ class WeightServerLoader(BaseModelLoader):
             local_agent.deregister_memory(local_descs)
             local_agent.remove_remote_agent(remote_agent_name)
 
+    def _load_with_retry(
+        self, model: nn.Module, model_config: ModelConfig,
+        device: torch.device, max_retries: int = 3,
+    ) -> None:
+        """Load weights with retry on NIXL transfer failures."""
+        for attempt in range(1, max_retries + 1):
+            try:
+                weights_iterator = self._connect_and_receive(
+                    device, model_config)
+                model.load_weights(weights_iterator)
+                return
+            except RuntimeError as e:
+                if attempt < max_retries:
+                    wait = attempt * 2
+                    logger.warning(
+                        "Weight transfer attempt %d/%d failed: %s. "
+                        "Retrying in %ds with fresh connection...",
+                        attempt, max_retries, e, wait,
+                    )
+                    time.sleep(wait)
+                else:
+                    raise
+
     @instrument(span_name="Load weights (weight_server)")
     def load_weights(
         self, model: nn.Module, model_config: ModelConfig
@@ -484,11 +510,7 @@ class WeightServerLoader(BaseModelLoader):
                         "Worker %d/%d: loading weights (serialized)",
                         rank, world_size,
                     )
-                    weights_iterator = self._connect_and_receive(
-                        device, model_config)
-                    model.load_weights(weights_iterator)
+                    self._load_with_retry(model, model_config, device)
                 dist.barrier()
         else:
-            weights_iterator = self._connect_and_receive(
-                device, model_config)
-            model.load_weights(weights_iterator)
+            self._load_with_retry(model, model_config, device)
