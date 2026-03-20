@@ -152,12 +152,20 @@ def register_with_nixl(
 
 
 def serve_metadata(
+    agent: "nixl_agent",
     agent_metadata: bytes,
     tensor_metadata: list[dict],
     host: str,
     port: int,
 ) -> None:
-    """Serve weight metadata to concurrent clients over ZMQ ROUTER."""
+    """Serve weight metadata to concurrent clients over ZMQ ROUTER.
+
+    Protocol (two-step handshake):
+      1. Client sends its NIXL agent metadata.
+      2. Server registers the client as a remote agent (required by NIXL
+         for the UCX connection handshake), then replies with its own
+         agent metadata + tensor list.
+    """
     payload = pickle.dumps({
         "agent_metadata": agent_metadata,
         "tensors": tensor_metadata,
@@ -173,17 +181,24 @@ def serve_metadata(
     logger.info("Metadata server listening on %s:%d (ROUTER, concurrent)", host, port)
 
     clients_served = 0
+    remote_agents: list[str] = []
     while True:
         try:
             # ROUTER recv: [identity, delimiter, message]
             identity, _, msg = socket.recv_multipart()
+            clients_served += 1
+
+            # The message is the client's NIXL agent metadata.
+            client_agent_metadata = msg
+            remote_name = agent.add_remote_agent(client_agent_metadata)
+            remote_agents.append(remote_name)
             logger.info(
-                "Client %d connected (request: %s)",
-                clients_served + 1, msg.decode(),
+                "Client %d registered as remote agent: %s",
+                clients_served, remote_name,
             )
+
             # ROUTER send: [identity, delimiter, payload]
             socket.send_multipart([identity, b"", payload])
-            clients_served += 1
             logger.info(
                 "Metadata sent to client %d — total served: %d",
                 clients_served, clients_served,
@@ -193,6 +208,13 @@ def serve_metadata(
             break
         except Exception:
             logger.exception("Error serving client")
+
+    # Cleanup remote agents.
+    for name in remote_agents:
+        try:
+            agent.remove_remote_agent(name)
+        except Exception:
+            pass
 
     socket.close()
     ctx.term()
@@ -240,7 +262,7 @@ def main():
     )
 
     try:
-        serve_metadata(agent_metadata, tensor_metadata, args.host, args.port)
+        serve_metadata(agent, agent_metadata, tensor_metadata, args.host, args.port)
     finally:
         agent.deregister_memory(descs)
 

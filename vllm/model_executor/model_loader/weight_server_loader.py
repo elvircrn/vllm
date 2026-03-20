@@ -175,7 +175,15 @@ class WeightServerLoader(BaseModelLoader):
         local_device_id = device.index
         local_expert_ids = _get_ep_filter(model_config)
 
-        # --- 1. Fetch metadata from server via ZMQ ---
+        # --- 1. Create local NIXL agent first (need metadata for handshake) ---
+        local_agent = nixl_agent(
+            f"weight_client_{uuid.uuid4()}", config
+        )
+        local_agent_metadata = local_agent.get_agent_metadata()
+
+        # --- 2. Handshake with server via ZMQ ---
+        # Send our NIXL agent metadata so the server can register us
+        # (bidirectional registration required for UCX connection).
         logger.info(
             "Connecting to weight server at %s:%d ...",
             self.server_host, self.server_port,
@@ -183,7 +191,7 @@ class WeightServerLoader(BaseModelLoader):
         ctx = zmq.Context()
         socket = ctx.socket(zmq.REQ)
         socket.connect(f"tcp://{self.server_host}:{self.server_port}")
-        socket.send(b"get_metadata")
+        socket.send(local_agent_metadata)
         payload = pickle.loads(socket.recv())
         socket.close()
         ctx.term()
@@ -191,7 +199,11 @@ class WeightServerLoader(BaseModelLoader):
         server_agent_metadata: bytes = payload["agent_metadata"]
         all_tensor_metadata: list[dict] = payload["tensors"]
 
-        # --- 2. Filter tensors (EP-aware) ---
+        # --- 3. Register remote server agent ---
+        remote_agent_name = local_agent.add_remote_agent(server_agent_metadata)
+        logger.info("Registered remote agent: %s", remote_agent_name)
+
+        # --- 4. Filter tensors (EP-aware) ---
         tensor_metadata = [
             meta for meta in all_tensor_metadata
             if not _should_skip_tensor(meta["name"], local_expert_ids)
@@ -202,14 +214,7 @@ class WeightServerLoader(BaseModelLoader):
             len(all_tensor_metadata), len(tensor_metadata), skipped,
         )
 
-        # --- 3. Create local NIXL agent and register remote server ---
-        local_agent = nixl_agent(
-            f"weight_client_{uuid.uuid4()}", config
-        )
-        remote_agent_name = local_agent.add_remote_agent(server_agent_metadata)
-        logger.info("Registered remote agent: %s", remote_agent_name)
-
-        # --- 4. Transfer tensors in batches ---
+        # --- 5. Transfer tensors in batches ---
         total = len(tensor_metadata)
         total_bytes = 0
         start_time = time.perf_counter()
