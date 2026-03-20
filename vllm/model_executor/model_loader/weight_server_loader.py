@@ -48,7 +48,8 @@ _STR_TO_DTYPE = {
 }
 
 # Number of tensors to transfer in a single NIXL batch.
-_BATCH_SIZE = 64
+# Large batches amortize per-transfer overhead (registration, prep, polling).
+_BATCH_SIZE = 4096
 
 # Regex to extract expert ID from tensor names like
 # "model.layers.0.mlp.experts.42.gate_proj.weight"
@@ -225,34 +226,51 @@ class WeightServerLoader(BaseModelLoader):
             len(all_tensor_metadata), len(tensor_metadata), skipped,
         )
 
-        # --- 5. Transfer tensors in batches ---
+        # --- 5. Pre-allocate contiguous client buffer & register once ---
         total = len(tensor_metadata)
-        total_bytes = 0
+        total_bytes = sum(m["size"] for m in tensor_metadata)
+        logger.info(
+            "Allocating %.2f GiB contiguous buffer on %s for %d tensors",
+            total_bytes / (1 << 30), device, total,
+        )
+        client_buf = torch.empty(total_bytes, dtype=torch.uint8, device=device)
+        buf_base = client_buf.data_ptr()
+
+        # Compute offsets for each tensor in the contiguous buffer.
+        offsets: list[int] = []
+        offset = 0
+        for meta in tensor_metadata:
+            offsets.append(offset)
+            offset += meta["size"]
+
+        # Register the entire client buffer once.
+        local_descs = local_agent.get_reg_descs(
+            [(buf_base, total_bytes, local_device_id, "")], "VRAM"
+        )
+        local_agent.register_memory(local_descs)
+
         start_time = time.perf_counter()
-        registered_descs = []
+        transferred_bytes = 0
 
         try:
-            for batch_start in range(0, total, _BATCH_SIZE):
+            # --- 6. Transfer in large batches ---
+            num_batches = (total + _BATCH_SIZE - 1) // _BATCH_SIZE
+            for batch_idx, batch_start in enumerate(
+                range(0, total, _BATCH_SIZE)
+            ):
                 batch_start_time = time.perf_counter()
-                batch = tensor_metadata[batch_start:batch_start + _BATCH_SIZE]
-                batch_size = len(batch)
+                batch_end = min(batch_start + _BATCH_SIZE, total)
+                batch_size = batch_end - batch_start
 
-                # Allocate local GPU buffers for this batch.
-                local_tensors: list[tuple[str, torch.Tensor]] = []
-                local_reg_data = []
+                # Build transfer descriptors (local → into buffer, remote).
+                local_xfer_data = []
                 remote_xfer_data = []
-
-                for meta in batch:
-                    dtype = _STR_TO_DTYPE[meta["dtype"]]
-                    t = torch.empty(
-                        meta["shape"], dtype=dtype, device=device
-                    )
-                    local_tensors.append((meta["name"], t))
-                    local_reg_data.append((
-                        t.data_ptr(),
+                for i in range(batch_start, batch_end):
+                    meta = tensor_metadata[i]
+                    local_xfer_data.append((
+                        buf_base + offsets[i],
                         meta["size"],
                         local_device_id,
-                        "",
                     ))
                     remote_xfer_data.append((
                         meta["addr"],
@@ -260,16 +278,8 @@ class WeightServerLoader(BaseModelLoader):
                         meta["device_id"],
                     ))
 
-                # Register local buffers with NIXL.
-                local_descs = local_agent.get_reg_descs(
-                    local_reg_data, "VRAM"
-                )
-                local_agent.register_memory(local_descs)
-                registered_descs.append(local_descs)
-
-                # Create transfer descriptor lists.
                 local_xfer_descs = local_agent.get_xfer_descs(
-                    [(d[0], d[1], d[2]) for d in local_reg_data], "VRAM"
+                    local_xfer_data, "VRAM"
                 )
                 remote_xfer_descs = local_agent.get_xfer_descs(
                     remote_xfer_data, "VRAM"
@@ -282,7 +292,6 @@ class WeightServerLoader(BaseModelLoader):
                     remote_agent_name, remote_xfer_descs
                 )
 
-                # Execute batched READ transfer.
                 desc_ids = list(range(batch_size))
                 xfer_handle = local_agent.make_prepped_xfer(
                     "READ",
@@ -294,7 +303,6 @@ class WeightServerLoader(BaseModelLoader):
                 )
                 local_agent.transfer(xfer_handle)
 
-                # Poll for completion.
                 while True:
                     state = local_agent.check_xfer_state(xfer_handle)
                     if state == "DONE":
@@ -304,52 +312,54 @@ class WeightServerLoader(BaseModelLoader):
                             f"NIXL transfer failed with state: {state}"
                         )
 
-                # Cleanup handles for this batch.
                 local_agent.release_xfer_handle(xfer_handle)
                 local_agent.release_dlist_handle(local_handle)
                 local_agent.release_dlist_handle(remote_handle)
 
-                batch_elapsed = time.perf_counter() - batch_start_time
                 batch_bytes = sum(
-                    t.nelement() * t.element_size() for _, t in local_tensors
+                    tensor_metadata[i]["size"]
+                    for i in range(batch_start, batch_end)
                 )
-
-                # Yield tensors (on GPU, no CPU copy).
-                for name, t in local_tensors:
-                    total_bytes += t.nelement() * t.element_size()
-                    yield name, t
-
-                done = batch_start + batch_size
+                transferred_bytes += batch_bytes
+                batch_elapsed = time.perf_counter() - batch_start_time
                 elapsed = time.perf_counter() - start_time
                 logger.info(
                     "Batch %d/%d: %d tensors, %.2f MiB in %.3fs "
-                    "(%.2f GiB/s) | Total: %d/%d tensors, "
-                    "%.2f GiB in %.2fs (%.2f GiB/s)",
-                    batch_start // _BATCH_SIZE + 1,
-                    (total + _BATCH_SIZE - 1) // _BATCH_SIZE,
+                    "(%.2f GiB/s) | Total: %d/%d, "
+                    "%.2f/%.2f GiB in %.2fs (%.2f GiB/s)",
+                    batch_idx + 1, num_batches,
                     batch_size,
                     batch_bytes / (1 << 20),
                     batch_elapsed,
                     batch_bytes / (1 << 30) / max(batch_elapsed, 1e-9),
-                    done, total,
+                    batch_end, total,
+                    transferred_bytes / (1 << 30),
                     total_bytes / (1 << 30),
                     elapsed,
-                    total_bytes / (1 << 30) / max(elapsed, 1e-9),
+                    transferred_bytes / (1 << 30) / max(elapsed, 1e-9),
                 )
-        finally:
-            for descs in registered_descs:
-                local_agent.deregister_memory(descs)
-            local_agent.remove_remote_agent(remote_agent_name)
 
-        elapsed = time.perf_counter() - start_time
-        logger.info(
-            "All %d weights received via NIXL: %.2f GiB in %.2f s "
-            "(%.2f GiB/s)",
-            total,
-            total_bytes / (1 << 30),
-            elapsed,
-            total_bytes / (1 << 30) / max(elapsed, 1e-9),
-        )
+            elapsed = time.perf_counter() - start_time
+            logger.info(
+                "All %d weights received via NIXL: %.2f GiB in %.2f s "
+                "(%.2f GiB/s)",
+                total,
+                total_bytes / (1 << 30),
+                elapsed,
+                total_bytes / (1 << 30) / max(elapsed, 1e-9),
+            )
+
+            # --- 7. Yield tensors as views into the contiguous buffer ---
+            for i, meta in enumerate(tensor_metadata):
+                dtype = _STR_TO_DTYPE[meta["dtype"]]
+                t = client_buf[offsets[i]:offsets[i] + meta["size"]].view(
+                    dtype
+                ).reshape(meta["shape"])
+                yield meta["name"], t
+
+        finally:
+            local_agent.deregister_memory(local_descs)
+            local_agent.remove_remote_agent(remote_agent_name)
 
     @instrument(span_name="Load weights (weight_server)")
     def load_weights(
