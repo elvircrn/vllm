@@ -470,5 +470,25 @@ class WeightServerLoader(BaseModelLoader):
         device = torch.device(
             f"cuda:{current_platform.current_device_index or torch.cuda.current_device()}"
         )
-        weights_iterator = self._connect_and_receive(device, model_config)
-        model.load_weights(weights_iterator)
+
+        # Serialize weight loading across workers to avoid concurrent
+        # NIXL connections (CUDA IPC doesn't support multiple concurrent
+        # clients reading from the same server agent).
+        import torch.distributed as dist
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+            for r in range(world_size):
+                if r == rank:
+                    logger.info(
+                        "Worker %d/%d: loading weights (serialized)",
+                        rank, world_size,
+                    )
+                    weights_iterator = self._connect_and_receive(
+                        device, model_config)
+                    model.load_weights(weights_iterator)
+                dist.barrier()
+        else:
+            weights_iterator = self._connect_and_receive(
+                device, model_config)
+            model.load_weights(weights_iterator)
