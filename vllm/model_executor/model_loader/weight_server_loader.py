@@ -190,9 +190,34 @@ class WeightServerLoader(BaseModelLoader):
         local_expert_ids = _get_ep_filter(model_config)
 
         # --- 1. Create local NIXL agent first (need metadata for handshake) ---
+        # Expand CUDA_VISIBLE_DEVICES to include all GPUs so NIXL/UCX
+        # can access the server's GPUs via CUDA IPC.  The server unsets
+        # CUDA_VISIBLE_DEVICES and uses physical GPU indices; the client
+        # must also see those GPUs.  We keep the client's assigned GPU
+        # first so PyTorch's cuda:0 stays correct.
+        cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if cvd is not None:
+            assigned = [g.strip() for g in cvd.split(",")]
+            num_gpus = torch.cuda.device_count()
+            # If restrictive (fewer GPUs than physically available),
+            # expand to include all GPUs.
+            all_gpus = [str(i) for i in range(8)]  # DGX has 8 GPUs
+            missing = [g for g in all_gpus if g not in assigned]
+            if missing:
+                expanded = ",".join(assigned + missing)
+                os.environ["CUDA_VISIBLE_DEVICES"] = expanded
+                logger.info(
+                    "Expanded CUDA_VISIBLE_DEVICES: %s → %s",
+                    cvd, expanded,
+                )
+                cvd = expanded
+            else:
+                cvd = os.environ["CUDA_VISIBLE_DEVICES"]
+        else:
+            cvd = "<unset>"
+
         ucx_tls = os.environ.get("UCX_TLS", "all")
         ucx_net = os.environ.get("UCX_NET_DEVICES", "all")
-        cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>")
         logger.info(
             "UCX_TLS=%s, UCX_NET_DEVICES=%s, CUDA_VISIBLE_DEVICES=%s, "
             "local_device=%s (index=%d)",
