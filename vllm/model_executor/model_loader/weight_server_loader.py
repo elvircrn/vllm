@@ -80,17 +80,26 @@ def _get_ep_filter(model_config: ModelConfig) -> set[int] | None:
     try:
         from vllm.distributed.parallel_state import get_ep_group
         ep_group = get_ep_group()
-    except Exception:
+    except Exception as e:
+        logger.info("EP group not available: %s", e)
         return None
 
     ep_size = ep_group.world_size
     if ep_size <= 1:
+        logger.info("EP size is %d, no EP filtering", ep_size)
         return None
 
     ep_rank = ep_group.rank_in_group
     num_experts = getattr(model_config.hf_config, "n_routed_experts",
                           getattr(model_config.hf_config, "num_local_experts",
                                   0))
+    logger.info(
+        "EP group: rank=%d, size=%d, num_experts=%d "
+        "(n_routed_experts=%s, num_local_experts=%s)",
+        ep_rank, ep_size, num_experts,
+        getattr(model_config.hf_config, "n_routed_experts", "N/A"),
+        getattr(model_config.hf_config, "num_local_experts", "N/A"),
+    )
     if num_experts <= 0:
         return None
 
