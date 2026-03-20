@@ -188,7 +188,12 @@ class WeightServerLoader(BaseModelLoader):
         # --- 1. Create local NIXL agent first (need metadata for handshake) ---
         ucx_tls = os.environ.get("UCX_TLS", "all")
         ucx_net = os.environ.get("UCX_NET_DEVICES", "all")
-        logger.info("UCX_TLS=%s, UCX_NET_DEVICES=%s", ucx_tls, ucx_net)
+        cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>")
+        logger.info(
+            "UCX_TLS=%s, UCX_NET_DEVICES=%s, CUDA_VISIBLE_DEVICES=%s, "
+            "local_device=%s (index=%d)",
+            ucx_tls, ucx_net, cvd, device, local_device_id,
+        )
 
         local_agent = nixl_agent(
             f"weight_client_{uuid.uuid4()}", config
@@ -209,6 +214,13 @@ class WeightServerLoader(BaseModelLoader):
         server_agent_metadata: bytes = payload["agent_metadata"]
         all_tensor_metadata: list[dict] = payload["tensors"]
         buffer_metadata: list[dict] = payload["buffers"]
+
+        server_gpu_ids = sorted({b["device_id"] for b in buffer_metadata})
+        logger.info(
+            "Server GPU device IDs: %s (client local device: %d, "
+            "CUDA_VISIBLE_DEVICES=%s)",
+            server_gpu_ids, local_device_id, cvd,
+        )
 
         # --- 3. Register remote server agent ---
         remote_agent_name = local_agent.add_remote_agent(server_agent_metadata)
@@ -307,7 +319,16 @@ class WeightServerLoader(BaseModelLoader):
             # Poll all transfers.
             for i, (xh, lh, rh, size) in enumerate(xfer_handles):
                 while True:
-                    state = local_agent.check_xfer_state(xh)
+                    try:
+                        state = local_agent.check_xfer_state(xh)
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"NIXL bulk transfer {i} failed: {e}. "
+                            f"Server GPUs: {[b['device_id'] for b in buffer_metadata]}, "
+                            f"client device: {local_device_id}, "
+                            f"CUDA_VISIBLE_DEVICES="
+                            f"{os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}"
+                        ) from e
                     if state == "DONE":
                         break
                     if state != "PROC":
@@ -419,7 +440,13 @@ class WeightServerLoader(BaseModelLoader):
                 local_agent.transfer(xh)
 
                 while True:
-                    state = local_agent.check_xfer_state(xh)
+                    try:
+                        state = local_agent.check_xfer_state(xh)
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"NIXL selective transfer batch {batch_idx} "
+                            f"failed: {e}"
+                        ) from e
                     if state == "DONE":
                         break
                     if state != "PROC":
@@ -477,7 +504,7 @@ class WeightServerLoader(BaseModelLoader):
                     device, model_config)
                 model.load_weights(weights_iterator)
                 return
-            except RuntimeError as e:
+            except Exception as e:
                 if attempt < max_retries:
                     wait = attempt * 2
                     logger.warning(
