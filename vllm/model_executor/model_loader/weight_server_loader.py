@@ -172,7 +172,18 @@ class WeightServerLoader(BaseModelLoader):
         os.environ.setdefault("UCX_TLS", "all")
         os.environ.setdefault("UCX_NET_DEVICES", "all")
 
-        local_device_id = device.index
+        # Use physical device ID (not logical) for NIXL registration,
+        # so it matches the server's physical IDs.
+        cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if cvd:
+            phys_map = [int(x.strip()) for x in cvd.split(",")]
+            local_device_id = phys_map[device.index]
+        else:
+            local_device_id = device.index
+        logger.info(
+            "Local device: %s (logical %d, physical %d)",
+            device, device.index, local_device_id,
+        )
         local_expert_ids = _get_ep_filter(model_config)
 
         # --- 1. Create local NIXL agent first (need metadata for handshake) ---
@@ -207,25 +218,12 @@ class WeightServerLoader(BaseModelLoader):
         remote_agent_name = local_agent.add_remote_agent(server_agent_metadata)
         logger.info("Registered remote agent: %s", remote_agent_name)
 
-        # Log transport info: check P2P to remote devices.
+        # Log transport info: remote devices use physical IDs.
         remote_device_ids = sorted({m["device_id"] for m in all_tensor_metadata})
         logger.info(
-            "Local device: %s (index %d), remote devices: %s",
-            device, local_device_id, remote_device_ids,
+            "Local physical device: %d, remote physical devices: %s",
+            local_device_id, remote_device_ids,
         )
-        for rd in remote_device_ids:
-            try:
-                can_p2p = torch.cuda.can_device_access_peer(device.index, rd)
-                logger.info(
-                    "P2P access cuda:%d -> cuda:%d: %s (NVLink %s)",
-                    device.index, rd, can_p2p,
-                    "available" if can_p2p else "NOT available — will use IB/host",
-                )
-            except Exception:
-                logger.info(
-                    "P2P check cuda:%d -> cuda:%d: N/A (device not visible)",
-                    device.index, rd,
-                )
 
         # --- 4. Filter tensors (EP-aware) ---
         tensor_metadata = [
