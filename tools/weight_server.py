@@ -164,7 +164,8 @@ def register_with_nixl(
     except ImportError:
         config = None
 
-    os.environ.setdefault("UCX_TLS", "all")
+    # Use local transports only (NVLink via CUDA IPC, no InfiniBand).
+    os.environ.setdefault("UCX_TLS", "cuda_ipc,cuda_copy,shm,self")
     os.environ.setdefault("UCX_NET_DEVICES", "all")
 
     agent = nixl_agent(f"weight_server_{uuid.uuid4()}", config)
