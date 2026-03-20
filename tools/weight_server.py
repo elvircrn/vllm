@@ -180,10 +180,16 @@ def serve_metadata(
     socket.bind(f"tcp://{host}:{port}")
     logger.info("Metadata server listening on %s:%d (ROUTER, concurrent)", host, port)
 
+    poller = zmq.Poller()
+    poller.register(socket, zmq.POLLIN)
+
     clients_served = 0
     remote_agents: list[str] = []
-    while True:
-        try:
+    try:
+        while True:
+            # Poll with 1s timeout so Ctrl+C is responsive.
+            if not poller.poll(1000):
+                continue
             # ROUTER recv: [identity, delimiter, message]
             identity, _, msg = socket.recv_multipart()
             clients_served += 1
@@ -203,11 +209,8 @@ def serve_metadata(
                 "Metadata sent to client %d — total served: %d",
                 clients_served, clients_served,
             )
-        except KeyboardInterrupt:
-            logger.info("Shutting down (%d clients served)", clients_served)
-            break
-        except Exception:
-            logger.exception("Error serving client")
+    except KeyboardInterrupt:
+        logger.info("Shutting down (%d clients served)", clients_served)
 
     # Cleanup remote agents.
     for name in remote_agents:
