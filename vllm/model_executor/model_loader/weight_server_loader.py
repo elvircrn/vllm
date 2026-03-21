@@ -119,8 +119,6 @@ def _should_skip_tensor(name: str, local_expert_ids: set[int] | None) -> bool:
     m = _EXPERT_ID_RE.search(name)
     if m is None:
         return False
-    if not name.endswith(".weight"):
-        return False
     expert_id = int(m.group(1))
     return expert_id not in local_expert_ids
 
