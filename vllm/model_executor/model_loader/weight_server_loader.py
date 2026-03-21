@@ -368,11 +368,11 @@ class WeightServerLoader(BaseModelLoader):
         buffer_metadata: list[dict],
         tensor_metadata: list[dict],
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """Range-based selective transfer.
+        """Range-based selective transfer with parallel reads.
 
-        Computes the exact byte ranges of needed tensors per server buffer
-        and transfers only those ranges. With server-side expert sorting,
-        non-local expert regions are completely skipped.
+        Computes the exact byte ranges of needed tensors per server buffer,
+        then batches reads that fit in the staging buffer simultaneously.
+        Reads from different server GPUs overlap via NVLink.
         """
         all_total = sum(b["size"] for b in buffer_metadata)
 
@@ -398,12 +398,41 @@ class WeightServerLoader(BaseModelLoader):
         chunk_cap = int(free_mem * 0.75)
         needed_bytes = sum(m["size"] for m in tensor_metadata)
 
+        # Collect all read operations (each <= chunk_cap).
+        read_ops: list[dict] = []
+        for buf_meta in buffer_metadata:
+            buf_device = buf_meta["device_id"]
+            for range_start, range_end, range_tensors in \
+                    buf_ranges.get(buf_device, []):
+                range_size = range_end - range_start
+                range_offset = 0
+                tensor_idx = 0
+                while range_offset < range_size:
+                    this_read = min(chunk_cap, range_size - range_offset)
+                    read_start = range_start + range_offset
+                    read_end = read_start + this_read
+                    # Find tensors in this sub-chunk.
+                    end_idx = tensor_idx
+                    while end_idx < len(range_tensors):
+                        m = range_tensors[end_idx]
+                        if m["addr"] + m["size"] > read_end:
+                            break
+                        end_idx += 1
+                    read_ops.append({
+                        "remote_addr": read_start,
+                        "size": this_read,
+                        "device_id": buf_device,
+                        "tensors": range_tensors[tensor_idx:end_idx],
+                    })
+                    tensor_idx = end_idx
+                    range_offset += this_read
+
         logger.info(
-            "Selective transfer (range-based): %d tensors, "
-            "%.2f GiB needed across %d ranges (%.2f GiB range bytes), "
+            "Selective transfer (parallel range-based): %d tensors, "
+            "%.2f GiB needed, %d ranges, %d read ops, "
             "%.2f GiB total buffers, staging=%.2f GiB",
             len(tensor_metadata), needed_bytes / (1 << 30),
-            total_ranges, total_range_bytes / (1 << 30),
+            total_ranges, len(read_ops),
             all_total / (1 << 30), chunk_cap / (1 << 30),
         )
 
@@ -415,75 +444,75 @@ class WeightServerLoader(BaseModelLoader):
 
         start_time = time.perf_counter()
         transferred_bytes = 0
-        num_reads = 0
+        num_batches = 0
 
         try:
-            for buf_meta in buffer_metadata:
-                buf_device = buf_meta["device_id"]
-                ranges = buf_ranges.get(buf_device, [])
+            op_idx = 0
+            while op_idx < len(read_ops):
+                # Pack as many reads as fit in the staging buffer.
+                batch: list[tuple[dict, int]] = []
+                staging_used = 0
+                while op_idx < len(read_ops):
+                    op = read_ops[op_idx]
+                    if batch and staging_used + op["size"] > chunk_cap:
+                        break
+                    batch.append((op, staging_used))
+                    staging_used += op["size"]
+                    op_idx += 1
 
-                for range_start, range_end, range_tensors in ranges:
-                    range_size = range_end - range_start
+                # Fire all reads in this batch simultaneously.
+                handles = []
+                for op, stg_offset in batch:
+                    local_xfer = local_agent.get_xfer_descs(
+                        [(buf_base + stg_offset, op["size"],
+                          local_device_id)], "VRAM")
+                    remote_xfer = local_agent.get_xfer_descs(
+                        [(op["remote_addr"], op["size"],
+                          op["device_id"])], "VRAM")
+                    local_h = local_agent.prep_xfer_dlist(
+                        "NIXL_INIT_AGENT", local_xfer)
+                    remote_h = local_agent.prep_xfer_dlist(
+                        remote_agent_name, remote_xfer)
+                    xh = local_agent.make_prepped_xfer(
+                        "READ", local_h, [0], remote_h, [0],
+                        notif_msg=b"",
+                    )
+                    local_agent.transfer(xh)
+                    handles.append((xh, local_h, remote_h))
 
-                    # Sub-chunk if range exceeds staging buffer.
-                    range_offset = 0
-                    tensor_idx = 0
-                    while range_offset < range_size:
-                        this_read = min(chunk_cap,
-                                        range_size - range_offset)
-                        read_start = range_start + range_offset
-                        read_end = read_start + this_read
+                # Wait for all reads in batch to complete.
+                for i, (xh, local_h, remote_h) in enumerate(handles):
+                    while True:
+                        try:
+                            state = local_agent.check_xfer_state(xh)
+                        except Exception as e:
+                            raise RuntimeError(
+                                f"NIXL parallel transfer batch="
+                                f"{num_batches} read={i} failed: {e}"
+                            ) from e
+                        if state == "DONE":
+                            break
+                        if state != "PROC":
+                            raise RuntimeError(
+                                f"NIXL parallel transfer batch="
+                                f"{num_batches} read={i} failed: "
+                                f"{state}")
+                    local_agent.release_xfer_handle(xh)
+                    local_agent.release_dlist_handle(local_h)
+                    local_agent.release_dlist_handle(remote_h)
 
-                        local_xfer = local_agent.get_xfer_descs(
-                            [(buf_base, this_read, local_device_id)],
-                            "VRAM")
-                        remote_xfer = local_agent.get_xfer_descs(
-                            [(read_start, this_read, buf_device)],
-                            "VRAM")
-                        local_h = local_agent.prep_xfer_dlist(
-                            "NIXL_INIT_AGENT", local_xfer)
-                        remote_h = local_agent.prep_xfer_dlist(
-                            remote_agent_name, remote_xfer)
-                        xh = local_agent.make_prepped_xfer(
-                            "READ", local_h, [0], remote_h, [0],
-                            notif_msg=b"",
-                        )
-                        local_agent.transfer(xh)
+                # Yield tensors from all reads in this batch.
+                for op, stg_offset in batch:
+                    for meta in op["tensors"]:
+                        off = (meta["addr"] - op["remote_addr"]
+                               + stg_offset)
+                        dtype = _STR_TO_DTYPE[meta["dtype"]]
+                        t = client_buf[off:off + meta["size"]].view(
+                            dtype).reshape(meta["shape"])
+                        yield meta["name"], t
+                    transferred_bytes += op["size"]
 
-                        while True:
-                            try:
-                                state = local_agent.check_xfer_state(xh)
-                            except Exception as e:
-                                raise RuntimeError(
-                                    f"NIXL range transfer read={num_reads}"
-                                    f" failed: {e}"
-                                ) from e
-                            if state == "DONE":
-                                break
-                            if state != "PROC":
-                                raise RuntimeError(
-                                    f"NIXL range transfer read={num_reads}"
-                                    f" failed: {state}")
-
-                        local_agent.release_xfer_handle(xh)
-                        local_agent.release_dlist_handle(local_h)
-                        local_agent.release_dlist_handle(remote_h)
-                        transferred_bytes += this_read
-                        num_reads += 1
-
-                        # Yield tensors that fall within this read.
-                        while tensor_idx < len(range_tensors):
-                            meta = range_tensors[tensor_idx]
-                            if meta["addr"] + meta["size"] > read_end:
-                                break
-                            off = meta["addr"] - read_start
-                            dtype = _STR_TO_DTYPE[meta["dtype"]]
-                            t = client_buf[off:off + meta["size"]].view(
-                                dtype).reshape(meta["shape"])
-                            yield meta["name"], t
-                            tensor_idx += 1
-
-                        range_offset += this_read
+                num_batches += 1
 
         finally:
             local_agent.deregister_memory(local_descs)
@@ -493,10 +522,11 @@ class WeightServerLoader(BaseModelLoader):
         skipped_bytes = all_total - transferred_bytes
         logger.info(
             "Selective transfer done: %.2f GiB in %.3fs (%.2f GiB/s) "
-            "(%d reads, skipped %.2f GiB of %.2f GiB)",
+            "(%d read ops in %d batches, skipped %.2f GiB of %.2f GiB)",
             transferred_bytes / (1 << 30), elapsed,
             transferred_bytes / (1 << 30) / max(elapsed, 1e-9),
-            num_reads, skipped_bytes / (1 << 30), all_total / (1 << 30),
+            len(read_ops), num_batches,
+            skipped_bytes / (1 << 30), all_total / (1 << 30),
         )
         overhead = (transferred_bytes - needed_bytes) / max(needed_bytes, 1)
         logger.info(
