@@ -364,60 +364,57 @@ class WeightServerLoader(BaseModelLoader):
         for dev_id in buf_tensors:
             buf_tensors[dev_id].sort(key=lambda m: m["addr"])
 
+        # Allocate one staging buffer, register once, reuse for all chunks.
+        free_mem = torch.cuda.mem_get_info(device)[0]
+        chunk_cap = int(free_mem * 0.75)
+
         logger.info(
             "Selective transfer (chunked bulk): %d tensors needed, "
-            "%.2f GiB across %d server buffers",
+            "%.2f GiB across %d server buffers, staging=%.2f GiB",
             len(needed), all_total / (1 << 30), len(buffer_metadata),
+            chunk_cap / (1 << 30),
         )
+
+        client_buf = torch.empty(chunk_cap, dtype=torch.uint8, device=device)
+        buf_base = client_buf.data_ptr()
+        local_descs = local_agent.get_reg_descs(
+            [(buf_base, chunk_cap, local_device_id, "")], "VRAM")
+        local_agent.register_memory(local_descs)
 
         start_time = time.perf_counter()
         transferred_bytes = 0
         skipped_bytes = 0
         num_chunks = 0
 
-        for buf_idx, buf_meta in enumerate(buffer_metadata):
-            buf_size = buf_meta["size"]
-            buf_addr = buf_meta["addr"]
-            buf_device = buf_meta["device_id"]
-            dev_tensors = buf_tensors.get(buf_device, [])
+        try:
+            for buf_idx, buf_meta in enumerate(buffer_metadata):
+                buf_size = buf_meta["size"]
+                buf_addr = buf_meta["addr"]
+                buf_device = buf_meta["device_id"]
+                dev_tensors = buf_tensors.get(buf_device, [])
 
-            # Split this server buffer into chunks.
-            chunk_offset = 0
-            while chunk_offset < buf_size:
-                # Re-check free memory before each chunk allocation.
-                free_mem = torch.cuda.mem_get_info(device)[0]
-                chunk_cap = int(free_mem * 0.75)
-                this_chunk = min(chunk_cap, buf_size - chunk_offset)
+                chunk_offset = 0
+                while chunk_offset < buf_size:
+                    this_chunk = min(chunk_cap, buf_size - chunk_offset)
 
-                # Check if any needed tensors fall in this chunk.
-                chunk_start = buf_addr + chunk_offset
-                chunk_end = chunk_start + this_chunk
-                chunk_tensors = [
-                    m for m in dev_tensors
-                    if m["addr"] >= chunk_start and m["addr"] + m["size"] <= chunk_end
-                ]
-                if not chunk_tensors:
-                    skipped_bytes += this_chunk
-                    chunk_offset += this_chunk
-                    continue
+                    # Check if any needed tensors fall in this chunk.
+                    chunk_start = buf_addr + chunk_offset
+                    chunk_end = chunk_start + this_chunk
+                    chunk_tensors = [
+                        m for m in dev_tensors
+                        if m["addr"] >= chunk_start
+                        and m["addr"] + m["size"] <= chunk_end
+                    ]
+                    if not chunk_tensors:
+                        skipped_bytes += this_chunk
+                        chunk_offset += this_chunk
+                        continue
 
-                client_buf = torch.empty(
-                    this_chunk, dtype=torch.uint8, device=device)
-                local_descs = local_agent.get_reg_descs(
-                    [(client_buf.data_ptr(), this_chunk,
-                      local_device_id, "")], "VRAM",
-                )
-                local_agent.register_memory(local_descs)
-
-                try:
                     local_xfer = local_agent.get_xfer_descs(
-                        [(client_buf.data_ptr(), this_chunk,
-                          local_device_id)], "VRAM",
-                    )
+                        [(buf_base, this_chunk, local_device_id)], "VRAM")
                     remote_xfer = local_agent.get_xfer_descs(
                         [(buf_addr + chunk_offset, this_chunk,
-                          buf_device)], "VRAM",
-                    )
+                          buf_device)], "VRAM")
                     local_h = local_agent.prep_xfer_dlist(
                         "NIXL_INIT_AGENT", local_xfer)
                     remote_h = local_agent.prep_xfer_dlist(
@@ -457,11 +454,11 @@ class WeightServerLoader(BaseModelLoader):
                             dtype).reshape(meta["shape"])
                         yield meta["name"], t
 
-                finally:
-                    local_agent.deregister_memory(local_descs)
-                    del client_buf
+                    chunk_offset += this_chunk
 
-                chunk_offset += this_chunk
+        finally:
+            local_agent.deregister_memory(local_descs)
+            del client_buf
 
         elapsed = time.perf_counter() - start_time
         needed_bytes = sum(m["size"] for m in tensor_metadata)
