@@ -345,7 +345,11 @@ class WeightServerLoader(BaseModelLoader):
         buffer_metadata: list[dict],
         tensor_metadata: list[dict],
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """Transfer only needed tensors (EP-aware)."""
+        """Transfer only needed tensors in batches (EP-aware).
+
+        Allocates a per-batch buffer instead of one giant buffer to avoid
+        OOM when the model params are already allocated on the GPU.
+        """
         total_bytes = sum(m["size"] for m in tensor_metadata)
         total = len(tensor_metadata)
         logger.info(
@@ -353,31 +357,33 @@ class WeightServerLoader(BaseModelLoader):
             total, total_bytes / (1 << 30),
         )
 
-        client_buf = torch.empty(
-            total_bytes, dtype=torch.uint8, device=device)
-        buf_base = client_buf.data_ptr()
-
-        offsets: list[int] = []
-        offset = 0
-        for meta in tensor_metadata:
-            offsets.append(offset)
-            offset += meta["size"]
-
-        local_descs = local_agent.get_reg_descs(
-            [(buf_base, total_bytes, local_device_id, "")], "VRAM")
-        local_agent.register_memory(local_descs)
         start_time = time.perf_counter()
+        num_batches = (total + _BATCH_SIZE - 1) // _BATCH_SIZE
 
-        try:
-            num_batches = (total + _BATCH_SIZE - 1) // _BATCH_SIZE
-            for batch_idx in range(num_batches):
-                batch_start = batch_idx * _BATCH_SIZE
-                batch_end = min(batch_start + _BATCH_SIZE, total)
+        for batch_idx in range(num_batches):
+            batch_start = batch_idx * _BATCH_SIZE
+            batch_end = min(batch_start + _BATCH_SIZE, total)
+            batch_meta = tensor_metadata[batch_start:batch_end]
 
+            batch_bytes = sum(m["size"] for m in batch_meta)
+            client_buf = torch.empty(
+                batch_bytes, dtype=torch.uint8, device=device)
+            buf_base = client_buf.data_ptr()
+
+            offsets: list[int] = []
+            offset = 0
+            for meta in batch_meta:
+                offsets.append(offset)
+                offset += meta["size"]
+
+            local_descs = local_agent.get_reg_descs(
+                [(buf_base, batch_bytes, local_device_id, "")], "VRAM")
+            local_agent.register_memory(local_descs)
+
+            try:
                 local_xfer_data = []
                 remote_xfer_data = []
-                for i in range(batch_start, batch_end):
-                    meta = tensor_metadata[i]
+                for i, meta in enumerate(batch_meta):
                     local_xfer_data.append((
                         buf_base + offsets[i], meta["size"], local_device_id,
                     ))
@@ -394,7 +400,7 @@ class WeightServerLoader(BaseModelLoader):
                 remote_h = local_agent.prep_xfer_dlist(
                     remote_agent_name, remote_xfer)
 
-                desc_ids = list(range(batch_end - batch_start))
+                desc_ids = list(range(len(batch_meta)))
                 xh = local_agent.make_prepped_xfer(
                     "READ", local_h, desc_ids, remote_h, desc_ids,
                     notif_msg=b"",
@@ -420,21 +426,22 @@ class WeightServerLoader(BaseModelLoader):
                 local_agent.release_dlist_handle(local_h)
                 local_agent.release_dlist_handle(remote_h)
 
-            elapsed = time.perf_counter() - start_time
-            logger.info(
-                "Selective transfer done: %.2f GiB in %.3fs (%.2f GiB/s)",
-                total_bytes / (1 << 30), elapsed,
-                total_bytes / (1 << 30) / max(elapsed, 1e-9),
-            )
+                for i, meta in enumerate(batch_meta):
+                    dtype = _STR_TO_DTYPE[meta["dtype"]]
+                    t = client_buf[offsets[i]:offsets[i] + meta["size"]].view(
+                        dtype).reshape(meta["shape"])
+                    yield meta["name"], t
 
-            for i, meta in enumerate(tensor_metadata):
-                dtype = _STR_TO_DTYPE[meta["dtype"]]
-                t = client_buf[offsets[i]:offsets[i] + meta["size"]].view(
-                    dtype).reshape(meta["shape"])
-                yield meta["name"], t
+            finally:
+                local_agent.deregister_memory(local_descs)
+                del client_buf
 
-        finally:
-            local_agent.deregister_memory(local_descs)
+        elapsed = time.perf_counter() - start_time
+        logger.info(
+            "Selective transfer done: %.2f GiB in %.3fs (%.2f GiB/s)",
+            total_bytes / (1 << 30), elapsed,
+            total_bytes / (1 << 30) / max(elapsed, 1e-9),
+        )
             local_agent.remove_remote_agent(remote_agent_name)
 
     def _load_with_retry(
