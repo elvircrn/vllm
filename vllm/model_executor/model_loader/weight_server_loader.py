@@ -345,47 +345,51 @@ class WeightServerLoader(BaseModelLoader):
         buffer_metadata: list[dict],
         tensor_metadata: list[dict],
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """Transfer only needed tensors in batches (EP-aware).
+        """Transfer only needed tensors via a reusable staging buffer.
 
-        Allocates a per-batch buffer instead of one giant buffer to avoid
-        OOM when the model params are already allocated on the GPU.
+        Uses a fixed-size staging buffer (default 16 GiB), registered once
+        with NIXL. Tensors are packed into the buffer batch by batch; when
+        the buffer is full the batch is transferred and yielded, then the
+        buffer is reused for the next batch.
         """
         total_bytes = sum(m["size"] for m in tensor_metadata)
         total = len(tensor_metadata)
+
+        # Use up to 16 GiB or total_bytes, whichever is smaller.
+        _STAGING_CAP = 16 * (1 << 30)
+        staging_size = min(_STAGING_CAP, total_bytes)
+
         logger.info(
-            "Selective transfer (EP): %d tensors, %.2f GiB",
-            total, total_bytes / (1 << 30),
+            "Selective transfer (EP): %d tensors, %.2f GiB "
+            "(staging buffer %.2f GiB)",
+            total, total_bytes / (1 << 30), staging_size / (1 << 30),
         )
 
+        client_buf = torch.empty(staging_size, dtype=torch.uint8, device=device)
+        buf_base = client_buf.data_ptr()
+
+        local_descs = local_agent.get_reg_descs(
+            [(buf_base, staging_size, local_device_id, "")], "VRAM")
+        local_agent.register_memory(local_descs)
         start_time = time.perf_counter()
-        num_batches = (total + _BATCH_SIZE - 1) // _BATCH_SIZE
 
-        for batch_idx in range(num_batches):
-            batch_start = batch_idx * _BATCH_SIZE
-            batch_end = min(batch_start + _BATCH_SIZE, total)
-            batch_meta = tensor_metadata[batch_start:batch_end]
+        try:
+            # Pack tensors into batches that fit in the staging buffer.
+            batch_meta: list[dict] = []
+            batch_offsets: list[int] = []
+            batch_bytes = 0
+            batch_idx = 0
 
-            batch_bytes = sum(m["size"] for m in batch_meta)
-            client_buf = torch.empty(
-                batch_bytes, dtype=torch.uint8, device=device)
-            buf_base = client_buf.data_ptr()
-
-            offsets: list[int] = []
-            offset = 0
-            for meta in batch_meta:
-                offsets.append(offset)
-                offset += meta["size"]
-
-            local_descs = local_agent.get_reg_descs(
-                [(buf_base, batch_bytes, local_device_id, "")], "VRAM")
-            local_agent.register_memory(local_descs)
-
-            try:
+            def _flush_batch(
+                batch_m: list[dict], b_offsets: list[int],
+                b_bytes: int, b_idx: int,
+            ) -> Generator[tuple[str, torch.Tensor], None, None]:
                 local_xfer_data = []
                 remote_xfer_data = []
-                for i, meta in enumerate(batch_meta):
+                for i, meta in enumerate(batch_m):
                     local_xfer_data.append((
-                        buf_base + offsets[i], meta["size"], local_device_id,
+                        buf_base + b_offsets[i], meta["size"],
+                        local_device_id,
                     ))
                     remote_xfer_data.append((
                         meta["addr"], meta["size"], meta["device_id"],
@@ -400,7 +404,7 @@ class WeightServerLoader(BaseModelLoader):
                 remote_h = local_agent.prep_xfer_dlist(
                     remote_agent_name, remote_xfer)
 
-                desc_ids = list(range(len(batch_meta)))
+                desc_ids = list(range(len(batch_m)))
                 xh = local_agent.make_prepped_xfer(
                     "READ", local_h, desc_ids, remote_h, desc_ids,
                     notif_msg=b"",
@@ -412,36 +416,55 @@ class WeightServerLoader(BaseModelLoader):
                         state = local_agent.check_xfer_state(xh)
                     except Exception as e:
                         raise RuntimeError(
-                            f"NIXL selective transfer batch {batch_idx} "
+                            f"NIXL selective transfer batch {b_idx} "
                             f"failed: {e}"
                         ) from e
                     if state == "DONE":
                         break
                     if state != "PROC":
                         raise RuntimeError(
-                            f"NIXL selective transfer batch {batch_idx} "
+                            f"NIXL selective transfer batch {b_idx} "
                             f"failed: {state}")
 
                 local_agent.release_xfer_handle(xh)
                 local_agent.release_dlist_handle(local_h)
                 local_agent.release_dlist_handle(remote_h)
 
-                for i, meta in enumerate(batch_meta):
+                for i, meta in enumerate(batch_m):
                     dtype = _STR_TO_DTYPE[meta["dtype"]]
-                    t = client_buf[offsets[i]:offsets[i] + meta["size"]].view(
-                        dtype).reshape(meta["shape"])
-                    yield meta["name"], t
+                    t = client_buf[b_offsets[i]:b_offsets[i] + meta["size"]]
+                    yield meta["name"], t.view(dtype).reshape(meta["shape"])
 
-            finally:
-                local_agent.deregister_memory(local_descs)
-                del client_buf
+            for meta in tensor_metadata:
+                size = meta["size"]
+                if batch_bytes + size > staging_size and batch_meta:
+                    yield from _flush_batch(
+                        batch_meta, batch_offsets, batch_bytes, batch_idx)
+                    batch_meta = []
+                    batch_offsets = []
+                    batch_bytes = 0
+                    batch_idx += 1
 
-        elapsed = time.perf_counter() - start_time
-        logger.info(
-            "Selective transfer done: %.2f GiB in %.3fs (%.2f GiB/s)",
-            total_bytes / (1 << 30), elapsed,
-            total_bytes / (1 << 30) / max(elapsed, 1e-9),
-        )
+                batch_offsets.append(batch_bytes)
+                batch_meta.append(meta)
+                batch_bytes += size
+
+            if batch_meta:
+                yield from _flush_batch(
+                    batch_meta, batch_offsets, batch_bytes, batch_idx)
+
+            elapsed = time.perf_counter() - start_time
+            logger.info(
+                "Selective transfer done: %.2f GiB in %.3fs (%.2f GiB/s) "
+                "(%d batches)",
+                total_bytes / (1 << 30), elapsed,
+                total_bytes / (1 << 30) / max(elapsed, 1e-9),
+                batch_idx + 1,
+            )
+
+        finally:
+            local_agent.deregister_memory(local_descs)
+            del client_buf
 
     def _load_with_retry(
         self, model: nn.Module, model_config: ModelConfig,
