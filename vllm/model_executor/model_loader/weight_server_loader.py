@@ -354,16 +354,10 @@ class WeightServerLoader(BaseModelLoader):
         needed = {meta["name"] for meta in tensor_metadata}
         all_total = sum(b["size"] for b in buffer_metadata)
 
-        # Cap chunk size at 75% of free GPU memory.
-        free_mem = torch.cuda.mem_get_info(device)[0]
-        chunk_cap = int(free_mem * 0.75)
-
         logger.info(
             "Selective transfer (chunked bulk): %d tensors needed, "
-            "%.2f GiB across %d server buffers, "
-            "free=%.2f GiB, chunk_cap=%.2f GiB",
+            "%.2f GiB across %d server buffers",
             len(needed), all_total / (1 << 30), len(buffer_metadata),
-            free_mem / (1 << 30), chunk_cap / (1 << 30),
         )
 
         start_time = time.perf_counter()
@@ -378,6 +372,9 @@ class WeightServerLoader(BaseModelLoader):
             # Split this server buffer into chunks.
             chunk_offset = 0
             while chunk_offset < buf_size:
+                # Re-check free memory before each chunk allocation.
+                free_mem = torch.cuda.mem_get_info(device)[0]
+                chunk_cap = int(free_mem * 0.75)
                 this_chunk = min(chunk_cap, buf_size - chunk_offset)
 
                 client_buf = torch.empty(
@@ -499,17 +496,4 @@ class WeightServerLoader(BaseModelLoader):
             f"cuda:{current_platform.current_device_index or torch.cuda.current_device()}"
         )
 
-        import torch.distributed as dist
-        if dist.is_initialized() and dist.get_world_size() > 1:
-            rank = dist.get_rank()
-            world_size = dist.get_world_size()
-            for r in range(world_size):
-                if r == rank:
-                    logger.info(
-                        "Worker %d/%d: loading weights (serialized)",
-                        rank, world_size,
-                    )
-                    self._load_with_retry(model, model_config, device)
-                dist.barrier()
-        else:
-            self._load_with_retry(model, model_config, device)
+        self._load_with_retry(model, model_config, device)
