@@ -442,7 +442,6 @@ class WeightServerLoader(BaseModelLoader):
             total_bytes / (1 << 30), elapsed,
             total_bytes / (1 << 30) / max(elapsed, 1e-9),
         )
-            local_agent.remove_remote_agent(remote_agent_name)
 
     def _load_with_retry(
         self, model: nn.Module, model_config: ModelConfig,
