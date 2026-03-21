@@ -29,6 +29,7 @@ import argparse
 import logging
 import os
 import pickle
+import re
 import signal
 import time
 import uuid
@@ -44,6 +45,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+
+_EXPERT_ID_RE = re.compile(r"\.experts\.(\d+)\.")
+
+
+def _expert_sort_key(name: str) -> tuple[int, int, str]:
+    """Sort key that groups non-expert weights first, then experts by ID.
+
+    Returns (is_expert, expert_id, name) so that:
+      - Non-expert tensors come first (is_expert=0)
+      - Expert tensors are grouped by expert ID (is_expert=1, expert_id=N)
+    This layout lets clients skip contiguous regions of non-local experts.
+    """
+    m = _EXPERT_ID_RE.search(name)
+    if m is None:
+        return (0, 0, name)
+    return (1, int(m.group(1)), name)
 
 
 def discover_safetensors(model_path: str) -> list[str]:
@@ -99,6 +117,11 @@ def load_weights_to_gpus(
                 gpu_idx = min(range(num_gpus), key=lambda i: per_gpu_bytes[i])
                 per_gpu_tensors[gpu_idx].append((name, tensor))
                 per_gpu_bytes[gpu_idx] += size
+
+    # Sort tensors: non-expert first, then grouped by expert ID.
+    # This lets EP clients skip contiguous regions of non-local experts.
+    for gpu_idx in range(num_gpus):
+        per_gpu_tensors[gpu_idx].sort(key=lambda t: _expert_sort_key(t[0]))
 
     # Second pass: allocate one contiguous buffer per GPU, pack tensors.
     gpu_buffers: list[torch.Tensor] = []
