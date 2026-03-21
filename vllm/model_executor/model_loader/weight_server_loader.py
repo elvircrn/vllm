@@ -354,6 +354,16 @@ class WeightServerLoader(BaseModelLoader):
         needed = {meta["name"] for meta in tensor_metadata}
         all_total = sum(b["size"] for b in buffer_metadata)
 
+        # Pre-index: for each (device_id, offset_range) -> list of needed tensors.
+        # This lets us skip chunks with zero needed tensors.
+        buf_tensors: dict[int, list[dict]] = {}
+        for meta in tensor_metadata:
+            if meta["name"] in needed:
+                buf_tensors.setdefault(meta["device_id"], []).append(meta)
+        # Sort by address for efficient chunk lookup.
+        for dev_id in buf_tensors:
+            buf_tensors[dev_id].sort(key=lambda m: m["addr"])
+
         logger.info(
             "Selective transfer (chunked bulk): %d tensors needed, "
             "%.2f GiB across %d server buffers",
@@ -362,12 +372,14 @@ class WeightServerLoader(BaseModelLoader):
 
         start_time = time.perf_counter()
         transferred_bytes = 0
+        skipped_bytes = 0
         num_chunks = 0
 
         for buf_idx, buf_meta in enumerate(buffer_metadata):
             buf_size = buf_meta["size"]
             buf_addr = buf_meta["addr"]
             buf_device = buf_meta["device_id"]
+            dev_tensors = buf_tensors.get(buf_device, [])
 
             # Split this server buffer into chunks.
             chunk_offset = 0
@@ -376,6 +388,18 @@ class WeightServerLoader(BaseModelLoader):
                 free_mem = torch.cuda.mem_get_info(device)[0]
                 chunk_cap = int(free_mem * 0.75)
                 this_chunk = min(chunk_cap, buf_size - chunk_offset)
+
+                # Check if any needed tensors fall in this chunk.
+                chunk_start = buf_addr + chunk_offset
+                chunk_end = chunk_start + this_chunk
+                chunk_tensors = [
+                    m for m in dev_tensors
+                    if m["addr"] >= chunk_start and m["addr"] + m["size"] <= chunk_end
+                ]
+                if not chunk_tensors:
+                    skipped_bytes += this_chunk
+                    chunk_offset += this_chunk
+                    continue
 
                 client_buf = torch.empty(
                     this_chunk, dtype=torch.uint8, device=device)
@@ -425,22 +449,13 @@ class WeightServerLoader(BaseModelLoader):
                     transferred_bytes += this_chunk
                     num_chunks += 1
 
-                    # Yield needed tensors that fall in this chunk.
-                    chunk_start = buf_addr + chunk_offset
-                    chunk_end = chunk_start + this_chunk
-                    for meta in tensor_metadata:
-                        if meta["device_id"] != buf_device:
-                            continue
-                        if meta["name"] not in needed:
-                            continue
-                        t_start = meta["addr"]
-                        t_end = t_start + meta["size"]
-                        if t_start >= chunk_start and t_end <= chunk_end:
-                            off = t_start - chunk_start
-                            dtype = _STR_TO_DTYPE[meta["dtype"]]
-                            t = client_buf[off:off + meta["size"]].view(
-                                dtype).reshape(meta["shape"])
-                            yield meta["name"], t
+                    # Yield needed tensors from this chunk.
+                    for meta in chunk_tensors:
+                        off = meta["addr"] - chunk_start
+                        dtype = _STR_TO_DTYPE[meta["dtype"]]
+                        t = client_buf[off:off + meta["size"]].view(
+                            dtype).reshape(meta["shape"])
+                        yield meta["name"], t
 
                 finally:
                     local_agent.deregister_memory(local_descs)
@@ -449,14 +464,14 @@ class WeightServerLoader(BaseModelLoader):
                 chunk_offset += this_chunk
 
         elapsed = time.perf_counter() - start_time
+        needed_bytes = sum(m["size"] for m in tensor_metadata)
         logger.info(
             "Selective transfer done: %.2f GiB in %.3fs (%.2f GiB/s) "
-            "(%d chunks across %d server buffers)",
+            "(%d chunks, skipped %.2f GiB)",
             transferred_bytes / (1 << 30), elapsed,
             transferred_bytes / (1 << 30) / max(elapsed, 1e-9),
-            num_chunks, len(buffer_metadata),
+            num_chunks, skipped_bytes / (1 << 30),
         )
-        needed_bytes = sum(m["size"] for m in tensor_metadata)
         overhead = (transferred_bytes - needed_bytes) / max(needed_bytes, 1)
         logger.info(
             "Needed %.2f GiB, transferred %.2f GiB (%.1f%% overhead)",
