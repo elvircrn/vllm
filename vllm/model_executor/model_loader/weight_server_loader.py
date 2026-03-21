@@ -336,6 +336,31 @@ class WeightServerLoader(BaseModelLoader):
             local_agent.deregister_memory(local_descs)
             local_agent.remove_remote_agent(remote_agent_name)
 
+    @staticmethod
+    def _merge_tensor_ranges(
+        tensors: list[dict],
+    ) -> list[tuple[int, int, list[dict]]]:
+        """Merge contiguous/adjacent tensor byte ranges.
+
+        Returns list of (range_start, range_end, tensors_in_range).
+        With server-side expert sorting, this typically yields ~2 ranges
+        per buffer: one for non-expert weights, one for local experts.
+        """
+        if not tensors:
+            return []
+        ranges: list[tuple[int, int, list[dict]]] = []
+        for t in tensors:
+            t_start, t_end = t["addr"], t["addr"] + t["size"]
+            if ranges and t_start <= ranges[-1][1]:
+                # Extend current range.
+                prev_start, prev_end, prev_tensors = ranges[-1]
+                ranges[-1] = (prev_start, max(prev_end, t_end),
+                              prev_tensors)
+                prev_tensors.append(t)
+            else:
+                ranges.append((t_start, t_end, [t]))
+        return ranges
+
     def _selective_transfer(
         self,
         local_agent,
@@ -345,34 +370,43 @@ class WeightServerLoader(BaseModelLoader):
         buffer_metadata: list[dict],
         tensor_metadata: list[dict],
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """Streaming chunked bulk transfer.
+        """Range-based selective transfer.
 
-        Reads server GPU buffers in chunks that fit in free GPU memory.
-        Each chunk is one contiguous NIXL READ (~700 GiB/s), then only
-        the needed tensors are yielded before the chunk buffer is freed.
+        Computes the exact byte ranges of needed tensors per server buffer
+        and transfers only those ranges. With server-side expert sorting,
+        non-local expert regions are completely skipped.
         """
-        needed = {meta["name"] for meta in tensor_metadata}
         all_total = sum(b["size"] for b in buffer_metadata)
 
-        # Pre-index: for each (device_id, offset_range) -> list of needed tensors.
-        # This lets us skip chunks with zero needed tensors.
+        # Group needed tensors by server device, sorted by address.
         buf_tensors: dict[int, list[dict]] = {}
         for meta in tensor_metadata:
-            if meta["name"] in needed:
-                buf_tensors.setdefault(meta["device_id"], []).append(meta)
-        # Sort by address for efficient chunk lookup.
+            buf_tensors.setdefault(meta["device_id"], []).append(meta)
         for dev_id in buf_tensors:
             buf_tensors[dev_id].sort(key=lambda m: m["addr"])
 
-        # Allocate one staging buffer, register once, reuse for all chunks.
+        # Compute needed ranges per device.
+        buf_ranges: dict[int, list[tuple[int, int, list[dict]]]] = {}
+        total_range_bytes = 0
+        total_ranges = 0
+        for dev_id, tensors in buf_tensors.items():
+            ranges = self._merge_tensor_ranges(tensors)
+            buf_ranges[dev_id] = ranges
+            total_ranges += len(ranges)
+            total_range_bytes += sum(end - start for start, end, _ in ranges)
+
+        # Allocate one staging buffer, register once, reuse for all reads.
         free_mem = torch.cuda.mem_get_info(device)[0]
         chunk_cap = int(free_mem * 0.75)
+        needed_bytes = sum(m["size"] for m in tensor_metadata)
 
         logger.info(
-            "Selective transfer (chunked bulk): %d tensors needed, "
-            "%.2f GiB across %d server buffers, staging=%.2f GiB",
-            len(needed), all_total / (1 << 30), len(buffer_metadata),
-            chunk_cap / (1 << 30),
+            "Selective transfer (range-based): %d tensors, "
+            "%.2f GiB needed across %d ranges (%.2f GiB range bytes), "
+            "%.2f GiB total buffers, staging=%.2f GiB",
+            len(tensor_metadata), needed_bytes / (1 << 30),
+            total_ranges, total_range_bytes / (1 << 30),
+            all_total / (1 << 30), chunk_cap / (1 << 30),
         )
 
         client_buf = torch.empty(chunk_cap, dtype=torch.uint8, device=device)
@@ -383,91 +417,88 @@ class WeightServerLoader(BaseModelLoader):
 
         start_time = time.perf_counter()
         transferred_bytes = 0
-        skipped_bytes = 0
-        num_chunks = 0
+        num_reads = 0
 
         try:
-            for buf_idx, buf_meta in enumerate(buffer_metadata):
-                buf_size = buf_meta["size"]
-                buf_addr = buf_meta["addr"]
+            for buf_meta in buffer_metadata:
                 buf_device = buf_meta["device_id"]
-                dev_tensors = buf_tensors.get(buf_device, [])
+                ranges = buf_ranges.get(buf_device, [])
 
-                chunk_offset = 0
-                while chunk_offset < buf_size:
-                    this_chunk = min(chunk_cap, buf_size - chunk_offset)
+                for range_start, range_end, range_tensors in ranges:
+                    range_size = range_end - range_start
 
-                    # Check if any needed tensors fall in this chunk.
-                    chunk_start = buf_addr + chunk_offset
-                    chunk_end = chunk_start + this_chunk
-                    chunk_tensors = [
-                        m for m in dev_tensors
-                        if m["addr"] >= chunk_start
-                        and m["addr"] + m["size"] <= chunk_end
-                    ]
-                    if not chunk_tensors:
-                        skipped_bytes += this_chunk
-                        chunk_offset += this_chunk
-                        continue
+                    # Sub-chunk if range exceeds staging buffer.
+                    range_offset = 0
+                    tensor_idx = 0
+                    while range_offset < range_size:
+                        this_read = min(chunk_cap,
+                                        range_size - range_offset)
+                        read_start = range_start + range_offset
+                        read_end = read_start + this_read
 
-                    local_xfer = local_agent.get_xfer_descs(
-                        [(buf_base, this_chunk, local_device_id)], "VRAM")
-                    remote_xfer = local_agent.get_xfer_descs(
-                        [(buf_addr + chunk_offset, this_chunk,
-                          buf_device)], "VRAM")
-                    local_h = local_agent.prep_xfer_dlist(
-                        "NIXL_INIT_AGENT", local_xfer)
-                    remote_h = local_agent.prep_xfer_dlist(
-                        remote_agent_name, remote_xfer)
-                    xh = local_agent.make_prepped_xfer(
-                        "READ", local_h, [0], remote_h, [0],
-                        notif_msg=b"",
-                    )
-                    local_agent.transfer(xh)
+                        local_xfer = local_agent.get_xfer_descs(
+                            [(buf_base, this_read, local_device_id)],
+                            "VRAM")
+                        remote_xfer = local_agent.get_xfer_descs(
+                            [(read_start, this_read, buf_device)],
+                            "VRAM")
+                        local_h = local_agent.prep_xfer_dlist(
+                            "NIXL_INIT_AGENT", local_xfer)
+                        remote_h = local_agent.prep_xfer_dlist(
+                            remote_agent_name, remote_xfer)
+                        xh = local_agent.make_prepped_xfer(
+                            "READ", local_h, [0], remote_h, [0],
+                            notif_msg=b"",
+                        )
+                        local_agent.transfer(xh)
 
-                    while True:
-                        try:
-                            state = local_agent.check_xfer_state(xh)
-                        except Exception as e:
-                            raise RuntimeError(
-                                f"NIXL chunked transfer buf={buf_idx} "
-                                f"chunk={num_chunks} failed: {e}"
-                            ) from e
-                        if state == "DONE":
-                            break
-                        if state != "PROC":
-                            raise RuntimeError(
-                                f"NIXL chunked transfer buf={buf_idx} "
-                                f"chunk={num_chunks} failed: {state}")
+                        while True:
+                            try:
+                                state = local_agent.check_xfer_state(xh)
+                            except Exception as e:
+                                raise RuntimeError(
+                                    f"NIXL range transfer read={num_reads}"
+                                    f" failed: {e}"
+                                ) from e
+                            if state == "DONE":
+                                break
+                            if state != "PROC":
+                                raise RuntimeError(
+                                    f"NIXL range transfer read={num_reads}"
+                                    f" failed: {state}")
 
-                    local_agent.release_xfer_handle(xh)
-                    local_agent.release_dlist_handle(local_h)
-                    local_agent.release_dlist_handle(remote_h)
-                    transferred_bytes += this_chunk
-                    num_chunks += 1
+                        local_agent.release_xfer_handle(xh)
+                        local_agent.release_dlist_handle(local_h)
+                        local_agent.release_dlist_handle(remote_h)
+                        transferred_bytes += this_read
+                        num_reads += 1
 
-                    # Yield needed tensors from this chunk.
-                    for meta in chunk_tensors:
-                        off = meta["addr"] - chunk_start
-                        dtype = _STR_TO_DTYPE[meta["dtype"]]
-                        t = client_buf[off:off + meta["size"]].view(
-                            dtype).reshape(meta["shape"])
-                        yield meta["name"], t
+                        # Yield tensors that fall within this read.
+                        while tensor_idx < len(range_tensors):
+                            meta = range_tensors[tensor_idx]
+                            if meta["addr"] + meta["size"] > read_end:
+                                break
+                            off = meta["addr"] - read_start
+                            dtype = _STR_TO_DTYPE[meta["dtype"]]
+                            t = client_buf[off:off + meta["size"]].view(
+                                dtype).reshape(meta["shape"])
+                            yield meta["name"], t
+                            tensor_idx += 1
 
-                    chunk_offset += this_chunk
+                        range_offset += this_read
 
         finally:
             local_agent.deregister_memory(local_descs)
             del client_buf
 
         elapsed = time.perf_counter() - start_time
-        needed_bytes = sum(m["size"] for m in tensor_metadata)
+        skipped_bytes = all_total - transferred_bytes
         logger.info(
             "Selective transfer done: %.2f GiB in %.3fs (%.2f GiB/s) "
-            "(%d chunks, skipped %.2f GiB)",
+            "(%d reads, skipped %.2f GiB of %.2f GiB)",
             transferred_bytes / (1 << 30), elapsed,
             transferred_bytes / (1 << 30) / max(elapsed, 1e-9),
-            num_chunks, skipped_bytes / (1 << 30),
+            num_reads, skipped_bytes / (1 << 30), all_total / (1 << 30),
         )
         overhead = (transferred_bytes - needed_bytes) / max(needed_bytes, 1)
         logger.info(
