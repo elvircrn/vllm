@@ -18,7 +18,6 @@ Usage:
 import os
 import pickle
 import re
-import threading
 import time
 import uuid
 from collections.abc import Generator
@@ -27,21 +26,12 @@ import torch
 import zmq
 from torch import nn
 
-from vllm.config import ModelConfig, VllmConfig
+from vllm.config import ModelConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
-from vllm.model_executor.model_loader.base_loader import (
-    BaseModelLoader,
-    log_model_inspection,
-)
-from vllm.model_executor.model_loader.utils import (
-    initialize_model,
-    process_weights_after_loading,
-)
+from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.platforms import current_platform
 from vllm.tracing import instrument
-from vllm.utils.mem_utils import format_gib
-from vllm.utils.torch_utils import set_default_torch_dtype
 
 logger = init_logger(__name__)
 
@@ -55,6 +45,8 @@ _STR_TO_DTYPE = {
     "torch.int32": torch.int32,
     "torch.int64": torch.int64,
 }
+
+_BATCH_SIZE = 4096
 
 _EXPERT_ID_RE = re.compile(r"\.experts\.(\d+)\.")
 
@@ -131,6 +123,7 @@ def _should_skip_tensor(name: str, local_expert_ids: set[int] | None) -> bool:
     return expert_id not in local_expert_ids
 
 
+
 class WeightServerLoader(BaseModelLoader):
     """Loads weights from a multi-GPU weight server via NIXL READ transfers."""
 
@@ -145,18 +138,10 @@ class WeightServerLoader(BaseModelLoader):
     def download_model(self, model_config: ModelConfig) -> None:
         pass
 
-    # ------------------------------------------------------------------
-    # Phase 1: NIXL setup (can run in background thread)
-    # ------------------------------------------------------------------
-
-    def _nixl_setup(
+    def _connect_and_receive(
         self, device: torch.device, model_config: ModelConfig,
-    ) -> dict:
-        """Create NIXL agent, ZMQ handshake, pre-compute read ops.
-
-        Thread-safe: sets its own CUDA context. Everything here can run
-        in a background thread while model initialization proceeds.
-        """
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """Pull weights from the server via NIXL and yield (name, tensor)."""
         from nixl._api import nixl_agent
 
         try:
@@ -165,6 +150,7 @@ class WeightServerLoader(BaseModelLoader):
         except ImportError:
             config = None
 
+        # Use local transports only (NVLink via CUDA IPC, no InfiniBand).
         os.environ.setdefault("UCX_TLS", "cuda_ipc,cuda_copy,tcp,shm,self")
         os.environ.setdefault("UCX_NET_DEVICES", "all")
 
@@ -178,6 +164,8 @@ class WeightServerLoader(BaseModelLoader):
         )
 
         # Ensure CUDA context is active on this thread before NIXL init.
+        # UCX disables cuda_ipc if no valid CUDA context exists during
+        # agent creation (see nixl_connector.py L1267-1275).
         current_platform.set_device(device)
 
         local_agent = nixl_agent(
@@ -190,8 +178,8 @@ class WeightServerLoader(BaseModelLoader):
             "Connecting to weight server at %s:%d ...",
             self.server_host, self.server_port,
         )
-        zmq_ctx = zmq.Context()
-        socket = zmq_ctx.socket(zmq.REQ)
+        ctx = zmq.Context()
+        socket = ctx.socket(zmq.REQ)
         socket.connect(f"tcp://{self.server_host}:{self.server_port}")
         socket.send(local_agent_metadata)
         payload = pickle.loads(socket.recv())
@@ -206,8 +194,7 @@ class WeightServerLoader(BaseModelLoader):
             server_gpu_ids, local_device_id,
         )
 
-        remote_agent_name = local_agent.add_remote_agent(
-            server_agent_metadata)
+        remote_agent_name = local_agent.add_remote_agent(server_agent_metadata)
         logger.info("Registered remote agent: %s", remote_agent_name)
 
         # --- Filter tensors (EP-aware) ---
@@ -216,68 +203,32 @@ class WeightServerLoader(BaseModelLoader):
             if not _should_skip_tensor(meta["name"], local_expert_ids)
         ]
         skipped = len(all_tensor_metadata) - len(tensor_metadata)
-        use_bulk = (skipped == 0)
-
         logger.info(
             "Server has %d tensors — pulling %d (skipped %d non-local)",
             len(all_tensor_metadata), len(tensor_metadata), skipped,
         )
 
-        return {
-            "local_agent": local_agent,
-            "remote_agent_name": remote_agent_name,
-            "local_device_id": local_device_id,
-            "buffer_metadata": buffer_metadata,
-            "tensor_metadata": tensor_metadata,
-            "use_bulk": use_bulk,
-            "socket": socket,
-            "zmq_ctx": zmq_ctx,
-        }
+        use_bulk = (skipped == 0)
 
-    # ------------------------------------------------------------------
-    # Phase 2: NIXL transfers (must run on main thread after model init)
-    # ------------------------------------------------------------------
-
-    def _nixl_transfer(
-        self, device: torch.device, state: dict,
-    ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """Execute NIXL reads using pre-computed setup state."""
         try:
-            if state["use_bulk"]:
+            if use_bulk:
                 yield from self._bulk_transfer(
-                    state["local_agent"], state["remote_agent_name"],
-                    state["local_device_id"], device,
-                    state["buffer_metadata"], state["tensor_metadata"],
+                    local_agent, remote_agent_name, local_device_id,
+                    device, buffer_metadata, tensor_metadata,
                 )
             else:
                 yield from self._selective_transfer(
-                    state["local_agent"], state["remote_agent_name"],
-                    state["local_device_id"], device,
-                    state["buffer_metadata"], state["tensor_metadata"],
+                    local_agent, remote_agent_name, local_device_id,
+                    device, buffer_metadata, tensor_metadata,
                 )
         finally:
             try:
-                state["socket"].send(b"__disconnect__")
-                state["socket"].recv()
+                socket.send(b"__disconnect__")
+                socket.recv()
             except Exception:
                 pass
-            state["socket"].close()
-            state["zmq_ctx"].term()
-
-    # ------------------------------------------------------------------
-    # Combined path (for load_weights backward compat)
-    # ------------------------------------------------------------------
-
-    def _connect_and_receive(
-        self, device: torch.device, model_config: ModelConfig,
-    ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """Pull weights from the server via NIXL and yield (name, tensor)."""
-        state = self._nixl_setup(device, model_config)
-        yield from self._nixl_transfer(device, state)
-
-    # ------------------------------------------------------------------
-    # Transfer implementations
-    # ------------------------------------------------------------------
+            socket.close()
+            ctx.term()
 
     def _bulk_transfer(
         self,
@@ -330,27 +281,25 @@ class WeightServerLoader(BaseModelLoader):
                     "READ", local_h, [0], remote_h, [0], notif_msg=b"",
                 )
                 local_agent.transfer(xh)
-                xfer_handles.append(
-                    (xh, local_h, remote_h, buf_meta["size"]))
+                xfer_handles.append((xh, local_h, remote_h, buf_meta["size"]))
 
             for i, (xh, lh, rh, size) in enumerate(xfer_handles):
                 while True:
                     try:
-                        st = local_agent.check_xfer_state(xh)
+                        state = local_agent.check_xfer_state(xh)
                     except Exception as e:
                         raise RuntimeError(
                             f"NIXL bulk transfer {i} failed: {e}. "
-                            f"Server GPUs: "
-                            f"{[b['device_id'] for b in buffer_metadata]}"
-                            f", client device: {local_device_id}, "
+                            f"Server GPUs: {[b['device_id'] for b in buffer_metadata]}, "
+                            f"client device: {local_device_id}, "
                             f"CUDA_VISIBLE_DEVICES="
                             f"{os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}"
                         ) from e
-                    if st == "DONE":
+                    if state == "DONE":
                         break
-                    if st != "PROC":
+                    if state != "PROC":
                         raise RuntimeError(
-                            f"NIXL bulk transfer {i} failed: {st}")
+                            f"NIXL bulk transfer {i} failed: {state}")
                 local_agent.release_xfer_handle(xh)
                 local_agent.release_dlist_handle(lh)
                 local_agent.release_dlist_handle(rh)
@@ -401,6 +350,7 @@ class WeightServerLoader(BaseModelLoader):
         for t in tensors:
             t_start, t_end = t["addr"], t["addr"] + t["size"]
             if ranges and t_start <= ranges[-1][1]:
+                # Extend current range.
                 prev_start, prev_end, prev_tensors = ranges[-1]
                 ranges[-1] = (prev_start, max(prev_end, t_end),
                               prev_tensors)
@@ -409,16 +359,23 @@ class WeightServerLoader(BaseModelLoader):
                 ranges.append((t_start, t_end, [t]))
         return ranges
 
-    @staticmethod
-    def _compute_read_ops(
+    def _selective_transfer(
+        self,
+        local_agent,
+        remote_agent_name: str,
+        local_device_id: int,
+        device: torch.device,
         buffer_metadata: list[dict],
         tensor_metadata: list[dict],
-        chunk_cap: int,
-    ) -> tuple[list[dict], int, int]:
-        """Pre-compute read operations from tensor ranges.
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """Range-based selective transfer with parallel reads.
 
-        Returns (read_ops, total_ranges, total_range_bytes).
+        Computes the exact byte ranges of needed tensors per server buffer,
+        then batches reads that fit in the staging buffer simultaneously.
+        Reads from different server GPUs overlap via NVLink.
         """
+        all_total = sum(b["size"] for b in buffer_metadata)
+
         # Group needed tensors by server device, sorted by address.
         buf_tensors: dict[int, list[dict]] = {}
         for meta in tensor_metadata:
@@ -431,11 +388,15 @@ class WeightServerLoader(BaseModelLoader):
         total_range_bytes = 0
         total_ranges = 0
         for dev_id, tensors in buf_tensors.items():
-            ranges = WeightServerLoader._merge_tensor_ranges(tensors)
+            ranges = self._merge_tensor_ranges(tensors)
             buf_ranges[dev_id] = ranges
             total_ranges += len(ranges)
-            total_range_bytes += sum(
-                end - start for start, end, _ in ranges)
+            total_range_bytes += sum(end - start for start, end, _ in ranges)
+
+        # Allocate one staging buffer, register once, reuse for all reads.
+        free_mem = torch.cuda.mem_get_info(device)[0]
+        chunk_cap = int(free_mem * 0.75)
+        needed_bytes = sum(m["size"] for m in tensor_metadata)
 
         # Collect all read operations (each <= chunk_cap).
         read_ops: list[dict] = []
@@ -450,6 +411,7 @@ class WeightServerLoader(BaseModelLoader):
                     this_read = min(chunk_cap, range_size - range_offset)
                     read_start = range_start + range_offset
                     read_end = read_start + this_read
+                    # Find tensors in this sub-chunk.
                     end_idx = tensor_idx
                     while end_idx < len(range_tensors):
                         m = range_tensors[end_idx]
@@ -465,27 +427,6 @@ class WeightServerLoader(BaseModelLoader):
                     tensor_idx = end_idx
                     range_offset += this_read
 
-        return read_ops, total_ranges, total_range_bytes
-
-    def _selective_transfer(
-        self,
-        local_agent,
-        remote_agent_name: str,
-        local_device_id: int,
-        device: torch.device,
-        buffer_metadata: list[dict],
-        tensor_metadata: list[dict],
-    ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """Range-based selective transfer with parallel reads."""
-        all_total = sum(b["size"] for b in buffer_metadata)
-        needed_bytes = sum(m["size"] for m in tensor_metadata)
-
-        free_mem = torch.cuda.mem_get_info(device)[0]
-        chunk_cap = int(free_mem * 0.75)
-
-        read_ops, total_ranges, _ = self._compute_read_ops(
-            buffer_metadata, tensor_metadata, chunk_cap)
-
         logger.info(
             "Selective transfer (parallel range-based): %d tensors, "
             "%.2f GiB needed, %d ranges, %d read ops, "
@@ -495,25 +436,7 @@ class WeightServerLoader(BaseModelLoader):
             all_total / (1 << 30), chunk_cap / (1 << 30),
         )
 
-        yield from self._execute_read_ops(
-            local_agent, remote_agent_name, local_device_id,
-            device, read_ops, chunk_cap, all_total, needed_bytes,
-        )
-
-    def _execute_read_ops(
-        self,
-        local_agent,
-        remote_agent_name: str,
-        local_device_id: int,
-        device: torch.device,
-        read_ops: list[dict],
-        chunk_cap: int,
-        all_total: int,
-        needed_bytes: int,
-    ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """Execute pre-computed read ops with parallel batching."""
-        client_buf = torch.empty(chunk_cap, dtype=torch.uint8,
-                                 device=device)
+        client_buf = torch.empty(chunk_cap, dtype=torch.uint8, device=device)
         buf_base = client_buf.data_ptr()
         local_descs = local_agent.get_reg_descs(
             [(buf_base, chunk_cap, local_device_id, "")], "VRAM")
@@ -561,19 +484,19 @@ class WeightServerLoader(BaseModelLoader):
                 for i, (xh, local_h, remote_h) in enumerate(handles):
                     while True:
                         try:
-                            st = local_agent.check_xfer_state(xh)
+                            state = local_agent.check_xfer_state(xh)
                         except Exception as e:
                             raise RuntimeError(
                                 f"NIXL parallel transfer batch="
                                 f"{num_batches} read={i} failed: {e}"
                             ) from e
-                        if st == "DONE":
+                        if state == "DONE":
                             break
-                        if st != "PROC":
+                        if state != "PROC":
                             raise RuntimeError(
                                 f"NIXL parallel transfer batch="
                                 f"{num_batches} read={i} failed: "
-                                f"{st}")
+                                f"{state}")
                     local_agent.release_xfer_handle(xh)
                     local_agent.release_dlist_handle(local_h)
                     local_agent.release_dlist_handle(remote_h)
@@ -613,10 +536,6 @@ class WeightServerLoader(BaseModelLoader):
             overhead * 100,
         )
 
-    # ------------------------------------------------------------------
-    # load_weights (backward-compat standalone path)
-    # ------------------------------------------------------------------
-
     def _load_with_retry(
         self, model: nn.Module, model_config: ModelConfig,
         device: torch.device, max_retries: int = 3,
@@ -647,79 +566,5 @@ class WeightServerLoader(BaseModelLoader):
         device = torch.device(
             f"cuda:{current_platform.current_device_index or torch.cuda.current_device()}"
         )
+
         self._load_with_retry(model, model_config, device)
-
-    # ------------------------------------------------------------------
-    # load_model: pipelines NIXL setup with model initialization
-    # ------------------------------------------------------------------
-
-    @instrument(span_name="Load model (weight_server)")
-    def load_model(
-        self, vllm_config: VllmConfig, model_config: ModelConfig,
-        prefix: str = "",
-    ) -> nn.Module:
-        """Override to pipeline NIXL setup with model initialization.
-
-        Runs NIXL agent creation + ZMQ handshake in a background thread
-        while the model skeleton is being created on the main thread.
-        This overlaps ~1s of NIXL/UCX setup with ~2s of model init.
-        """
-        device_config = vllm_config.device_config
-        load_config = vllm_config.load_config
-        load_device = (
-            device_config.device
-            if load_config.device is None
-            else load_config.device
-        )
-        target_device = torch.device(load_device)
-        device = torch.device(
-            f"cuda:{current_platform.current_device_index or torch.cuda.current_device()}"
-        )
-
-        # Start NIXL setup in background thread.
-        setup_state: dict = {}
-        setup_error: list[BaseException | None] = [None]
-
-        def _bg_setup():
-            try:
-                setup_state.update(
-                    self._nixl_setup(device, model_config))
-            except BaseException as e:
-                setup_error[0] = e
-
-        logger.info("Pipelined load: NIXL setup + model init")
-        setup_thread = threading.Thread(target=_bg_setup, daemon=True)
-        setup_thread.start()
-
-        # Create model skeleton on main thread (overlaps with NIXL setup).
-        with set_default_torch_dtype(model_config.dtype):
-            with target_device:
-                model = initialize_model(
-                    vllm_config=vllm_config,
-                    model_config=model_config,
-                    prefix=prefix,
-                )
-
-            log_model_inspection(model)
-
-            # Wait for NIXL setup to complete.
-            setup_thread.join()
-            if setup_error[0] is not None:
-                raise setup_error[0]
-
-            # Transfer weights and load into model.
-            weights_iter = self._nixl_transfer(device, setup_state)
-            model.load_weights(weights_iter)
-
-            if current_platform.is_cuda():
-                peak_memory = torch.accelerator.max_memory_allocated()
-                logger.debug_once(
-                    "Peak GPU memory after loading weights: %s GiB",
-                    format_gib(peak_memory),
-                    scope="local",
-                )
-
-            process_weights_after_loading(
-                model, model_config, target_device)
-
-        return model.eval()
