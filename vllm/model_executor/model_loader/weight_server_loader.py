@@ -345,99 +345,127 @@ class WeightServerLoader(BaseModelLoader):
         buffer_metadata: list[dict],
         tensor_metadata: list[dict],
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """Streaming bulk transfer: one server GPU buffer at a time.
+        """Streaming chunked bulk transfer.
 
-        Pulls each server GPU buffer entirely (one NIXL READ each),
-        then yields only the needed tensors from it before freeing
-        the client buffer. This uses the fast bulk path (~700 GiB/s)
-        while keeping memory usage bounded to one server GPU buffer.
+        Reads server GPU buffers in chunks that fit in free GPU memory.
+        Each chunk is one contiguous NIXL READ (~700 GiB/s), then only
+        the needed tensors are yielded before the chunk buffer is freed.
         """
-        # Build lookup: tensor name -> metadata for needed tensors.
-        needed = {meta["name"]: meta for meta in tensor_metadata}
-        # Group all tensors (including skipped) by server buffer.
+        needed = {meta["name"] for meta in tensor_metadata}
         all_total = sum(b["size"] for b in buffer_metadata)
+
+        # Cap chunk size at 75% of free GPU memory.
+        free_mem = torch.cuda.mem_get_info(device)[0]
+        chunk_cap = int(free_mem * 0.75)
+
         logger.info(
-            "Selective transfer (streaming bulk): %d/%d tensors needed, "
-            "%.2f GiB across %d server buffers",
-            len(needed), len(tensor_metadata), all_total / (1 << 30),
-            len(buffer_metadata),
+            "Selective transfer (chunked bulk): %d tensors needed, "
+            "%.2f GiB across %d server buffers, "
+            "free=%.2f GiB, chunk_cap=%.2f GiB",
+            len(needed), all_total / (1 << 30), len(buffer_metadata),
+            free_mem / (1 << 30), chunk_cap / (1 << 30),
         )
 
         start_time = time.perf_counter()
         transferred_bytes = 0
+        num_chunks = 0
 
         for buf_idx, buf_meta in enumerate(buffer_metadata):
             buf_size = buf_meta["size"]
             buf_addr = buf_meta["addr"]
             buf_device = buf_meta["device_id"]
 
-            client_buf = torch.empty(buf_size, dtype=torch.uint8, device=device)
-            local_descs = local_agent.get_reg_descs(
-                [(client_buf.data_ptr(), buf_size, local_device_id, "")],
-                "VRAM",
-            )
-            local_agent.register_memory(local_descs)
+            # Split this server buffer into chunks.
+            chunk_offset = 0
+            while chunk_offset < buf_size:
+                this_chunk = min(chunk_cap, buf_size - chunk_offset)
 
-            try:
-                local_xfer = local_agent.get_xfer_descs(
-                    [(client_buf.data_ptr(), buf_size, local_device_id)],
-                    "VRAM",
+                client_buf = torch.empty(
+                    this_chunk, dtype=torch.uint8, device=device)
+                local_descs = local_agent.get_reg_descs(
+                    [(client_buf.data_ptr(), this_chunk,
+                      local_device_id, "")], "VRAM",
                 )
-                remote_xfer = local_agent.get_xfer_descs(
-                    [(buf_addr, buf_size, buf_device)], "VRAM",
-                )
-                local_h = local_agent.prep_xfer_dlist(
-                    "NIXL_INIT_AGENT", local_xfer)
-                remote_h = local_agent.prep_xfer_dlist(
-                    remote_agent_name, remote_xfer)
-                xh = local_agent.make_prepped_xfer(
-                    "READ", local_h, [0], remote_h, [0], notif_msg=b"",
-                )
-                local_agent.transfer(xh)
+                local_agent.register_memory(local_descs)
 
-                while True:
-                    try:
-                        state = local_agent.check_xfer_state(xh)
-                    except Exception as e:
-                        raise RuntimeError(
-                            f"NIXL streaming bulk transfer {buf_idx} "
-                            f"failed: {e}"
-                        ) from e
-                    if state == "DONE":
-                        break
-                    if state != "PROC":
-                        raise RuntimeError(
-                            f"NIXL streaming bulk transfer {buf_idx} "
-                            f"failed: {state}")
+                try:
+                    local_xfer = local_agent.get_xfer_descs(
+                        [(client_buf.data_ptr(), this_chunk,
+                          local_device_id)], "VRAM",
+                    )
+                    remote_xfer = local_agent.get_xfer_descs(
+                        [(buf_addr + chunk_offset, this_chunk,
+                          buf_device)], "VRAM",
+                    )
+                    local_h = local_agent.prep_xfer_dlist(
+                        "NIXL_INIT_AGENT", local_xfer)
+                    remote_h = local_agent.prep_xfer_dlist(
+                        remote_agent_name, remote_xfer)
+                    xh = local_agent.make_prepped_xfer(
+                        "READ", local_h, [0], remote_h, [0],
+                        notif_msg=b"",
+                    )
+                    local_agent.transfer(xh)
 
-                local_agent.release_xfer_handle(xh)
-                local_agent.release_dlist_handle(local_h)
-                local_agent.release_dlist_handle(remote_h)
-                transferred_bytes += buf_size
+                    while True:
+                        try:
+                            state = local_agent.check_xfer_state(xh)
+                        except Exception as e:
+                            raise RuntimeError(
+                                f"NIXL chunked transfer buf={buf_idx} "
+                                f"chunk={num_chunks} failed: {e}"
+                            ) from e
+                        if state == "DONE":
+                            break
+                        if state != "PROC":
+                            raise RuntimeError(
+                                f"NIXL chunked transfer buf={buf_idx} "
+                                f"chunk={num_chunks} failed: {state}")
 
-                # Yield only needed tensors from this buffer.
-                for meta in tensor_metadata:
-                    if meta["device_id"] != buf_device:
-                        continue
-                    if meta["name"] not in needed:
-                        continue
-                    offset = meta["addr"] - buf_addr
-                    dtype = _STR_TO_DTYPE[meta["dtype"]]
-                    t = client_buf[offset:offset + meta["size"]].view(
-                        dtype).reshape(meta["shape"])
-                    yield meta["name"], t
+                    local_agent.release_xfer_handle(xh)
+                    local_agent.release_dlist_handle(local_h)
+                    local_agent.release_dlist_handle(remote_h)
+                    transferred_bytes += this_chunk
+                    num_chunks += 1
 
-            finally:
-                local_agent.deregister_memory(local_descs)
-                del client_buf
+                    # Yield needed tensors that fall in this chunk.
+                    chunk_start = buf_addr + chunk_offset
+                    chunk_end = chunk_start + this_chunk
+                    for meta in tensor_metadata:
+                        if meta["device_id"] != buf_device:
+                            continue
+                        if meta["name"] not in needed:
+                            continue
+                        t_start = meta["addr"]
+                        t_end = t_start + meta["size"]
+                        if t_start >= chunk_start and t_end <= chunk_end:
+                            off = t_start - chunk_start
+                            dtype = _STR_TO_DTYPE[meta["dtype"]]
+                            t = client_buf[off:off + meta["size"]].view(
+                                dtype).reshape(meta["shape"])
+                            yield meta["name"], t
+
+                finally:
+                    local_agent.deregister_memory(local_descs)
+                    del client_buf
+
+                chunk_offset += this_chunk
 
         elapsed = time.perf_counter() - start_time
         logger.info(
             "Selective transfer done: %.2f GiB in %.3fs (%.2f GiB/s) "
-            "(%d server buffers)",
+            "(%d chunks across %d server buffers)",
             transferred_bytes / (1 << 30), elapsed,
             transferred_bytes / (1 << 30) / max(elapsed, 1e-9),
-            len(buffer_metadata),
+            num_chunks, len(buffer_metadata),
+        )
+        needed_bytes = sum(m["size"] for m in tensor_metadata)
+        overhead = (transferred_bytes - needed_bytes) / max(needed_bytes, 1)
+        logger.info(
+            "Needed %.2f GiB, transferred %.2f GiB (%.1f%% overhead)",
+            needed_bytes / (1 << 30),
+            transferred_bytes / (1 << 30),
+            overhead * 100,
         )
 
     def _load_with_retry(
