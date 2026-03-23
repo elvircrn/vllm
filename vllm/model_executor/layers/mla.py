@@ -8,6 +8,7 @@ from vllm.config import CacheConfig
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.utils.nan_detect import check as nan_check
 
 
 @dataclass
@@ -119,6 +120,8 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         q_c = None
         kv_lora = None
 
+        nan_check(hidden_states, self.prefix, "input_hidden")
+
         if self.q_lora_rank is not None:
             assert self.fused_qkv_a_proj is not None, (
                 "fused_qkv_a_proj is required when q_lora_rank is not None"
@@ -131,12 +134,14 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             )
 
             qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+            nan_check(qkv_lora, self.prefix, "qkv_a_proj")
             q_c, kv_lora = qkv_lora.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 dim=-1,
             )
             q_c = self.q_a_layernorm(q_c)
             q = self.q_b_proj(q_c)[0]
+            nan_check(q, self.prefix, "q_b_proj")
         else:
             assert self.kv_a_proj_with_mqa is not None, (
                 "kv_a_proj_with_mqa is required when q_lora_rank is None"
@@ -150,6 +155,8 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv_c_normed = self.kv_a_layernorm(kv_c)
 
+        nan_check(kv_c_normed, self.prefix, "kv_c_normed")
+
         q = q.view(-1, self.num_heads, self.qk_head_dim)
         # Add head dim of 1 to k_pe
         k_pe = k_pe.unsqueeze(1)
@@ -158,6 +165,8 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
                 positions, q[..., self.qk_nope_head_dim :], k_pe
             )
+
+        nan_check(k_pe, self.prefix, "k_pe_roped")
 
         if self.indexer and self.is_sparse:
             _topk_indices = self.indexer(
@@ -174,4 +183,8 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
         )
 
-        return self.o_proj(attn_out)[0]
+        nan_check(attn_out, self.prefix, "attn_out")
+
+        o_proj_out = self.o_proj(attn_out)[0]
+        nan_check(o_proj_out, self.prefix, "o_proj")
+        return o_proj_out

@@ -1096,12 +1096,18 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        from vllm.utils.nan_detect import check as nan_check
+
+        layer_name = f"layers.{self.layer_idx}"
+
         # Self Attention
         if residual is None:
             residual = hidden_states.clone()
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        nan_check(hidden_states, layer_name, "post_input_ln")
 
         attn_kwargs = {
             "positions": positions,
@@ -1110,6 +1116,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         if not self.use_mha:
             attn_kwargs["llama_4_scaling"] = llama_4_scaling
         hidden_states = self.self_attn(**attn_kwargs)
+
+        nan_check(hidden_states, layer_name, "post_attn")
 
         if (
             not isinstance(self.self_attn, DeepseekAttention)
@@ -1126,7 +1134,13 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+
+        nan_check(hidden_states, layer_name, "post_attn_ln")
+        nan_check(residual, layer_name, "residual_pre_mlp")
+
         hidden_states = self.mlp(hidden_states)
+
+        nan_check(hidden_states, layer_name, "post_mlp")
 
         if isinstance(self.mlp, DeepseekV2MLP) and hidden_states.dtype == torch.float16:
             # Fix FP16 overflow

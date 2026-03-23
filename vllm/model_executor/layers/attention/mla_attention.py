@@ -472,6 +472,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         k_pe: torch.Tensor,
         output_shape: torch.Size | None = None,
     ) -> torch.Tensor:
+        from vllm.utils.nan_detect import check as nan_check
+
         if self.calculate_kv_scales:
             torch.ops.vllm.maybe_calc_kv_scales(q, kv_c_normed, k_pe, self.layer_name)
 
@@ -486,6 +488,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             assert isinstance(slot_mapping, dict), (
                 f"Expected slot_mapping to be a dict, got {type(slot_mapping)}. "
             )
+
+            nan_check(kv_c_normed, self.layer_name, "pre_kv_write.kv_c_normed")
+            nan_check(k_pe, self.layer_name, "pre_kv_write.k_pe")
+
             self.impl.do_kv_cache_update(
                 kv_c_normed,
                 k_pe,
@@ -504,11 +510,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     attn_metadata,
                     output=output,
                 )
+                nan_check(output, self.layer_name, "fmha_output")
                 return output
             else:
-                return self.forward_impl(
+                result = self.forward_impl(
                     q, kv_c_normed, k_pe, self_kv_cache, attn_metadata
                 )
+                nan_check(result, self.layer_name, "fmha_output")
+                return result
         else:
             kv_cache_dummy_dep = torch.ops.vllm.unified_mla_kv_cache_update(
                 kv_c_normed,
