@@ -1816,8 +1816,13 @@ class GPUModelRunner(
         self.seq_lens.np[:num_reqs] = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
         )
-        # Fill unused with 0 for full cuda graph mode.
-        self.seq_lens.np[num_reqs:].fill(0)
+        # Fill unused with 1 for full cuda graph mode.
+        # Using 1 instead of 0 prevents NaN/Inf from empty softmax in
+        # attention kernels for padding requests. With seq_lens=0, the
+        # softmax has no elements, producing NaN that contaminates real
+        # tokens via NVFP4 128-row GEMM tiles. The padding outputs are
+        # never used for sampling or written to KV cache.
+        self.seq_lens.np[num_reqs:].fill(1)
         self.seq_lens.copy_to_gpu()
 
         num_tokens = [self.requests[r].num_tokens for r in self.input_batch.req_ids]
@@ -5157,7 +5162,7 @@ class GPUModelRunner(
                 else:
                     seq_lens = max_query_len  # type: ignore[assignment]
                 self.seq_lens.np[:num_reqs] = seq_lens
-                self.seq_lens.np[num_reqs:] = 0
+                self.seq_lens.np[num_reqs:] = 1
                 self.seq_lens.copy_to_gpu()
 
                 cum_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
