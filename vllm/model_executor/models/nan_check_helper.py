@@ -46,9 +46,19 @@ _fwd_mqa_real_nan: torch.Tensor | None = None
 _layer_idx_gpu: torch.Tensor | None = None
 
 
+_initialized = False
+
+
 def ensure_flags(num_layers: int, device: torch.device) -> None:
     global _nan_counts, _inf_counts, _attn_detail, _inf_attn_detail
-    global _fwd_mqa_real_nan, _layer_idx_gpu
+    global _fwd_mqa_real_nan, _layer_idx_gpu, _initialized
+    if not _initialized:
+        _initialized = True
+        print(
+            f"[NAN_CHECK] active: num_layers={num_layers} device={device}",
+            file=sys.stderr,
+            flush=True,
+        )
     if _nan_counts is None or _nan_counts.shape[0] < num_layers:
         _nan_counts = torch.zeros(num_layers, 4, dtype=torch.int64, device=device)
     if _inf_counts is None or _inf_counts.shape[0] < num_layers:
