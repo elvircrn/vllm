@@ -200,8 +200,6 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
             bmm2_scale=self.bmm2_scale,
         )
 
-        o[:] = float("nan")  # poison ALL tokens
-
         # Flatten the output for consistent shape
         o = o.view(-1, o.shape[-2], o.shape[-1])
 
