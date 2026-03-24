@@ -200,6 +200,10 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
             bmm2_scale=self.bmm2_scale,
         )
 
+        # Poison padding slots with NaN for testing
+        pad_mask = attn_metadata.decode.seq_lens == 0
+        o[pad_mask] = float("nan")
+
         # Flatten the output for consistent shape
         o = o.view(-1, o.shape[-2], o.shape[-1])
 
