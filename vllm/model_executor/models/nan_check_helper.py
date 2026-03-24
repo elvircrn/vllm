@@ -366,6 +366,7 @@ def stash_if_nan(
     Buffer is keyed by batch_size since each CUDA graph batch size
     is compiled separately (dynamic=False).
     """
+    return  # disabled for Heisenbug testing
     if _nan_reported:
         return
     B = q_input.shape[0]
