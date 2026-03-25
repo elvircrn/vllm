@@ -253,9 +253,6 @@ from vllm.model_executor.models.nan_check_helper import (
 from vllm.model_executor.models.nan_check_helper import (
     stash_if_nan as _nan_stash_if_nan,
 )
-from vllm.model_executor.models.nan_check_helper import (
-    stash_if_nan_prefill as _nan_stash_if_nan_prefill,
-)
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer, has_nvidia_artifactory
 from vllm.utils.math_utils import cdiv, round_down
@@ -645,7 +642,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         )  # kv_cache bf16 (skipped if FP8)
 
         if num_mha_tokens > 0:
-            _nan_mark_mla(q[num_mqa_tokens:], 14, self._nan_layer_idx)  # mha q input
             self.impl.forward_mha(
                 q[num_mqa_tokens:],
                 k_c_normed[num_mqa_tokens:],
@@ -654,15 +650,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 attn_metadata,
                 self._k_scale,
                 output=output[num_mqa_tokens:],
-            )
-            _nan_mark_mla(
-                output[num_mqa_tokens:], 10, self._nan_layer_idx
-            )  # after fwd_mha
-            _nan_stash_if_nan_prefill(
-                self._nan_layer_idx,
-                output[num_mqa_tokens:],
-                kv_cache,
-                num_actual_toks,
             )
 
         if num_mqa_tokens > 0:
