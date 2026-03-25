@@ -640,12 +640,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
         if num_mha_tokens > 0:
             _nan_mark_mla(q[num_mqa_tokens:], 14, self._nan_layer_idx)  # mha q input
-            _nan_mark_mla(
-                k_c_normed[num_mqa_tokens:], 15, self._nan_layer_idx
-            )  # mha kv_c_normed input
-            _nan_mark_mla(
-                k_pe[num_mqa_tokens:], 16, self._nan_layer_idx
-            )  # mha k_pe input
             self.impl.forward_mha(
                 q[num_mqa_tokens:],
                 k_c_normed[num_mqa_tokens:],
