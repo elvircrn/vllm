@@ -3095,6 +3095,10 @@ class GPUModelRunner(
             positions = self.xdrope_positions.gpu[:, :num_input_tokens]
         else:
             positions = self.positions.gpu[:num_input_tokens]
+            # Zero out positions beyond scheduled tokens to prevent stale
+            # values from prior iterations contaminating CUDA graph padding.
+            if num_input_tokens > num_scheduled_tokens:
+                self.positions.gpu[num_scheduled_tokens:num_input_tokens].zero_()
 
         if is_first_rank:
             intermediate_tensors = None
