@@ -1415,6 +1415,7 @@ class DeepseekV2ForCausalLM(
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
+        _nan_report(hidden_states)
         return hidden_states
 
     def compute_logits(
