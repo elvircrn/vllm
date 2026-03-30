@@ -85,6 +85,9 @@ from vllm.model_executor.models.nan_check_helper import (
 from vllm.model_executor.models.nan_check_helper import (
     report_if_nan as _nan_report,
 )
+from vllm.model_executor.models.nan_check_helper import (
+    check_kv_caches as _nan_check_kv_caches,
+)
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -1416,6 +1419,7 @@ class DeepseekV2ForCausalLM(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
         _nan_report(hidden_states)
+        _nan_check_kv_caches(self.model.layers)
         return hidden_states
 
     def compute_logits(
