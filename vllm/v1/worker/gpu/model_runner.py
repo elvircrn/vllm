@@ -840,6 +840,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             _nan_set_ext(
                 getattr(input_batch, 'num_tokens', 0),
                 getattr(input_batch, 'num_tokens_after_padding', 0),
+                slot_mappings=self.block_tables.slot_mappings,
             )
         except Exception:
             pass

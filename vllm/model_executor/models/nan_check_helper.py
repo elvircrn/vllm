@@ -353,16 +353,26 @@ _current_phase: str = "PREFILL"
 _ext_num_actual: int = 0
 _ext_padded: int = 0
 
+# Slot mapping tensor reference — set from model_runner every iteration.
+# Persists across CUDA graph replay (same underlying storage).
+_ext_slot_mappings: torch.Tensor | None = None
 
-def set_batch_info_external(num_actual: int, padded: int) -> None:
+
+def set_batch_info_external(
+    num_actual: int,
+    padded: int,
+    slot_mappings: torch.Tensor | None = None,
+) -> None:
     """Called from model_runner OUTSIDE the compiled region.
 
     These values are reliable during CUDA graph replay since this
     function runs as normal Python every step.
     """
-    global _ext_num_actual, _ext_padded
+    global _ext_num_actual, _ext_padded, _ext_slot_mappings
     _ext_num_actual = num_actual
     _ext_padded = padded
+    if slot_mappings is not None:
+        _ext_slot_mappings = slot_mappings
     # Log first call to verify values are correct
     if not hasattr(set_batch_info_external, '_logged'):
         set_batch_info_external._logged = True
@@ -1166,7 +1176,33 @@ def report_if_nan(hidden_states: torch.Tensor) -> None:
                    f"padded={padded}\n")
             f.write(msg)
             f.flush()
-    
+
+            # Dump slot_mapping around the flagged token
+            if _ext_slot_mappings is not None and tok_idx >= 0:
+                sm = _ext_slot_mappings.cpu()
+                num_groups = sm.shape[0]
+                num_cols = sm.shape[1]
+                # Show slots around first_tok for each KV cache group
+                window = 8
+                lo = max(0, tok_idx - window)
+                hi = min(num_cols, tok_idx + window + 1)
+                for g in range(num_groups):
+                    slots = sm[g, lo:hi].tolist()
+                    # Count valid (>=0) vs pad (-1) in full range
+                    full = sm[g, :padded]
+                    n_valid = int((full >= 0).sum().item())
+                    n_pad = int((full == -1).sum().item())
+                    msg = (
+                        f"[SLOT_MAP_DUMP] layer={layer_idx} "
+                        f"group={g} first_tok={tok_idx} "
+                        f"slot[{tok_idx}]={sm[g, tok_idx].item()} "
+                        f"window[{lo}:{hi}]={slots} "
+                        f"valid_in_padded={n_valid}/{padded} "
+                        f"pad_in_padded={n_pad}/{padded}\n"
+                    )
+                    f.write(msg)
+                    f.flush()
+
     if per_layer_real_nan:
         f = _get_log()
         for layer_idx in range(nan_cpu.shape[0]):
