@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import TYPE_CHECKING, Literal
 
 import torch
@@ -2534,7 +2535,29 @@ def reshape_and_cache_flash(
     )
 
 
-import cache_nan_ext as _cache_nan_ext
+try:
+    import cache_nan_ext as _cache_nan_ext
+except ModuleNotFoundError:
+    # Auto-JIT compile the cache_nan_ext extension from csrc/cache_kernels.cu
+    import importlib
+    import sys
+    _jit_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "tools", "jit_cache_nan.py",
+    )
+    if os.path.exists(_jit_path):
+        _spec = importlib.util.spec_from_file_location("jit_cache_nan", _jit_path)
+        _mod = importlib.util.module_from_spec(_spec)
+        try:
+            _spec.loader.exec_module(_mod)
+            import cache_nan_ext as _cache_nan_ext
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                "cache_nan_ext JIT build failed: %s — nan_flag disabled", e)
+            _cache_nan_ext = None
+    else:
+        _cache_nan_ext = None
 
 
 def concat_and_cache_mla(
@@ -2546,9 +2569,14 @@ def concat_and_cache_mla(
     scale: torch.Tensor,
     nan_flag: torch.Tensor | None = None,
 ) -> None:
-    _cache_nan_ext.concat_and_cache_mla(
-        kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale, nan_flag
-    )
+    if _cache_nan_ext is not None:
+        _cache_nan_ext.concat_and_cache_mla(
+            kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale, nan_flag
+        )
+    else:
+        torch.ops._C_cache_ops.concat_and_cache_mla(
+            kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
+        )
 
 
 def concat_and_cache_mla_rope_fused(

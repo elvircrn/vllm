@@ -24,7 +24,7 @@ for flag in [
     while flag in cpp_ext.COMMON_NVCC_FLAGS:
         cpp_ext.COMMON_NVCC_FLAGS.remove(flag)
 
-SRC_DIR = "/opt/vllm-source/csrc"
+SRC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "csrc")
 BUILD_DIR = "/tmp/jit_build/cache_nan"
 os.makedirs(BUILD_DIR, exist_ok=True)
 
