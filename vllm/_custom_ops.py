@@ -276,7 +276,7 @@ def merge_attn_states(
             suffix_lse,
             prefill_tokens_with_context,
         )
-    except TypeError:
+    except (TypeError, RuntimeError):
         # Precompiled binary has old 6-arg signature
         torch.ops._C.merge_attn_states(
             output,
