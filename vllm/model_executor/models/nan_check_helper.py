@@ -1159,8 +1159,6 @@ def report_if_nan(hidden_states: torch.Tensor) -> None:
             fused_qkv_inf = ai[0].item() if ai is not None else 0
             # Padding-aware: deduce if tok0 contributed NaN
             hidden_dim = hidden_states.shape[-1]
-            padded = (_saved_batch_info["padded_size"]
-                      if _saved_batch_info else total)
             num_padding = padded - n
             # fused_qkv output dim = 2112, kv_c dim = 512, k_pe dim = 64
             fqkv_pad_max = num_padding * 2112
