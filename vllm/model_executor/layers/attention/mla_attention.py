@@ -503,6 +503,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             assert isinstance(slot_mapping, dict), (
                 f"Expected slot_mapping to be a dict, got {type(slot_mapping)}. "
             )
+            _nan_mark_mla(
+                kv_c_normed, 24, self._nan_layer_idx
+            )  # kv_c_pre_kernel (right before concat_and_cache_mla)
             self.impl.do_kv_cache_update(
                 kv_c_normed,
                 k_pe,
@@ -1056,6 +1059,9 @@ def unified_mla_kv_cache_update(
     )
     layer_slot_mapping = slot_mapping.get(layer_name)
     if layer_slot_mapping is not None:
+        _nan_mark_mla(
+            kv_c_normed, 24, attn_layer._nan_layer_idx
+        )  # kv_c_pre_kernel (right before concat_and_cache_mla)
         attn_layer.impl.do_kv_cache_update(
             kv_c_normed,
             k_pe,

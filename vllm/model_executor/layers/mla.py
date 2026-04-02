@@ -171,6 +171,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
                 positions, q[..., self.qk_nope_head_dim :], k_pe
             )
+        _nan_mark_attn(k_pe, 23, self._nan_layer_idx)  # k_pe_post_rope
         _nan_mark_attn(q, 3, self._nan_layer_idx)  # rope
 
         if self.indexer and self.is_sparse:
