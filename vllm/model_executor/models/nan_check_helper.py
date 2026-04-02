@@ -472,6 +472,13 @@ def report_scales(
     }
 
 
+def log_lifecycle(event: str) -> None:
+    """Write a lifecycle marker to the NaN log (e.g., PROFILE_START)."""
+    f = _get_log()
+    f.write(f"[LIFECYCLE] {event} at {datetime.datetime.now()}\n")
+    f.flush()
+
+
 def _emit_scales(tag: str) -> None:
     if _saved_scales is None:
         return
