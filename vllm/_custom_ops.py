@@ -2559,6 +2559,13 @@ def _get_cache_nan_ext():
     return _cache_nan_ext
 
 
+_last_kernel_shapes: dict[str, int] = {}
+
+
+def get_last_kernel_shapes() -> dict[str, int]:
+    return _last_kernel_shapes
+
+
 def concat_and_cache_mla(
     kv_c: torch.Tensor,
     k_pe: torch.Tensor,
@@ -2568,6 +2575,8 @@ def concat_and_cache_mla(
     scale: torch.Tensor,
     nan_flag: torch.Tensor | None = None,
 ) -> None:
+    _last_kernel_shapes["kv_c_rows"] = kv_c.shape[0]
+    _last_kernel_shapes["slot_mapping_len"] = slot_mapping.shape[0]
     if nan_flag is not None:
         _get_cache_nan_ext().concat_and_cache_mla(
             kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale,

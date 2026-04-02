@@ -1172,10 +1172,15 @@ def report_if_nan(hidden_states: torch.Tensor) -> None:
             hs_pad_max = num_padding * hidden_dim
             tok0_hs_nan = "YES" if nan_cpu[layer_idx, 0].item() > hs_pad_max else "NO"
             tok0_fqkv_nan = "YES" if fused_qkv_nan > fqkv_pad_max else "NO"
+            # Kernel launch sizes from last concat_and_cache_mla call
+            from vllm._custom_ops import get_last_kernel_shapes
+            ks = get_last_kernel_shapes()
             msg = (f"[KV_KERNEL_NAN] phase={phase} layer={layer_idx} "
                    f"bits=0x{bits:02x} flags={','.join(flags)} "
                    f"first_tok={tok_idx} num_actual={n} "
                    f"tok_type={is_padding} "
+                   f"kv_c_rows={ks.get('kv_c_rows', '?')} "
+                   f"slot_map_len={ks.get('slot_mapping_len', '?')} "
                    f"tok0_hs_nan={tok0_hs_nan} "
                    f"tok0_fqkv_nan={tok0_fqkv_nan} "
                    f"hs_maxabs={hs_maxabs:.4g} "
