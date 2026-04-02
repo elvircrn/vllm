@@ -685,6 +685,31 @@ class Worker(WorkerBase):
             else:
                 self.model_runner._dummy_sampler_run(hidden_states=last_hidden_states)
 
+        # Check KV cache state after warmup to detect NaN contamination.
+        # KV cache is uint8 (FP8 E4M3FN), so torch.isnan doesn't work.
+        # FP8 E4M3FN NaN: (byte & 0x7F) == 0x7F  (0x7F=+NaN, 0xFF=-NaN)
+        import logging as _logging
+        _kv_log = _logging.getLogger("vllm.kv_cache_check")
+        for i, kv_cache in enumerate(self.model_runner.kv_caches):
+            if kv_cache is not None and kv_cache.numel() > 0:
+                all_zero = (kv_cache == 0).all().item()
+                if kv_cache.dtype == torch.uint8:
+                    fp8_nan_mask = (kv_cache & 0x7F) == 0x7F
+                    has_nan = fp8_nan_mask.any().item()
+                    nan_count = int(fp8_nan_mask.sum().item())
+                else:
+                    has_nan = torch.isnan(kv_cache).any().item()
+                    nan_count = int(torch.isnan(kv_cache).sum().item())
+                nonzero_count = kv_cache.nonzero().shape[0] if not all_zero else 0
+                _kv_log.warning(
+                    "[KV_CACHE_POST_WARMUP] cache_idx=%d "
+                    "shape=%s dtype=%s "
+                    "all_zero=%s has_nan=%s nan_count=%d "
+                    "nonzero_count=%d",
+                    i, list(kv_cache.shape), kv_cache.dtype,
+                    all_zero, has_nan, nan_count, nonzero_count,
+                )
+
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
