@@ -1057,6 +1057,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             del intermediate_tensors
 
+        # Gate kernel-level NaN check: only active during prefill.
+        try:
+            from vllm.model_executor.models.nan_check_helper import (
+                set_kernel_nan_active,
+            )
+            set_kernel_nan_active(max_query_len > 1)
+        except Exception:
+            pass
+
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.

@@ -27,6 +27,10 @@ _reported_kv_write_layers: set[int] = set()
 _reported_kv_kernel_layers: set[int] = set()
 _kv_poison_reported: bool = False
 
+# Kernel NaN check gate — set from model_runner before forward pass.
+# Off by default; enabled only during prefill via set_kernel_nan_active().
+_kernel_nan_active: bool = False
+
 # Count tensors: shape (num_layers, 4)
 # column 0 = input (before layernorm), column 1 = pre_attn (after layernorm),
 # column 2 = attn, column 3 = moe
@@ -105,10 +109,13 @@ def mark(tensor: torch.Tensor, stage_col: int, layer_idx: int) -> None:
     n = _last_num_actual_toks
     if n > 0 and n < tensor.shape[0]:
         tensor = tensor[:n]
-    _nan_counts[layer_idx, stage_col] = tensor.isnan().sum()
-    _inf_counts[layer_idx, stage_col] = tensor.isinf().sum()
+    _nan_counts[layer_idx, stage_col] = torch.max(
+        _nan_counts[layer_idx, stage_col], tensor.isnan().sum())
+    _inf_counts[layer_idx, stage_col] = torch.max(
+        _inf_counts[layer_idx, stage_col], tensor.isinf().sum())
     if stage_col == 0 and _hidden_maxabs is not None:
-        _hidden_maxabs[layer_idx] = tensor.abs().max()
+        _hidden_maxabs[layer_idx] = torch.max(
+            _hidden_maxabs[layer_idx], tensor.abs().max())
 
 
 def mark_attn(
@@ -146,8 +153,13 @@ def mark_attn(
             tensor = tensor[:n]
         nan_count = tensor.isnan().sum()
         inf_count = tensor.isinf().sum()
-    _attn_detail[layer_idx, stage_col] = nan_count
-    _inf_attn_detail[layer_idx, stage_col] = inf_count
+    # Use max (not =) to survive torch.compile re-tracing: if a first
+    # execution finds NaN but a re-trace is clean, max preserves the hit.
+    # _zero_all() resets between report_if_nan calls.
+    _attn_detail[layer_idx, stage_col] = torch.max(
+        _attn_detail[layer_idx, stage_col], nan_count)
+    _inf_attn_detail[layer_idx, stage_col] = torch.max(
+        _inf_attn_detail[layer_idx, stage_col], inf_count)
 
 
 def mark_fp8_nan(tensor: torch.Tensor, stage_col: int, layer_idx: int) -> None:
@@ -192,13 +204,21 @@ def _ensure_kv_write_counts(num_layers: int, device: torch.device) -> None:
         _kv_kernel_nan_flags[:, 1] = 0x7FFFFFFF
 
 
+def set_kernel_nan_active(active: bool) -> None:
+    """Called from model_runner before forward pass to gate kernel NaN checks."""
+    global _kernel_nan_active
+    _kernel_nan_active = active
+
+
 def get_kernel_nan_flag(layer_idx: int) -> "torch.Tensor | None":
     """Return a 2-element int32 view for the kernel's nan_flag.
 
     Element [0] = bit flags (atomicOr), [1] = min token_idx (atomicMin).
-    Returns None if checks are disabled or flags not yet allocated.
+    Returns None if checks are disabled, not prefill, or flags not allocated.
     """
     if not _per_layer_checks_enabled:
+        return None
+    if not _kernel_nan_active:
         return None
     if _kv_kernel_nan_flags is None:
         return None
