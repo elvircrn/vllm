@@ -724,46 +724,32 @@ class Worker(WorkerBase):
             log_lifecycle("SAMPLER_WARMUP_END")
 
             # Check KV cache state after warmup to detect NaN contamination
-            import logging as _logging
-            _kv_log = _logging.getLogger("vllm.kv_cache_check")
+            # KV cache is uint8 (FP8 E4M3), so torch.isnan doesn't work.
+            # FP8 E4M3 NaN: exponent=1111, mantissa=111 → (byte & 0x7F) == 0x7F
             for i, kv_cache in enumerate(self.model_runner.kv_caches):
                 if kv_cache is not None and kv_cache.numel() > 0:
                     all_zero = (kv_cache == 0).all().item()
-                    has_nan = torch.isnan(kv_cache).any().item()
-                    has_inf = torch.isinf(kv_cache).any().item()
+                    if kv_cache.dtype == torch.uint8:
+                        fp8_nan_mask = (kv_cache & 0x7F) == 0x7F
+                        has_nan = fp8_nan_mask.any().item()
+                        nan_count = fp8_nan_mask.sum().item()
+                    else:
+                        has_nan = torch.isnan(kv_cache).any().item()
+                        nan_count = torch.isnan(kv_cache).sum().item()
                     nonzero_count = kv_cache.nonzero().shape[0] if not all_zero else 0
-                    _kv_log.warning(
+                    logger.warning(
                         "[KV_CACHE_POST_WARMUP] cache_idx=%d "
                         "shape=%s dtype=%s "
-                        "all_zero=%s has_nan=%s has_inf=%s "
+                        "all_zero=%s has_nan=%s nan_count=%d "
                         "nonzero_count=%d",
                         i, list(kv_cache.shape), kv_cache.dtype,
-                        all_zero, has_nan, has_inf, nonzero_count,
+                        all_zero, has_nan, nan_count, nonzero_count,
                     )
-                    if _per_layer_checks_enabled:
-                        f = _get_log()
-                        f.write(
-                            f"[KV_CACHE_POST_WARMUP] cache_idx={i} "
-                            f"shape={list(kv_cache.shape)} dtype={kv_cache.dtype} "
-                            f"all_zero={all_zero} has_nan={has_nan} has_inf={has_inf} "
-                            f"nonzero_count={nonzero_count}\n"
-                        )
-                        f.flush()
 
             if self.model_runner.is_pooling_model:
                 self.model_runner._dummy_pooler_run(hidden_states)
             else:
                 self.model_runner._dummy_sampler_run(hidden_states=last_hidden_states)
-
-        # Zero KV cache after all warmup/profiling to prevent NaN
-        # contamination from dummy runs leaking into real inference.
-        for kv_cache in self.model_runner.kv_caches:
-            if kv_cache is not None and kv_cache.numel() > 0:
-                kv_cache.fill_(0)
-        logger.warning(
-            "[KV_CACHE_ZEROED] zeroed %d KV cache tensors after warmup",
-            len(self.model_runner.kv_caches),
-        )
 
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
