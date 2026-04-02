@@ -253,6 +253,7 @@ class DeepseekV2MoE(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        self.prefix = prefix
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
 
@@ -383,6 +384,34 @@ class DeepseekV2MoE(nn.Module):
         shared_output, final_hidden_states = fused_moe_out
         if self.shared_experts is None:
             assert shared_output is None
+
+        # --- NaN/Inf diagnostics for DeepSeek MoE ---
+        from vllm.model_executor.models.nan_check_helper import (
+            _get_log,
+            _per_layer_checks_enabled,
+        )
+        if _per_layer_checks_enabled:
+            routed_nan = torch.isnan(final_hidden_states).any().item()
+            routed_inf = torch.isinf(final_hidden_states).any().item()
+            shared_nan = (
+                torch.isnan(shared_output).any().item()
+                if shared_output is not None else False
+            )
+            shared_inf = (
+                torch.isinf(shared_output).any().item()
+                if shared_output is not None else False
+            )
+            if routed_nan or routed_inf or shared_nan or shared_inf:
+                f = _get_log()
+                f.write(
+                    f"[MOE_SPLIT] prefix={self.prefix} "
+                    f"routed_nan={routed_nan} routed_inf={routed_inf} "
+                    f"routed_nan_count={torch.isnan(final_hidden_states).sum().item()} "
+                    f"routed_inf_count={torch.isinf(final_hidden_states).sum().item()} "
+                    f"shared_nan={shared_nan} shared_inf={shared_inf} "
+                    f"input_maxabs={hidden_states.abs().max().item():.4f}\n"
+                )
+                f.flush()
 
         # Fix FP16 overflow
         # See DeepseekV2DecoderLayer for more details.

@@ -3997,6 +3997,20 @@ class GPUModelRunner(
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
 
+        # Log first real inference step.
+        if not hasattr(self, '_nan_first_real_logged'):
+            self._nan_first_real_logged = True
+            from vllm.model_executor.models.nan_check_helper import (
+                log_lifecycle,
+            )
+            log_lifecycle("FIRST_REAL_INFERENCE")
+
+        # Gate kernel-level NaN check: only active during prefill.
+        from vllm.model_executor.models.nan_check_helper import (
+            set_kernel_nan_active,
+        )
+        set_kernel_nan_active(max_num_scheduled_tokens > 1)
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         # When spec decode is enabled, defer connector finalization
@@ -4056,6 +4070,14 @@ class GPUModelRunner(
                     )
 
                 sample_hidden_states = hidden_states[logits_indices]
+                from vllm.model_executor.models.nan_check_helper import (
+                    set_batch_info_external as _nan_set_ext,
+                )
+                _nan_set_ext(
+                    num_scheduled_tokens,
+                    num_tokens_padded,
+                    slot_mappings=slot_mappings,
+                )
                 logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
@@ -5724,6 +5746,8 @@ class GPUModelRunner(
         return self._dummy_pooler_run_task(hidden_states, max_task)
 
     def profile_run(self) -> None:
+        from vllm.model_executor.models.nan_check_helper import log_lifecycle
+        log_lifecycle("PROFILE_START")
         # Profile with multimodal encoder & encoder cache.
         if self.supports_mm_inputs:
             mm_config = self.model_config.multimodal_config
@@ -5798,6 +5822,8 @@ class GPUModelRunner(
         del hidden_states, output
         self.encoder_cache.clear()
         gc.collect()
+        from vllm.model_executor.models.nan_check_helper import log_lifecycle
+        log_lifecycle("PROFILE_END")
 
     def _init_minimal_kv_cache_for_profiling(self) -> None:
         from vllm.v1.core.kv_cache_utils import (
@@ -6001,6 +6027,8 @@ class GPUModelRunner(
                 logger.info("Initialized EncoderCudaGraphManager for vision encoder")
 
         compilation_counter.num_gpu_runner_capture_triggers += 1
+        from vllm.model_executor.models.nan_check_helper import log_lifecycle
+        log_lifecycle("CUDAGRAPH_CAPTURE_START")
 
         start_time = time.perf_counter()
 
@@ -6053,6 +6081,11 @@ class GPUModelRunner(
             elapsed_time,
             cuda_graph_size / (1 << 30),
             scope="local",
+        )
+        from vllm.model_executor.models.nan_check_helper import log_lifecycle
+        log_lifecycle(
+            f"CUDAGRAPH_CAPTURE_END took={elapsed_time:.0f}s "
+            f"size={cuda_graph_size / (1 << 30):.2f}GiB"
         )
         return cuda_graph_size
 

@@ -324,7 +324,7 @@ class TrtLlmNvFp4ExpertsMonolithic(
             e_score_correction_bias = e_score_correction_bias.to(torch.bfloat16)
 
         # Invoke kernel.
-        return flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
+        result = flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
             routing_logits=router_logits,
             routing_bias=e_score_correction_bias,
             hidden_states=hidden_states,
@@ -355,3 +355,48 @@ class TrtLlmNvFp4ExpertsMonolithic(
             do_finalize=True,
             activation_type=activation_to_flashinfer_int(activation),
         )[0]
+
+        # --- NaN/Inf diagnostics for NVFP4 MoE kernel ---
+        from vllm.model_executor.models.nan_check_helper import (
+            _get_log,
+            _per_layer_checks_enabled,
+        )
+        if _per_layer_checks_enabled and (
+            torch.isnan(result).any() or torch.isinf(result).any()
+        ):
+            f = _get_log()
+            nan_mask = torch.isnan(result).any(dim=-1)  # per-token
+            inf_mask = torch.isinf(result).any(dim=-1)
+            nan_toks = nan_mask.sum().item()
+            inf_toks = inf_mask.sum().item()
+            hs_nan = torch.isnan(hidden_states).any().item()
+            hs_inf = torch.isinf(hidden_states).any().item()
+            hs_max = hidden_states.abs().max().item()
+            w1_scale = self.quant_config.w1_scale.view(torch.float8_e4m3fn)
+            w2_scale = self.quant_config.w2_scale.view(torch.float8_e4m3fn)
+            g1_sc = self.g1_scale_c
+            g1_alpha = self.quant_config.g1_alphas
+            g2_alpha = self.quant_config.g2_alphas
+            a1q_f = a1q_scale.view(torch.float8_e4m3fn).reshape(
+                *hidden_states.shape[:-1], -1
+            ).view(torch.uint8)
+            f.write(
+                f"[NVFP4_MOE_NAN] nan_toks={nan_toks} inf_toks={inf_toks} "
+                f"total_toks={result.shape[0]} "
+                f"input_has_nan={hs_nan} input_has_inf={hs_inf} "
+                f"input_maxabs={hs_max:.4f} "
+                f"ep_rank={self.ep_rank} "
+                f"local_experts={self.local_num_experts} "
+                f"topk={self.topk} "
+                f"w1_scale_nan={w1_scale.view(torch.uint8).eq(0x7F).any().item()} "
+                f"w2_scale_nan={w2_scale.view(torch.uint8).eq(0x7F).any().item()} "
+                f"a1q_scale_max={a1q_f.max().item()} "
+                f"a1q_scale_min={a1q_f.min().item()} "
+                f"g1_scale_c={g1_sc} g1_alphas={g1_alpha} "
+                f"g2_alphas={g2_alpha} "
+                f"result_maxabs={result[~torch.isnan(result)].abs().max().item():.4f} "
+                f"result_inf_count={torch.isinf(result).sum().item()} "
+                f"result_nan_count={torch.isnan(result).sum().item()}\n"
+            )
+            f.flush()
+        return result
