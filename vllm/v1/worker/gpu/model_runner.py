@@ -509,13 +509,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @torch.inference_mode()
     def profile_run(self) -> None:
-        try:
-            from vllm.model_executor.models.nan_check_helper import (
-                log_lifecycle,
-            )
-            log_lifecycle("PROFILE_START")
-        except Exception:
-            pass
+        from vllm.model_executor.models.nan_check_helper import log_lifecycle
+        log_lifecycle("PROFILE_START")
         hidden_states, sample_hidden_states = self._dummy_run(
             self.max_num_tokens, skip_attn=True, is_profile=True
         )
@@ -531,13 +526,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         torch.accelerator.synchronize()
         del hidden_states, sample_hidden_states
         gc.collect()
-        try:
-            from vllm.model_executor.models.nan_check_helper import (
-                log_lifecycle,
-            )
-            log_lifecycle("PROFILE_END")
-        except Exception:
-            pass
+        from vllm.model_executor.models.nan_check_helper import log_lifecycle
+        log_lifecycle("PROFILE_END")
 
     def reset_mm_cache(self) -> None:
         if self.encoder_cache is not None:
@@ -564,13 +554,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             return 0
 
-        try:
-            from vllm.model_executor.models.nan_check_helper import (
-                log_lifecycle,
-            )
-            log_lifecycle("CUDAGRAPH_CAPTURE_START")
-        except Exception:
-            pass
+        from vllm.model_executor.models.nan_check_helper import log_lifecycle
+        log_lifecycle("CUDAGRAPH_CAPTURE_START")
         start_time = time.perf_counter()
         gc.collect()
         torch.accelerator.empty_cache()
@@ -601,16 +586,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             elapsed_time,
             cuda_graph_size / (1 << 30),
         )
-        try:
-            from vllm.model_executor.models.nan_check_helper import (
-                log_lifecycle,
-            )
-            log_lifecycle(
-                f"CUDAGRAPH_CAPTURE_END took={elapsed_time:.0f}s "
-                f"size={cuda_graph_size / (1 << 30):.2f}GiB"
-            )
-        except Exception:
-            pass
+        from vllm.model_executor.models.nan_check_helper import log_lifecycle
+        log_lifecycle(
+            f"CUDAGRAPH_CAPTURE_END took={elapsed_time:.0f}s "
+            f"size={cuda_graph_size / (1 << 30):.2f}GiB"
+        )
         return cuda_graph_size
 
     def _remove_request(self, req_id: str) -> bool:
@@ -864,17 +844,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         sample_hidden_states = hidden_states[input_batch.logits_indices]
-        try:
-            from vllm.model_executor.models.nan_check_helper import (
-                set_batch_info_external as _nan_set_ext,
-            )
-            _nan_set_ext(
-                getattr(input_batch, 'num_tokens', 0),
-                getattr(input_batch, 'num_tokens_after_padding', 0),
-                slot_mappings=self.block_tables.slot_mappings,
-            )
-        except Exception:
-            pass
+        from vllm.model_executor.models.nan_check_helper import (
+            set_batch_info_external as _nan_set_ext,
+        )
+        _nan_set_ext(
+            getattr(input_batch, 'num_tokens', 0),
+            getattr(input_batch, 'num_tokens_after_padding', 0),
+            slot_mappings=self.block_tables.slot_mappings,
+        )
         logits = self.model.compute_logits(sample_hidden_states)
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.
@@ -969,13 +946,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Log first real inference step.
         if not dummy_run and not hasattr(self, '_nan_first_real_logged'):
             self._nan_first_real_logged = True
-            try:
-                from vllm.model_executor.models.nan_check_helper import (
-                    log_lifecycle,
-                )
-                log_lifecycle("FIRST_REAL_INFERENCE")
-            except Exception:
-                pass
+            from vllm.model_executor.models.nan_check_helper import (
+                log_lifecycle,
+            )
+            log_lifecycle("FIRST_REAL_INFERENCE")
 
         # Get batch descriptor and sync across DP ranks.
         num_reqs = len(scheduler_output.num_scheduled_tokens)
@@ -1100,13 +1074,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             del intermediate_tensors
 
         # Gate kernel-level NaN check: only active during prefill.
-        try:
-            from vllm.model_executor.models.nan_check_helper import (
-                set_kernel_nan_active,
-            )
-            set_kernel_nan_active(max_query_len > 1)
-        except Exception:
-            pass
+        from vllm.model_executor.models.nan_check_helper import (
+            set_kernel_nan_active,
+        )
+        set_kernel_nan_active(max_query_len > 1)
 
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:

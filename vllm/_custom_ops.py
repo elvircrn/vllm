@@ -266,15 +266,26 @@ def merge_attn_states(
     output_lse: torch.Tensor | None = None,
     prefill_tokens_with_context: int | None = None,
 ) -> None:
-    torch.ops._C.merge_attn_states(
-        output,
-        output_lse,
-        prefix_output,
-        prefix_lse,
-        suffix_output,
-        suffix_lse,
-        prefill_tokens_with_context,
-    )
+    try:
+        torch.ops._C.merge_attn_states(
+            output,
+            output_lse,
+            prefix_output,
+            prefix_lse,
+            suffix_output,
+            suffix_lse,
+            prefill_tokens_with_context,
+        )
+    except TypeError:
+        # Precompiled binary has old 6-arg signature
+        torch.ops._C.merge_attn_states(
+            output,
+            output_lse,
+            prefix_output,
+            prefix_lse,
+            suffix_output,
+            suffix_lse,
+        )
 
 
 def convert_vertical_slash_indexes(
