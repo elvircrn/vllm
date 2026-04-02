@@ -725,33 +725,37 @@ class Worker(WorkerBase):
 
             # Check KV cache state after warmup to detect NaN contamination
             # KV cache is uint8 (FP8 E4M3), so torch.isnan doesn't work.
-            # FP8 E4M3 NaN: exponent=1111, mantissa=111 → (byte & 0x7F) == 0x7F
-            logger.warning(
-                "[KV_CACHE_POST_WARMUP] checking %d KV cache tensors",
-                len(self.model_runner.kv_caches),
-            )
-            try:
-                for i, kv_cache in enumerate(self.model_runner.kv_caches):
-                    if kv_cache is not None and kv_cache.numel() > 0:
-                        all_zero = (kv_cache == 0).all().item()
-                        if kv_cache.dtype == torch.uint8:
-                            fp8_nan_mask = (kv_cache & 0x7F) == 0x7F
-                            has_nan = fp8_nan_mask.any().item()
-                            nan_count = fp8_nan_mask.sum().item()
-                        else:
-                            has_nan = torch.isnan(kv_cache).any().item()
-                            nan_count = torch.isnan(kv_cache).sum().item()
-                        nonzero_count = kv_cache.nonzero().shape[0] if not all_zero else 0
-                        logger.warning(
-                            "[KV_CACHE_POST_WARMUP] cache_idx=%d "
-                            "shape=%s dtype=%s "
-                            "all_zero=%s has_nan=%s nan_count=%d "
-                            "nonzero_count=%d",
-                            i, list(kv_cache.shape), kv_cache.dtype,
-                            all_zero, has_nan, nan_count, nonzero_count,
+            # FP8 E4M3 NaN: (byte & 0x7F) == 0x7F
+            import logging as _logging
+            _kv_log = _logging.getLogger("vllm.kv_cache_check")
+            for i, kv_cache in enumerate(self.model_runner.kv_caches):
+                if kv_cache is not None and kv_cache.numel() > 0:
+                    all_zero = (kv_cache == 0).all().item()
+                    if kv_cache.dtype == torch.uint8:
+                        fp8_nan_mask = (kv_cache & 0x7F) == 0x7F
+                        has_nan = fp8_nan_mask.any().item()
+                        nan_count = int(fp8_nan_mask.sum().item())
+                    else:
+                        has_nan = torch.isnan(kv_cache).any().item()
+                        nan_count = int(torch.isnan(kv_cache).sum().item())
+                    nonzero_count = kv_cache.nonzero().shape[0] if not all_zero else 0
+                    _kv_log.warning(
+                        "[KV_CACHE_POST_WARMUP] cache_idx=%d "
+                        "shape=%s dtype=%s "
+                        "all_zero=%s has_nan=%s nan_count=%d "
+                        "nonzero_count=%d",
+                        i, list(kv_cache.shape), kv_cache.dtype,
+                        all_zero, has_nan, nan_count, nonzero_count,
+                    )
+                    if _per_layer_checks_enabled:
+                        f = _get_log()
+                        f.write(
+                            f"[KV_CACHE_POST_WARMUP] cache_idx={i} "
+                            f"shape={list(kv_cache.shape)} dtype={kv_cache.dtype} "
+                            f"all_zero={all_zero} has_nan={has_nan} nan_count={nan_count} "
+                            f"nonzero_count={nonzero_count}\n"
                         )
-            except Exception as e:
-                logger.error("[KV_CACHE_POST_WARMUP] FAILED: %s", e)
+                        f.flush()
 
             if self.model_runner.is_pooling_model:
                 self.model_runner._dummy_pooler_run(hidden_states)
