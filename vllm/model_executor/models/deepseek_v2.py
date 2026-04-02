@@ -1636,6 +1636,15 @@ class DeepseekV2ForCausalLM(
                         if is_pp_missing_parameter(name, self):
                             continue
 
+                        # Skip checkpoint weights that have no matching
+                        # model parameter (e.g. when num_hidden_layers is
+                        # overridden via --hf-overrides to load a subset of
+                        # layers, NVFP4 quantization scales for absent or
+                        # structurally different layers won't exist in the
+                        # model's param dict).
+                        if name not in params_dict:
+                            continue
+
                         param = params_dict[name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
