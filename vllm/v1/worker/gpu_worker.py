@@ -723,6 +723,33 @@ class Worker(WorkerBase):
                     f.flush()
             log_lifecycle("SAMPLER_WARMUP_END")
 
+            # Check KV cache state after warmup to detect NaN contamination
+            import logging as _logging
+            _kv_log = _logging.getLogger("vllm.kv_cache_check")
+            for i, kv_cache in enumerate(self.model_runner.kv_caches):
+                if kv_cache is not None and kv_cache.numel() > 0:
+                    all_zero = (kv_cache == 0).all().item()
+                    has_nan = torch.isnan(kv_cache).any().item()
+                    has_inf = torch.isinf(kv_cache).any().item()
+                    nonzero_count = kv_cache.nonzero().shape[0] if not all_zero else 0
+                    _kv_log.warning(
+                        "[KV_CACHE_POST_WARMUP] cache_idx=%d "
+                        "shape=%s dtype=%s "
+                        "all_zero=%s has_nan=%s has_inf=%s "
+                        "nonzero_count=%d",
+                        i, list(kv_cache.shape), kv_cache.dtype,
+                        all_zero, has_nan, has_inf, nonzero_count,
+                    )
+                    if _per_layer_checks_enabled:
+                        f = _get_log()
+                        f.write(
+                            f"[KV_CACHE_POST_WARMUP] cache_idx={i} "
+                            f"shape={list(kv_cache.shape)} dtype={kv_cache.dtype} "
+                            f"all_zero={all_zero} has_nan={has_nan} has_inf={has_inf} "
+                            f"nonzero_count={nonzero_count}\n"
+                        )
+                        f.flush()
+
             if self.model_runner.is_pooling_model:
                 self.model_runner._dummy_pooler_run(hidden_states)
             else:
