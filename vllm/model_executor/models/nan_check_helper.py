@@ -1139,6 +1139,19 @@ def report_if_nan(hidden_states: torch.Tensor) -> None:
             tok_idx = kv_kernel_cpu[layer_idx, 1].item()
             if tok_idx == 0x7FFFFFFF:
                 tok_idx = -1  # no token captured
+            # Kernel launch size from last concat_and_cache_mla call
+            from vllm._custom_ops import get_last_kernel_shapes
+            ks = get_last_kernel_shapes()
+            kernel_num_toks = ks.get("slot_mapping_len", padded)
+            if tok_idx >= kernel_num_toks:
+                # Stale nan_flag from a previous kernel launch (e.g.,
+                # CUDA graph capture at a larger size). Skip.
+                f.write(f"[KV_KERNEL_NAN_STALE] layer={layer_idx} "
+                        f"first_tok={tok_idx} >= kernel_num_toks="
+                        f"{kernel_num_toks} — skipping stale flag\n")
+                f.flush()
+                _reported_kv_kernel_layers.discard(layer_idx)
+                continue
             flags = [name for bit, name in _BIT_NAMES.items()
                      if bits & (1 << bit)]
             is_padding = (
