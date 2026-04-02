@@ -20,6 +20,13 @@ _inf_reported = False
 _log_fh = None
 _per_layer_checks_enabled = os.environ.get("VLLM_NAN_CHECK", "1") == "1"
 
+# Per-layer first-occurrence tracking — only log each layer's first NaN event.
+_reported_real_nan_layers: set[int] = set()
+_reported_pad_nan_layers: set[int] = set()
+_reported_kv_write_layers: set[int] = set()
+_reported_kv_kernel_layers: set[int] = set()
+_kv_poison_reported: bool = False
+
 # Count tensors: shape (num_layers, 4)
 # column 0 = input (before layernorm), column 1 = pre_attn (after layernorm),
 # column 2 = attn, column 3 = moe
@@ -1104,7 +1111,8 @@ def report_if_nan(hidden_states: torch.Tensor) -> None:
         f = _get_log()
         for layer_idx in range(kv_write_cpu.shape[0]):
             c = kv_write_cpu[layer_idx].item()
-            if c > 0:
+            if c > 0 and layer_idx not in _reported_kv_write_layers:
+                _reported_kv_write_layers.add(layer_idx)
                 msg = (f"[KV_CACHE_WRITE_NAN] phase={phase} layer={layer_idx} "
                        f"nan_count={c}\n")
                 f.write(msg)
@@ -1124,6 +1132,9 @@ def report_if_nan(hidden_states: torch.Tensor) -> None:
             bits = kv_kernel_cpu[layer_idx, 0].item()
             if bits == 0:
                 continue
+            if layer_idx in _reported_kv_kernel_layers:
+                continue
+            _reported_kv_kernel_layers.add(layer_idx)
             tok_idx = kv_kernel_cpu[layer_idx, 1].item()
             if tok_idx == 0x7FFFFFFF:
                 tok_idx = -1  # no token captured
@@ -1209,6 +1220,9 @@ def report_if_nan(hidden_states: torch.Tensor) -> None:
             hs_nan = nan_cpu[layer_idx, 0].item()
             if hs_nan <= hs_pad_max:
                 continue
+            if layer_idx in _reported_real_nan_layers:
+                continue
+            _reported_real_nan_layers.add(layer_idx)
             hs_inf = inf_cpu[layer_idx, 0].item() if inf_cpu is not None else 0
             attn_nan = nan_cpu[layer_idx, 2].item()
             moe_nan = nan_cpu[layer_idx, 3].item()
@@ -1227,24 +1241,30 @@ def report_if_nan(hidden_states: torch.Tensor) -> None:
         # Log padding NaN to separate .pad.log file
         f = _get_pad_log()
         pad_layers = [i for i in range(nan_cpu.shape[0])
-                      if nan_cpu[i, 0].item() > 0]
-        msg = (f"[HS_PAD_NAN] phase={phase} padding-only NaN in "
-               f"{len(pad_layers)} layers "
-               f"(first={pad_layers[0] if pad_layers else '?'} "
-               f"last={pad_layers[-1] if pad_layers else '?'}) "
-               f"padded={padded} actual={n}\n")
-        f.write(msg)
-        f.flush()
+                      if nan_cpu[i, 0].item() > 0
+                      and i not in _reported_pad_nan_layers]
+        for i in pad_layers:
+            _reported_pad_nan_layers.add(i)
+        if pad_layers:
+            msg = (f"[HS_PAD_NAN] phase={phase} padding-only NaN in "
+                   f"{len(pad_layers)} NEW layers "
+                   f"(first={pad_layers[0]} "
+                   f"last={pad_layers[-1]}) "
+                   f"padded={padded} actual={n}\n")
+            f.write(msg)
+            f.flush()
 
     # Find the NaN origin: first layer where input (col0) is clean but
     # a later stage (post_ln/attn/moe) has NaN. This is where NaN is BORN.
     _emit_nan_origin(nan_cpu, inf_cpu, attn_nan_cpu, attn_inf_cpu,
                      maxabs_cpu, n, padded, phase)
 
-    if kv_poison:
+    if kv_poison and not _kv_poison_reported:
+        _kv_poison_reported = True
         _emit_kv_poison(hidden_states, nan_cpu, attn_nan_cpu, attn_inf_cpu, n)
 
-    if real_has_nan:
+    if real_has_nan and not _nan_reported:
+        _nan_reported = True
         rc = hidden_states.isnan().sum().item()
         _emit_report(
             "NAN_FIRST", hidden_states, nan_cpu, attn_nan_cpu, rc, num_actual_toks=n
@@ -1253,7 +1273,8 @@ def report_if_nan(hidden_states: torch.Tensor) -> None:
         _emit_batch_info("NAN")
         _dump_repro(hidden_states, nan_cpu, attn_nan_cpu)
 
-    if real_has_inf:
+    if real_has_inf and not _inf_reported:
+        _inf_reported = True
         rc = hidden_states.isinf().sum().item()
         _emit_report(
             "INF_FIRST", hidden_states, inf_cpu, attn_inf_cpu, rc, num_actual_toks=n
