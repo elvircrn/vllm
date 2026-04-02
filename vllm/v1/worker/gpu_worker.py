@@ -755,6 +755,16 @@ class Worker(WorkerBase):
             else:
                 self.model_runner._dummy_sampler_run(hidden_states=last_hidden_states)
 
+        # Zero KV cache after all warmup/profiling to prevent NaN
+        # contamination from dummy runs leaking into real inference.
+        for kv_cache in self.model_runner.kv_caches:
+            if kv_cache is not None and kv_cache.numel() > 0:
+                kv_cache.fill_(0)
+        logger.warning(
+            "[KV_CACHE_ZEROED] zeroed %d KV cache tensors after warmup",
+            len(self.model_runner.kv_caches),
+        )
+
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
