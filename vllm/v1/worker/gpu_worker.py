@@ -574,10 +574,13 @@ class Worker(WorkerBase):
                     warmup_sizes.append(compile_range.end)
 
         # We skip EPLB here since we don't want to record dummy metrics
+        from vllm.model_executor.models.nan_check_helper import log_lifecycle
+        log_lifecycle(f"COMPILE_WARMUP_START sizes={sorted(warmup_sizes, reverse=True)}")
         for size in sorted(warmup_sizes, reverse=True):
             logger.info("Compile and warming up model for size %d", size)
             self.model_runner._dummy_run(size, skip_eplb=True, remove_lora=False)
         self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
+        log_lifecycle("COMPILE_WARMUP_END")
 
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
@@ -675,11 +678,51 @@ class Worker(WorkerBase):
             )
 
             # We skip EPLB here since we don't want to record dummy metrics
+            from vllm.model_executor.models.nan_check_helper import (
+                log_lifecycle,
+            )
+            log_lifecycle("SAMPLER_WARMUP_START")
             hidden_states, last_hidden_states = self.model_runner._dummy_run(
                 num_tokens=max_num_reqs,
                 skip_eplb=True,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
             )
+
+            # Log slot mappings used by the warmup dummy run
+            # to check if NaN could have been written to KV cache
+            from vllm.model_executor.models.nan_check_helper import (
+                _get_log,
+                _per_layer_checks_enabled,
+            )
+            if _per_layer_checks_enabled:
+                f = _get_log()
+                mr = self.model_runner
+                if (
+                    hasattr(mr, "kv_cache_config")
+                    and mr.kv_cache_config is not None
+                ):
+                    for gid, grp in enumerate(
+                        mr.kv_cache_config.kv_cache_groups
+                    ):
+                        blk_table = mr.input_batch.block_table[gid]
+                        sm = blk_table.slot_mapping.gpu[:max_num_reqs]
+                        unique_slots = sm.unique()
+                        f.write(
+                            f"[WARMUP_SLOTS] gid={gid} "
+                            f"num_tokens={max_num_reqs} "
+                            f"unique_slots={unique_slots.numel()} "
+                            f"min={sm.min().item()} "
+                            f"max={sm.max().item()} "
+                            f"has_pad={int((sm == -1).any().item())} "
+                            f"all_pad={int((sm == -1).all().item())} "
+                            f"first_8={sm[:8].tolist()}\n"
+                        )
+                        f.flush()
+                else:
+                    f.write("[WARMUP_SLOTS] no kv_cache_config\n")
+                    f.flush()
+            log_lifecycle("SAMPLER_WARMUP_END")
+
             if self.model_runner.is_pooling_model:
                 self.model_runner._dummy_pooler_run(hidden_states)
             else:
