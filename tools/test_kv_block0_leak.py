@@ -22,13 +22,13 @@ SCALE = 1.0 / (QK_NOPE_HEAD_DIM ** 0.5)
 
 device = torch.device("cuda:0")
 
-# Create paged KV cache: [num_blocks, block_size, head_dim]
-kv_cache = torch.zeros(NUM_BLOCKS, BLOCK_SIZE, HEAD_DIM,
+# Create paged KV cache: [num_pages, num_kv_heads=1, page_size, head_dim]
+kv_cache = torch.zeros(NUM_BLOCKS, 1, BLOCK_SIZE, HEAD_DIM,
                         dtype=torch.uint8, device=device)
 
 # Fill block 1 with known valid FP8 values (our "real" data)
 # FP8 E4M3: 0x3C = 1.0
-kv_cache[1, :4, :] = 0x3C  # 4 tokens in block 1
+kv_cache[1, 0, :4, :] = 0x3C  # 4 tokens in block 1
 
 # Query: [batch, q_len=1, num_heads, head_dim=576]
 # trtllm kernel requires query head_dim == kv head_dim == kv_lora_rank + qk_rope_head_dim
@@ -47,7 +47,7 @@ workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
 def run_attention():
     return trtllm_batch_decode_with_kv_cache_mla(
         query=q,
-        kv_cache=kv_cache,  # [num_blocks, block_size, head_dim]
+        kv_cache=kv_cache,
         workspace_buffer=workspace,
         qk_nope_head_dim=QK_NOPE_HEAD_DIM,
         kv_lora_rank=KV_LORA_RANK,
@@ -65,7 +65,7 @@ out_clean = run_attention().clone()
 
 # === Test 2: block 0 has random junk (simulating warmup contamination) ===
 torch.manual_seed(99)
-kv_cache[0] = torch.randint(0, 255, kv_cache[0].shape,
+kv_cache[0, 0] = torch.randint(0, 255, kv_cache[0, 0].shape,
                              dtype=torch.uint8, device=device)
 out_junk = run_attention().clone()
 
