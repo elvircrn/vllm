@@ -31,8 +31,9 @@ kv_cache = torch.zeros(NUM_BLOCKS, BLOCK_SIZE, HEAD_DIM,
 torch.manual_seed(42)
 kv_cache[1, :4, :] = 0x3C  # 4 tokens in block 1
 
-# Query: [batch, q_len=1, num_heads, head_dim]
-q = torch.randn(BATCH, 1, NUM_HEADS, QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM,
+# Query: [batch, q_len=1, num_heads, qk_nope_head_dim + qk_rope_head_dim]
+Q_HEAD_DIM = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM  # 192
+q = torch.randn(BATCH, 1, NUM_HEADS, Q_HEAD_DIM,
                  dtype=torch.bfloat16, device=device)
 
 # Block table: request uses block 1 only (NOT block 0)
