@@ -12,45 +12,41 @@ from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
 # MLA dims for DeepSeek R1
 KV_LORA_RANK = 512
 QK_ROPE_HEAD_DIM = 64
-QK_NOPE_HEAD_DIM = 128
 HEAD_DIM = KV_LORA_RANK + QK_ROPE_HEAD_DIM  # 576
 NUM_HEADS = 128
 BLOCK_SIZE = 32
 NUM_BLOCKS = 64
 BATCH = 1
-SCALE = 1.0 / (QK_NOPE_HEAD_DIM ** 0.5)
+SCALE = 1.0 / (128 ** 0.5)
 
 device = torch.device("cuda:0")
 
-# Create paged KV cache: [num_pages, page_size, head_dim]
+# KV cache: [num_pages, page_size, head_dim] as FP8
 kv_cache = torch.zeros(NUM_BLOCKS, BLOCK_SIZE, HEAD_DIM,
                         dtype=torch.float8_e4m3fn, device=device)
 
 # Fill block 1 with known valid FP8 values (our "real" data)
-# FP8 E4M3: 0x3C = 1.0
-# FP8 E4M3: 1.0 = 0x3C. Use view to set raw bytes.
 kv_cache[1, :4, :] = torch.tensor(1.0, dtype=torch.float8_e4m3fn, device=device)
 
-# Query: [batch, q_len=1, num_heads, head_dim=576]
-# trtllm kernel requires query head_dim == kv head_dim == kv_lora_rank + qk_rope_head_dim
+# Query: FP8 [batch, q_len=1, num_heads, head_dim]
 torch.manual_seed(42)
 q = torch.randn(BATCH, 1, NUM_HEADS, HEAD_DIM,
-                 dtype=torch.bfloat16, device=device)
+                 dtype=torch.bfloat16, device=device).to(torch.float8_e4m3fn)
 
 # Block table: request uses block 1 only (NOT block 0)
 # block_num must be multiple of 128/block_size = 4
 block_table = torch.zeros(BATCH, 4, dtype=torch.int32, device=device)
-block_table[0, 0] = 1  # first block is block 1
+block_table[0, 0] = 1
 seq_lens = torch.tensor([4], dtype=torch.int32, device=device)
 
-workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+workspace = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
 
 def run_attention():
     return trtllm_batch_decode_with_kv_cache_mla(
         query=q,
         kv_cache=kv_cache,
         workspace_buffer=workspace,
-        qk_nope_head_dim=QK_NOPE_HEAD_DIM,
+        qk_nope_head_dim=128,
         kv_lora_rank=KV_LORA_RANK,
         qk_rope_head_dim=QK_ROPE_HEAD_DIM,
         block_tables=block_table,
@@ -61,17 +57,20 @@ def run_attention():
     )
 
 # === Test 1: block 0 is all zeros ===
-kv_cache[0].fill_(0)
+kv_cache[0].zero_()
 out_clean = run_attention().clone()
 
 # === Test 2: block 0 has random junk (simulating warmup contamination) ===
 torch.manual_seed(99)
-kv_cache[0] = torch.randint(0, 255, kv_cache[0].shape,
-                             dtype=torch.uint8, device=device).view(torch.float8_e4m3fn)
+junk = torch.randint(0, 255, kv_cache[0].shape,
+                     dtype=torch.uint8, device=device)
+kv_cache[0] = junk.view(torch.float8_e4m3fn)
 out_junk = run_attention().clone()
 
 # === Test 3: block 0 has FP8 NaN (0x7F) everywhere ===
-kv_cache[0] = torch.full_like(kv_cache[0].view(torch.uint8), 0x7F).view(torch.float8_e4m3fn)
+nan_bytes = torch.full(kv_cache[0].shape, 0x7F,
+                       dtype=torch.uint8, device=device)
+kv_cache[0] = nan_bytes.view(torch.float8_e4m3fn)
 out_nan = run_attention().clone()
 
 # === Compare ===
