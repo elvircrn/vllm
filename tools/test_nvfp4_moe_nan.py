@@ -70,6 +70,10 @@ def make_inputs(num_tokens, hidden_scale=1.0, seed=42):
     return hidden, h_scale, w1, w1_scale, w2, w2_scale, router
 
 
+g1_scale = torch.tensor([1.0], dtype=torch.float32, device=device)
+g1_alpha = torch.tensor([1.0], dtype=torch.float32, device=device)
+g2_alpha = torch.tensor([1.0], dtype=torch.float32, device=device)
+
 def run_moe(hidden, h_scale, w1, w1_scale, w2, w2_scale, router):
     return trtllm_fp4_block_scale_moe(
         routing_logits=router,
@@ -85,9 +89,9 @@ def run_moe(hidden, h_scale, w1, w1_scale, w2, w2_scale, router):
         gemm2_weights=w2,
         gemm2_weights_scale=w2_scale,
         gemm2_bias=None,
-        output1_scale_scalar=1.0,
-        output1_scale_gate_scalar=1.0,
-        output2_scale_scalar=1.0,
+        output1_scale_scalar=g1_scale,
+        output1_scale_gate_scalar=g1_alpha,
+        output2_scale_scalar=g2_alpha,
         num_experts=NUM_EXPERTS,
         top_k=TOP_K,
         n_group=N_GROUP,
