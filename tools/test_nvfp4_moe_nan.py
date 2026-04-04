@@ -53,15 +53,16 @@ def make_inputs(num_tokens, hidden_scale=1.0, seed=42):
     # w1 weights: [num_experts, 2*intermediate, K//2] (gate+up fused), must be uint8
     w1 = torch.randint(0, 256, (NUM_EXPERTS, 2 * N, K // 2),
                        dtype=torch.uint8, device=device)
-    # w1 scale: [num_experts, 2*intermediate//16, K//16]
-    w1_scale = torch.full((NUM_EXPERTS, 2 * N // 16, K // 16), 0x3C,
+    # w1 scale: [num_experts, 2*intermediate//16, K//2//16]
+    # weight_scale_vec_size = (K//2) / scale_last_dim must be 16 or 32
+    w1_scale = torch.full((NUM_EXPERTS, 2 * N // 16, K // 2 // 16), 0x3C,
                           dtype=torch.uint8, device=device).view(torch.float8_e4m3fn)
 
     # w2 weights: [num_experts, K//2, intermediate], must be uint8
     w2 = torch.randint(0, 256, (NUM_EXPERTS, K // 2, N),
                        dtype=torch.uint8, device=device)
-    # w2 scale: [num_experts, K//16, intermediate//16]
-    w2_scale = torch.full((NUM_EXPERTS, K // 16, N // 16), 0x3C,
+    # w2 scale: [num_experts, K//2//16, N//16]
+    w2_scale = torch.full((NUM_EXPERTS, K // 2 // 16, N // 16), 0x3C,
                           dtype=torch.uint8, device=device).view(torch.float8_e4m3fn)
 
     # Router logits: [M, num_experts]
