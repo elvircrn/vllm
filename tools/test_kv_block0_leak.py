@@ -47,7 +47,7 @@ workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
 def run_attention():
     return trtllm_batch_decode_with_kv_cache_mla(
         query=q,
-        kv_cache=kv_cache.unsqueeze(1),  # [num_blocks, 1, block_size, head_dim]
+        kv_cache=kv_cache,  # [num_blocks, block_size, head_dim]
         workspace_buffer=workspace,
         qk_nope_head_dim=QK_NOPE_HEAD_DIM,
         kv_lora_rank=KV_LORA_RANK,
