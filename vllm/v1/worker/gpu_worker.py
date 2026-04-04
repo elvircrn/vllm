@@ -697,6 +697,22 @@ class Worker(WorkerBase):
         _kvc_path = f"{_kvc_log_dir}/{_kvc_hostname}_gpu{_kvc_gpu}_{_kvc_ts}.log"
         with open(_kvc_path, "w") as _kvc_f:
             _kvc_f.write(f"=== KV cache post-warmup check {_dt.datetime.now()} ===\n")
+
+            # Log slot mappings used by warmup dummy run
+            mr = self.model_runner
+            _n = min(self.scheduler_config.max_num_seqs,
+                     self.scheduler_config.max_num_batched_tokens)
+            if hasattr(mr, "kv_cache_config") and mr.kv_cache_config is not None:
+                for gid in range(len(mr.kv_cache_config.kv_cache_groups)):
+                    sm = mr.input_batch.block_table[gid].slot_mapping.gpu[:_n]
+                    line = (
+                        f"[WARMUP_SLOTS] gid={gid} unique={sm.unique().numel()} "
+                        f"min={sm.min().item()} max={sm.max().item()} "
+                        f"has_pad={int((sm == -1).any().item())}"
+                    )
+                    _kvc_f.write(line + "\n")
+                    logger.warning(line)
+
             for i, kv_cache in enumerate(self.model_runner.kv_caches):
                 if kv_cache is not None and kv_cache.numel() > 0:
                     all_zero = (kv_cache == 0).all().item()
