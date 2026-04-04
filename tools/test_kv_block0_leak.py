@@ -28,16 +28,18 @@ kv_cache = torch.zeros(NUM_BLOCKS, BLOCK_SIZE, HEAD_DIM,
 
 # Fill block 1 with known valid FP8 values (our "real" data)
 # FP8 E4M3: 0x3C = 1.0
-torch.manual_seed(42)
 kv_cache[1, :4, :] = 0x3C  # 4 tokens in block 1
 
-# Query: [batch, q_len=1, num_heads, qk_nope_head_dim + qk_rope_head_dim]
-Q_HEAD_DIM = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM  # 192
-q = torch.randn(BATCH, 1, NUM_HEADS, Q_HEAD_DIM,
+# Query: [batch, q_len=1, num_heads, head_dim=576]
+# trtllm kernel requires query head_dim == kv head_dim == kv_lora_rank + qk_rope_head_dim
+torch.manual_seed(42)
+q = torch.randn(BATCH, 1, NUM_HEADS, HEAD_DIM,
                  dtype=torch.bfloat16, device=device)
 
 # Block table: request uses block 1 only (NOT block 0)
-block_table = torch.tensor([[1]], dtype=torch.int32, device=device)
+# block_num must be multiple of 128/block_size = 4
+block_table = torch.zeros(BATCH, 4, dtype=torch.int32, device=device)
+block_table[0, 0] = 1  # first block is block 1
 seq_lens = torch.tensor([4], dtype=torch.int32, device=device)
 
 workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
