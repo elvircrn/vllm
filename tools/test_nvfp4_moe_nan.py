@@ -36,11 +36,11 @@ def make_inputs(num_tokens, hidden_scale=1.0, seed=42):
     M, K = num_tokens, HIDDEN
     N = INTERMEDIATE
 
-    # Hidden states: packed FP4 (2 values per byte)
-    # Use small random int8 values to simulate valid FP4 data
-    hidden = torch.randint(-8, 8, (M, K // 2), dtype=torch.int8, device=device)
-    # Scale: one fp8 scale per 32 elements (block size 32, 2 per byte -> 16 bytes)
-    h_scale = torch.ones(M, K // 32, dtype=torch.uint8, device=device)
+    # Hidden states: packed FP4 (2 values per byte), must be uint8
+    hidden = torch.randint(0, 256, (M, K // 2), dtype=torch.uint8, device=device)
+    # Scale: one fp8 scale per 16 logical FP4 elements
+    # hidden is [M, K//2] uint8, hidden_size = K, scale dim = K // 16
+    h_scale = torch.ones(M, K // 16, dtype=torch.uint8, device=device)
     # Set scale to a valid small FP8 value (0x3C = 1.0)
     h_scale.fill_(0x3C)
     h_scale = h_scale.view(torch.float8_e4m3fn)
@@ -50,18 +50,18 @@ def make_inputs(num_tokens, hidden_scale=1.0, seed=42):
         h_scale_f32 = h_scale.float() * hidden_scale
         h_scale = h_scale_f32.to(torch.float8_e4m3fn)
 
-    # w1 weights: [num_experts, 2*intermediate, K//2] (gate+up fused)
-    w1 = torch.randint(-8, 8, (NUM_EXPERTS, 2 * N, K // 2),
-                       dtype=torch.int8, device=device)
-    # w1 scale: [num_experts, 2*intermediate//16, K//32]
-    w1_scale = torch.full((NUM_EXPERTS, 2 * N // 16, K // 32), 0x3C,
+    # w1 weights: [num_experts, 2*intermediate, K//2] (gate+up fused), must be uint8
+    w1 = torch.randint(0, 256, (NUM_EXPERTS, 2 * N, K // 2),
+                       dtype=torch.uint8, device=device)
+    # w1 scale: [num_experts, 2*intermediate//16, K//16]
+    w1_scale = torch.full((NUM_EXPERTS, 2 * N // 16, K // 16), 0x3C,
                           dtype=torch.uint8, device=device).view(torch.float8_e4m3fn)
 
-    # w2 weights: [num_experts, K//2, intermediate]
-    w2 = torch.randint(-8, 8, (NUM_EXPERTS, K // 2, N),
-                       dtype=torch.int8, device=device)
-    # w2 scale: [num_experts, K//32, intermediate//16]
-    w2_scale = torch.full((NUM_EXPERTS, K // 32, N // 16), 0x3C,
+    # w2 weights: [num_experts, K//2, intermediate], must be uint8
+    w2 = torch.randint(0, 256, (NUM_EXPERTS, K // 2, N),
+                       dtype=torch.uint8, device=device)
+    # w2 scale: [num_experts, K//16, intermediate//16]
+    w2_scale = torch.full((NUM_EXPERTS, K // 16, N // 16), 0x3C,
                           dtype=torch.uint8, device=device).view(torch.float8_e4m3fn)
 
     # Router logits: [M, num_experts]
