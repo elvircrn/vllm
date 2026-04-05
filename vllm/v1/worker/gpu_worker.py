@@ -688,13 +688,93 @@ class Worker(WorkerBase):
         # Install NVFP4 MoE NaN test hook if enabled
         if os.environ.get("VLLM_NVFP4_NAN_TEST", "0") == "1":
             try:
-                import sys
-                sys.path.insert(0, os.path.join(
-                    os.path.dirname(__file__), "..", "..", "..", "tools"))
-                from test_nvfp4_moe_nan import install_hook
-                install_hook()
+                from vllm.model_executor.layers.fused_moe.experts.\
+                    trtllm_nvfp4_moe import TrtLlmNvFp4ExpertsMonolithic
+                import datetime as _nvdt
+
+                _orig_apply = TrtLlmNvFp4ExpertsMonolithic.apply
+                _nvfp4_done = {"ran": False}
+
+                def _nvfp4_test_apply(
+                    self, hidden_states, w1, w2, router_logits,
+                    a1q_scale, activation, global_num_experts,
+                    e_score_correction_bias=None, num_expert_group=None,
+                    apply_router_weight_on_input=False,
+                    routed_scaling_factor=None, topk_group=None,
+                ):
+                    if not _nvfp4_done["ran"]:
+                        _nvfp4_done["ran"] = True
+                        _call = lambda h: _orig_apply(
+                            self, h, w1, w2, router_logits, a1q_scale,
+                            activation, global_num_experts,
+                            e_score_correction_bias, num_expert_group,
+                            apply_router_weight_on_input,
+                            routed_scaling_factor, topk_group,
+                        )
+                        device = hidden_states.device
+                        _ld = "/mnt/lustre/vllm-vlm-elvircrn/logs/nan_check"
+                        os.makedirs(_ld, exist_ok=True)
+                        _hn = os.environ.get("HOSTNAME", "unknown")
+                        _gp = os.environ.get("CUDA_VISIBLE_DEVICES", "x")
+                        _ts = _nvdt.datetime.now().strftime("%Y%m%d_%H%M%S")
+                        _lp = f"{_ld}/nvfp4_{_hn}_gpu{_gp}_{_ts}.log"
+                        with open(_lp, "w") as _f:
+                            _f.write(f"=== NVFP4 MoE NaN test "
+                                     f"{_nvdt.datetime.now()} ===\n")
+                            _f.write(f"hidden: {hidden_states.shape} "
+                                     f"{hidden_states.dtype}\n")
+                            _f.write(f"w1: {w1.shape} w2: {w2.shape}\n")
+                            _f.write(f"a1q_scale: {a1q_scale.shape}\n\n")
+
+                            # Test real input first
+                            real_out = _call(hidden_states)
+                            _rnan = torch.isnan(real_out).any().item()
+                            _rcnt = int(torch.isnan(real_out).sum().item())
+                            _rmax = (real_out.abs().max().item()
+                                     if not _rnan else float("nan"))
+                            _f.write(f"[REAL] nan={_rnan} cnt={_rcnt} "
+                                     f"max={_rmax:.6f}\n")
+
+                            # Test patterns
+                            for nm, fn in [
+                                ("zeros", lambda: torch.zeros_like(
+                                    hidden_states)),
+                                ("0x11", lambda: torch.full_like(
+                                    hidden_states, 0x11)),
+                                ("rand0", lambda: torch.randint(
+                                    0, 256, hidden_states.shape,
+                                    dtype=hidden_states.dtype,
+                                    device=device)),
+                                ("0x77", lambda: torch.full_like(
+                                    hidden_states, 0x77)),
+                            ]:
+                                try:
+                                    torch.manual_seed(42)
+                                    o = _call(fn())
+                                    _n = torch.isnan(o).any().item()
+                                    _c = int(torch.isnan(o).sum().item())
+                                    _m = (o.abs().max().item()
+                                          if not _n else float("nan"))
+                                    _f.write(f"[{nm}] nan={_n} cnt={_c} "
+                                             f"max={_m:.6f}\n")
+                                except Exception as e:
+                                    _f.write(f"[{nm}] ERROR: {e}\n")
+                            _f.flush()
+                        logger.warning("[NVFP4_NAN_TEST] wrote %s", _lp)
+                        return real_out
+
+                    return _orig_apply(
+                        self, hidden_states, w1, w2, router_logits,
+                        a1q_scale, activation, global_num_experts,
+                        e_score_correction_bias, num_expert_group,
+                        apply_router_weight_on_input,
+                        routed_scaling_factor, topk_group,
+                    )
+
+                TrtLlmNvFp4ExpertsMonolithic.apply = _nvfp4_test_apply
+                logger.warning("[NVFP4_NAN_TEST] Hook installed")
             except Exception as e:
-                logger.warning("[NVFP4_NAN_TEST] Failed to install hook: %s", e)
+                logger.warning("[NVFP4_NAN_TEST] Failed: %s", e)
 
         # Check KV cache state after warmup to detect NaN contamination.
         # KV cache is uint8 (FP8 E4M3FN), so torch.isnan doesn't work.
