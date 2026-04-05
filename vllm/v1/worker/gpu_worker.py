@@ -685,6 +685,17 @@ class Worker(WorkerBase):
             else:
                 self.model_runner._dummy_sampler_run(hidden_states=last_hidden_states)
 
+        # Install NVFP4 MoE NaN test hook if enabled
+        if os.environ.get("VLLM_NVFP4_NAN_TEST", "0") == "1":
+            try:
+                import sys
+                sys.path.insert(0, os.path.join(
+                    os.path.dirname(__file__), "..", "..", "..", "tools"))
+                from test_nvfp4_moe_nan import install_hook
+                install_hook()
+            except Exception as e:
+                logger.warning("[NVFP4_NAN_TEST] Failed to install hook: %s", e)
+
         # Check KV cache state after warmup to detect NaN contamination.
         # KV cache is uint8 (FP8 E4M3FN), so torch.isnan doesn't work.
         # FP8 E4M3FN NaN: (byte & 0x7F) == 0x7F  (0x7F=+NaN, 0xFF=-NaN)

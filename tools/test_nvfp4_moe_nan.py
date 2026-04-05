@@ -1,262 +1,139 @@
 #!/usr/bin/env python3
 """Test whether trtllm_fp4_block_scale_moe produces NaN from valid inputs.
 
-Grabs the already-shuffled expert weights from a running vLLM process
-and runs the kernel with controlled hidden_states patterns.
+Hooks into the actual kernel call to intercept real weights and test
+with controlled hidden_states patterns.
 
-Run on a pod that is RUNNING vLLM (decode pod):
-    CUDA_VISIBLE_DEVICES=0 python tools/test_nvfp4_moe_nan.py
+Deploy on a running vLLM pod by patching the MoE expert apply method.
+Usage: set VLLM_NVFP4_NAN_TEST=1 env var and the test runs on first forward.
 """
 
-import gc
+import os
 import sys
+import datetime
 
 import torch
 
-sys.path.insert(0, "/opt/vllm-source")
+
+def _run_nan_test(
+    original_fn, self_ref, hidden_states, w1, w2,
+    router_logits, a1q_scale, activation, global_num_experts,
+    e_score_correction_bias, num_expert_group,
+    apply_router_weight_on_input, routed_scaling_factor, topk_group,
+):
+    """Intercept a real forward call, run NaN tests with the real weights,
+    then call the original function."""
+    import flashinfer.fused_moe
+
+    device = hidden_states.device
+    log_dir = "/mnt/lustre/vllm-vlm-elvircrn/logs/nan_check"
+    os.makedirs(log_dir, exist_ok=True)
+    hostname = os.environ.get("HOSTNAME", "unknown")
+    gpu = os.environ.get("CUDA_VISIBLE_DEVICES", "x")
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = f"{log_dir}/nvfp4_nan_test_{hostname}_gpu{gpu}_{ts}.log"
+
+    with open(log_path, "w") as f:
+        f.write(f"=== NVFP4 MoE NaN test {datetime.datetime.now()} ===\n")
+        f.write(f"Real hidden_states: {hidden_states.shape} {hidden_states.dtype}\n")
+        f.write(f"Real a1q_scale: {a1q_scale.shape} {a1q_scale.dtype}\n")
+        f.write(f"w1: {w1.shape} {w1.dtype}\n")
+        f.write(f"w2: {w2.shape} {w2.dtype}\n")
+        f.write(f"w1_scale: {self_ref.quant_config.w1_scale.shape}\n")
+        f.write(f"w2_scale: {self_ref.quant_config.w2_scale.shape}\n")
+        f.write(f"router_logits: {router_logits.shape}\n")
+        f.write(f"global_num_experts={global_num_experts}\n")
+        f.write(f"topk={self_ref.topk}, local_num_experts={self_ref.local_num_experts}\n")
+        f.write(f"ep_rank={self_ref.ep_rank}, intermediate={self_ref.intermediate_size_per_partition}\n\n")
+
+        M = hidden_states.shape[0]
+        K = hidden_states.shape[1] * 2  # packed FP4
+
+        # First: check the REAL hidden states
+        real_out = original_fn(
+            self_ref, hidden_states, w1, w2,
+            router_logits, a1q_scale, activation, global_num_experts,
+            e_score_correction_bias, num_expert_group,
+            apply_router_weight_on_input, routed_scaling_factor, topk_group,
+        )
+        has_nan = torch.isnan(real_out).any().item()
+        nan_count = int(torch.isnan(real_out).sum().item())
+        maxabs = real_out.abs().max().item() if not has_nan else float("nan")
+        f.write(f"[REAL] M={M} has_nan={has_nan} nan_count={nan_count} maxabs={maxabs:.6f}\n")
+
+        # Now test with controlled patterns using the SAME weights
+        for pattern_name, pattern_fn in [
+            ("zeros", lambda: torch.zeros_like(hidden_states)),
+            ("ones_0x11", lambda: torch.full_like(hidden_states, 0x11)),
+            ("random_seed0", lambda: torch.randint(0, 256, hidden_states.shape,
+                                                     dtype=hidden_states.dtype,
+                                                     device=device)),
+            ("random_seed1", lambda: (torch.manual_seed(1) and False) or
+                                      torch.randint(0, 256, hidden_states.shape,
+                                                     dtype=hidden_states.dtype,
+                                                     device=device)),
+            ("max_0x77", lambda: torch.full_like(hidden_states, 0x77)),
+        ]:
+            torch.manual_seed(42)
+            try:
+                test_hidden = pattern_fn()
+                test_out = original_fn(
+                    self_ref, test_hidden, w1, w2,
+                    router_logits, a1q_scale, activation, global_num_experts,
+                    e_score_correction_bias, num_expert_group,
+                    apply_router_weight_on_input, routed_scaling_factor, topk_group,
+                )
+                has_nan = torch.isnan(test_out).any().item()
+                has_inf = torch.isinf(test_out).any().item()
+                nan_count = int(torch.isnan(test_out).sum().item())
+                maxabs = test_out.abs().max().item() if not has_nan else float("nan")
+                f.write(f"[{pattern_name}] has_nan={has_nan} nan_count={nan_count} "
+                        f"has_inf={has_inf} maxabs={maxabs:.6f}\n")
+            except Exception as e:
+                f.write(f"[{pattern_name}] ERROR: {e}\n")
+
+        f.write(f"\n=== Test complete ===\n")
+        f.flush()
+
+    print(f"[NVFP4_NAN_TEST] Results written to {log_path}")
+
+    # Return the real output
+    return real_out
 
 
-def find_moe_experts(model):
-    """Find TrtLlmNvFp4ExpertsMonolithic instances in the model."""
+def install_hook():
+    """Monkey-patch TrtLlmNvFp4ExpertsMonolithic.apply to run NaN test once."""
     from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
         TrtLlmNvFp4ExpertsMonolithic,
     )
-    results = []
-    for name, module in model.named_modules():
-        if isinstance(module, TrtLlmNvFp4ExpertsMonolithic):
-            results.append((name, module))
-    return results
 
+    original_apply = TrtLlmNvFp4ExpertsMonolithic.apply
+    _done = {"ran": False}
 
-def extract_from_running_vllm():
-    """Extract expert weights from the running vLLM worker's model."""
-    # The vLLM worker stores the model - we need to find it
-    # Try importing from the running process's global state
-    import vllm.distributed.parallel_state as ps
-
-    # Get the model from the worker
-    # This is hacky but works for testing
-    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-
-    # Find all GPUModelRunner instances via gc
-    runners = [obj for obj in gc.get_objects()
-               if isinstance(obj, GPUModelRunner)]
-    if not runners:
-        print("No GPUModelRunner found - this must run in the vLLM process")
-        print("Trying alternative: load weights and shuffle them ourselves")
-        return None
-    runner = runners[0]
-    model = runner.model
-    experts = find_moe_experts(model)
-    print(f"Found {len(experts)} MoE expert modules")
-    return experts
-
-
-def load_and_shuffle_weights(max_experts=8):
-    """Load weights from checkpoint and shuffle them using vLLM's loader."""
-    import glob
-    import os
-
-    import safetensors.torch as st
-
-    model_path = "/mnt/local/hf_cache/hub/models--nvidia--DeepSeek-R1-0528-NVFP4-v2/snapshots"
-    snap = glob.glob(os.path.join(model_path, "*"))[0]
-    files = sorted(glob.glob(os.path.join(snap, "model*.safetensors")))
-
-    device = torch.device("cuda:0")
-    layer_idx = 3
-
-    # Load per-expert weights for one layer (limited to max_experts to avoid OOM)
-    prefix = f"model.layers.{layer_idx}.mlp.experts"
-    gate_w, gate_s, up_w, up_s, down_w, down_s = {}, {}, {}, {}, {}, {}
-    g1_is, g1_s2, g2_is, g2_s2 = {}, {}, {}, {}
-
-    for f in files:
-        with st.safe_open(f, framework="pt", device=str(device)) as sf:
-            for key in sf.keys():
-                if not key.startswith(prefix):
-                    continue
-                eidx = int(key.split(".")[5])
-                if eidx >= max_experts:
-                    continue
-                t = sf.get_tensor(key)
-                if "gate_proj.weight_scale_2" in key:
-                    g1_s2[eidx] = t
-                elif "gate_proj.weight_scale" in key:
-                    gate_s[eidx] = t
-                elif "gate_proj.weight" in key:
-                    gate_w[eidx] = t
-                elif "gate_proj.input_scale" in key:
-                    g1_is[eidx] = t
-                elif "up_proj.weight_scale_2" in key:
-                    pass
-                elif "up_proj.weight_scale" in key:
-                    up_s[eidx] = t
-                elif "up_proj.weight" in key:
-                    up_w[eidx] = t
-                elif "down_proj.weight_scale_2" in key:
-                    g2_s2[eidx] = t
-                elif "down_proj.weight_scale" in key:
-                    down_s[eidx] = t
-                elif "down_proj.weight" in key:
-                    down_w[eidx] = t
-                elif "down_proj.input_scale" in key:
-                    g2_is[eidx] = t
-
-    num_experts = len(gate_w)
-    print(f"Loaded {num_experts} experts from layer {layer_idx}")
-
-    # Fuse gate+up into w1
-    w1 = torch.stack([torch.cat([gate_w[i], up_w[i]], dim=0)
-                       for i in range(num_experts)])
-    w1_scale = torch.stack([torch.cat([gate_s[i], up_s[i]], dim=0)
-                             for i in range(num_experts)])
-    w2 = torch.stack([down_w[i] for i in range(num_experts)])
-    w2_scale = torch.stack([down_s[i] for i in range(num_experts)])
-
-    # Shuffle weights using flashinfer's utility
-    from flashinfer.fused_moe.core import (
-        ActivationType,
-        DtypeTrtllmGen,
-        Fp8QuantizationType,
-        WeightLayout,
-    )
-
-    # Try to find a shuffle function
-    try:
-        from flashinfer.fused_moe.core import shuffle_moe_weight
-        print("Found shuffle_moe_weight")
-        w1, w1_scale = shuffle_moe_weight(w1, w1_scale)
-        w2, w2_scale = shuffle_moe_weight(w2, w2_scale)
-    except ImportError:
-        # Try the MoERunner's prepare path
-        try:
-            from flashinfer.fused_moe.core import MoERunner
-            K = gate_w[0].shape[1] * 2
-            N = down_w[0].shape[1]
-            runner = MoERunner(
-                top_k=8,
-                num_local_experts=num_experts,
-                dtype_act=DtypeTrtllmGen.E2m1,
-                dtype_weights=DtypeTrtllmGen.E2m1,
-                fp8_quantization_type=Fp8QuantizationType.NoneFp8,
-                hidden_size=K,
-                intermediate_size=N,
-                activation_type=ActivationType.Swiglu.value,
-                weight_layout=WeightLayout.MajorK,
-                use_shuffled_weight=False,  # Let it shuffle for us
+    def patched_apply(self, hidden_states, w1, w2, router_logits, a1q_scale,
+                      activation, global_num_experts,
+                      e_score_correction_bias=None, num_expert_group=None,
+                      apply_router_weight_on_input=False,
+                      routed_scaling_factor=None, topk_group=None):
+        if not _done["ran"]:
+            _done["ran"] = True
+            return _run_nan_test(
+                original_apply, self, hidden_states, w1, w2,
+                router_logits, a1q_scale, activation, global_num_experts,
+                e_score_correction_bias, num_expert_group,
+                apply_router_weight_on_input, routed_scaling_factor, topk_group,
             )
-            print("Created MoERunner with use_shuffled_weight=False")
-        except Exception as e:
-            print(f"Cannot shuffle weights: {e}")
-            print("Falling back to raw weights (may fail)")
+        return original_apply(
+            self, hidden_states, w1, w2, router_logits, a1q_scale,
+            activation, global_num_experts,
+            e_score_correction_bias, num_expert_group,
+            apply_router_weight_on_input, routed_scaling_factor, topk_group,
+        )
 
-    scalar_scales = {
-        "g1_scale_c": g1_s2[0].item(),
-        "g1_alphas": g1_is[0].item(),
-        "g2_alphas": g2_is[0].item() * g2_s2[0].item(),
-    }
-
-    return w1, w1_scale, w2, w2_scale, num_experts, scalar_scales
+    TrtLlmNvFp4ExpertsMonolithic.apply = patched_apply
+    print("[NVFP4_NAN_TEST] Hook installed on TrtLlmNvFp4ExpertsMonolithic.apply")
 
 
-def run_test():
-    from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
-
-    device = torch.device("cuda:0")
-
-    w1, w1_scale, w2, w2_scale, num_experts, scales = load_and_shuffle_weights()
-    K = w1.shape[2] * 2
-    N = w2.shape[2]
-
-    print(f"K={K}, N={N}, num_experts={num_experts}")
-    print(f"w1: {w1.shape}, w1_scale: {w1_scale.shape}")
-    print(f"w2: {w2.shape}, w2_scale: {w2_scale.shape}")
-    print(f"scales: {scales}")
-
-    g1_scale = torch.tensor([scales["g1_scale_c"]], dtype=torch.float32, device=device)
-    g1_alpha = torch.tensor([scales["g1_alphas"]], dtype=torch.float32, device=device)
-    g2_alpha = torch.tensor([scales["g2_alphas"]], dtype=torch.float32, device=device)
-
-    def make_hidden(M, pattern="random", seed=42):
-        torch.manual_seed(seed)
-        if pattern == "zeros":
-            h = torch.zeros(M, K // 2, dtype=torch.uint8, device=device)
-        elif pattern == "ones":
-            h = torch.full((M, K // 2), 0x11, dtype=torch.uint8, device=device)
-        elif pattern == "max":
-            h = torch.full((M, K // 2), 0x77, dtype=torch.uint8, device=device)
-        else:
-            h = torch.randint(0, 256, (M, K // 2), dtype=torch.uint8, device=device)
-
-        h_scale = torch.full((M, K // 16), 0x3C, dtype=torch.uint8,
-                             device=device).view(torch.float8_e4m3fn)
-        router = torch.randn(M, num_experts, dtype=torch.float32, device=device)
-        return h, h_scale, router
-
-    def run_moe(hidden, h_scale, router):
-        return trtllm_fp4_block_scale_moe(
-            routing_logits=router,
-            routing_bias=None,
-            hidden_states=hidden,
-            hidden_states_scale=h_scale,
-            gemm1_weights=w1,
-            gemm1_weights_scale=w1_scale,
-            gemm1_bias=None,
-            gemm1_alpha=None,
-            gemm1_beta=None,
-            gemm1_clamp_limit=None,
-            gemm2_weights=w2,
-            gemm2_weights_scale=w2_scale,
-            gemm2_bias=None,
-            output1_scale_scalar=g1_scale,
-            output1_scale_gate_scalar=g1_alpha,
-            output2_scale_scalar=g2_alpha,
-            num_experts=num_experts,  # local experts we loaded
-            top_k=1,
-            n_group=0,
-            topk_group=0,
-            intermediate_size=N,
-            local_expert_offset=0,
-            local_num_experts=num_experts,
-            routed_scaling_factor=1.0,
-            routing_method_type=2,  # DeepSeekV3
-            do_finalize=True,
-            activation_type=3,  # SiLU/Swiglu
-        )[0]
-
-    print("\n" + "=" * 60)
-    print("NVFP4 MoE NaN test with real model weights")
-    print("=" * 60)
-
-    for M in [1, 32, 1024]:
-        for pattern in ["zeros", "ones", "random", "max"]:
-            try:
-                h, hs, r = make_hidden(M, pattern)
-                out = run_moe(h, hs, r)
-                has_nan = torch.isnan(out).any().item()
-                has_inf = torch.isinf(out).any().item()
-                nan_count = int(torch.isnan(out).sum().item())
-                maxabs = out.abs().max().item() if not has_nan else float("nan")
-                status = "FAIL" if has_nan or has_inf else "OK"
-                print(f"  M={M:4d} {pattern:6s} -> {status} nan={nan_count} "
-                      f"inf={has_inf} maxabs={maxabs:.4f}")
-            except Exception as e:
-                print(f"  M={M:4d} {pattern:6s} -> ERROR: {e}")
-
-    print("\n--- Random seeds (M=1024) ---")
-    for seed in range(20):
-        try:
-            h, hs, r = make_hidden(1024, "random", seed=seed)
-            out = run_moe(h, hs, r)
-            has_nan = torch.isnan(out).any().item()
-            nan_count = int(torch.isnan(out).sum().item())
-            maxabs = out.abs().max().item() if not has_nan else float("nan")
-            status = "FAIL" if has_nan else "OK"
-            print(f"  seed={seed:2d} -> {status} nan={nan_count} maxabs={maxabs:.4f}")
-        except Exception as e:
-            print(f"  seed={seed:2d} -> ERROR: {e}")
-
-
-if __name__ == "__main__":
-    run_test()
+# Auto-install when VLLM_NVFP4_NAN_TEST=1
+if os.environ.get("VLLM_NVFP4_NAN_TEST", "0") == "1":
+    install_hook()
