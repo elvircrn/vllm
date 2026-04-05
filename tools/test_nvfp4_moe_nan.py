@@ -52,7 +52,7 @@ def extract_from_running_vllm():
     return experts
 
 
-def load_and_shuffle_weights():
+def load_and_shuffle_weights(max_experts=8):
     """Load weights from checkpoint and shuffle them using vLLM's loader."""
     import glob
     import os
@@ -66,7 +66,7 @@ def load_and_shuffle_weights():
     device = torch.device("cuda:0")
     layer_idx = 3
 
-    # Load per-expert weights for one layer
+    # Load per-expert weights for one layer (limited to max_experts to avoid OOM)
     prefix = f"model.layers.{layer_idx}.mlp.experts"
     gate_w, gate_s, up_w, up_s, down_w, down_s = {}, {}, {}, {}, {}, {}
     g1_is, g1_s2, g2_is, g2_s2 = {}, {}, {}, {}
@@ -76,8 +76,10 @@ def load_and_shuffle_weights():
             for key in sf.keys():
                 if not key.startswith(prefix):
                     continue
-                t = sf.get_tensor(key)
                 eidx = int(key.split(".")[5])
+                if eidx >= max_experts:
+                    continue
+                t = sf.get_tensor(key)
                 if "gate_proj.weight_scale_2" in key:
                     g1_s2[eidx] = t
                 elif "gate_proj.weight_scale" in key:
@@ -210,10 +212,10 @@ def run_test():
             output1_scale_scalar=g1_scale,
             output1_scale_gate_scalar=g1_alpha,
             output2_scale_scalar=g2_alpha,
-            num_experts=num_experts,
-            top_k=8,
-            n_group=4,
-            topk_group=3,
+            num_experts=num_experts,  # local experts we loaded
+            top_k=1,
+            n_group=0,
+            topk_group=0,
             intermediate_size=N,
             local_expert_offset=0,
             local_num_experts=num_experts,
