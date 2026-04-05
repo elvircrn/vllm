@@ -17,10 +17,6 @@ import torch
 # Add vllm source to path
 sys.path.insert(0, "/opt/vllm-source")
 
-from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
-    TrtLlmNvFp4ExpertsMonolithic,
-)
-from vllm.model_executor.layers.quantization.nvfp4 import NvFp4Config
 
 
 def load_expert_weights(layer_idx=3, num_experts=8):
