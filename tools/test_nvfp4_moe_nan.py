@@ -1,139 +1,213 @@
 #!/usr/bin/env python3
 """Test whether trtllm_fp4_block_scale_moe produces NaN from valid inputs.
 
-Simulates DeepSeek R1 MoE dimensions with NVFP4 packed weights.
-Run on a GPU pod:
+Loads actual DeepSeek R1 NVFP4 expert weights from checkpoint and runs
+the kernel with controlled hidden_states patterns.
+
+Run on a GPU pod with model cached:
     python tools/test_nvfp4_moe_nan.py
 """
 
+import glob
+import os
+import sys
+
 import torch
-from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
 
-# DeepSeek R1 MoE dims (scaled down for unit test)
-# Real: hidden=7168, intermediate=2048 (per partition), 256 experts
-# Test: use fewer experts and smaller dims that are valid for the kernel
-HIDDEN = 7168
-INTERMEDIATE = 2048  # per expert
-NUM_EXPERTS = 8       # small for test
-TOP_K = 1
-N_GROUP = 1
-TOPK_GROUP = 1
-LOCAL_NUM_EXPERTS = NUM_EXPERTS
-LOCAL_EXPERT_OFFSET = 0
-ROUTED_SCALING_FACTOR = 1.0
+# Add vllm source to path
+sys.path.insert(0, "/opt/vllm-source")
 
-device = torch.device("cuda:0")
-
-def make_inputs(num_tokens, hidden_scale=1.0, seed=42):
-    """Create valid NVFP4 inputs.
-
-    hidden_states: packed int8 (2 FP4 values per byte), shape [M, K//2]
-    hidden_states_scale: fp8 per-block scale, shape [M, K//32]
-    weights: packed int8, shape [num_experts, intermediate, K//2] for w1
-    weight_scales: fp8, shape [num_experts, intermediate//16, K//32] for w1
-    """
-    torch.manual_seed(seed)
-    M, K = num_tokens, HIDDEN
-    N = INTERMEDIATE
-
-    # Hidden states: packed FP4 (2 values per byte), must be uint8
-    hidden = torch.randint(0, 256, (M, K // 2), dtype=torch.uint8, device=device)
-    # Scale: one fp8 scale per 16 logical FP4 elements
-    # hidden is [M, K//2] uint8, hidden_size = K, scale dim = K // 16
-    h_scale = torch.ones(M, K // 16, dtype=torch.uint8, device=device)
-    # Set scale to a valid small FP8 value (0x3C = 1.0)
-    h_scale.fill_(0x3C)
-    h_scale = h_scale.view(torch.float8_e4m3fn)
-
-    # Multiply hidden scale by hidden_scale factor for testing
-    if hidden_scale != 1.0:
-        h_scale_f32 = h_scale.float() * hidden_scale
-        h_scale = h_scale_f32.to(torch.float8_e4m3fn)
-
-    # w1 weights: [num_experts, 2*intermediate, K//2] (gate+up fused), must be uint8
-    w1 = torch.randint(0, 256, (NUM_EXPERTS, 2 * N, K // 2),
-                       dtype=torch.uint8, device=device)
-    # w1 scale: [num_experts, 2*intermediate//16, K//2//16]
-    # weight_scale_vec_size = (K//2) / scale_last_dim must be 16 or 32
-    w1_scale = torch.full((NUM_EXPERTS, 2 * N // 16, K // 2 // 16), 0x3C,
-                          dtype=torch.uint8, device=device).view(torch.float8_e4m3fn)
-
-    # w2 weights: [num_experts, K//2, intermediate], must be uint8
-    w2 = torch.randint(0, 256, (NUM_EXPERTS, K // 2, N),
-                       dtype=torch.uint8, device=device)
-    # w2 scale: [num_experts, K//2//16, N//16]
-    w2_scale = torch.full((NUM_EXPERTS, K // 2 // 16, N // 16), 0x3C,
-                          dtype=torch.uint8, device=device).view(torch.float8_e4m3fn)
-
-    # Router logits: [M, num_experts]
-    router = torch.randn(M, NUM_EXPERTS, dtype=torch.float32, device=device)
-
-    return hidden, h_scale, w1, w1_scale, w2, w2_scale, router
+from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
+    TrtLlmNvFp4ExpertsMonolithic,
+)
+from vllm.model_executor.layers.quantization.nvfp4 import NvFp4Config
 
 
-g1_scale = torch.tensor([1.0], dtype=torch.float32, device=device)
-g1_alpha = torch.tensor([1.0], dtype=torch.float32, device=device)
-g2_alpha = torch.tensor([1.0], dtype=torch.float32, device=device)
+def load_expert_weights(layer_idx=3, num_experts=8):
+    """Load one MoE layer's expert weights from the checkpoint."""
+    model_path = "/mnt/local/hf_cache/hub/models--nvidia--DeepSeek-R1-0528-NVFP4-v2/snapshots"
+    snap = glob.glob(os.path.join(model_path, "*"))[0]
 
-def run_moe(hidden, h_scale, w1, w1_scale, w2, w2_scale, router):
-    return trtllm_fp4_block_scale_moe(
-        routing_logits=router,
-        routing_bias=None,
-        hidden_states=hidden,
-        hidden_states_scale=h_scale,
-        gemm1_weights=w1,
-        gemm1_weights_scale=w1_scale,
-        gemm1_bias=None,
-        gemm1_alpha=None,
-        gemm1_beta=None,
-        gemm1_clamp_limit=None,
-        gemm2_weights=w2,
-        gemm2_weights_scale=w2_scale,
-        gemm2_bias=None,
-        output1_scale_scalar=g1_scale,
-        output1_scale_gate_scalar=g1_alpha,
-        output2_scale_scalar=g2_alpha,
-        num_experts=NUM_EXPERTS,
-        top_k=TOP_K,
-        n_group=N_GROUP,
-        topk_group=TOPK_GROUP,
-        intermediate_size=INTERMEDIATE,
-        local_expert_offset=LOCAL_EXPERT_OFFSET,
-        local_num_experts=LOCAL_NUM_EXPERTS,
-        routed_scaling_factor=ROUTED_SCALING_FACTOR,
-        routing_method_type=2,  # DeepSeekV3
-        do_finalize=True,
-        activation_type=3,  # SiLU
-    )[0]
+    import safetensors.torch as st
+
+    # Collect per-expert weights
+    gate_w, gate_s, up_w, up_s, down_w, down_s = [], [], [], [], [], []
+    gate_is, up_is, down_is = [], [], []
+    gate_s2, up_s2, down_s2 = [], [], []
+
+    files = sorted(glob.glob(os.path.join(snap, "model*.safetensors")))
+
+    prefix = f"model.layers.{layer_idx}.mlp.experts"
+
+    for f in files:
+        with st.safe_open(f, framework="pt", device="cuda:0") as sf:
+            keys = [k for k in sf.keys() if k.startswith(prefix)]
+            for key in keys:
+                t = sf.get_tensor(key)
+                expert_idx = int(key.split(".")[5])
+
+                if f".{expert_idx}.gate_proj.weight_scale_2" in key:
+                    gate_s2.append((expert_idx, t))
+                elif f".{expert_idx}.gate_proj.weight_scale" in key:
+                    gate_s.append((expert_idx, t))
+                elif f".{expert_idx}.gate_proj.weight" in key:
+                    gate_w.append((expert_idx, t))
+                elif f".{expert_idx}.gate_proj.input_scale" in key:
+                    gate_is.append((expert_idx, t))
+                elif f".{expert_idx}.up_proj.weight_scale_2" in key:
+                    up_s2.append((expert_idx, t))
+                elif f".{expert_idx}.up_proj.weight_scale" in key:
+                    up_s.append((expert_idx, t))
+                elif f".{expert_idx}.up_proj.weight" in key:
+                    up_w.append((expert_idx, t))
+                elif f".{expert_idx}.up_proj.input_scale" in key:
+                    up_is.append((expert_idx, t))
+                elif f".{expert_idx}.down_proj.weight_scale_2" in key:
+                    down_s2.append((expert_idx, t))
+                elif f".{expert_idx}.down_proj.weight_scale" in key:
+                    down_s.append((expert_idx, t))
+                elif f".{expert_idx}.down_proj.weight" in key:
+                    down_w.append((expert_idx, t))
+                elif f".{expert_idx}.down_proj.input_scale" in key:
+                    down_is.append((expert_idx, t))
+
+    # Sort by expert index and stack
+    gate_w = torch.stack([t for _, t in sorted(gate_w)])
+    gate_s = torch.stack([t for _, t in sorted(gate_s)])
+    up_w = torch.stack([t for _, t in sorted(up_w)])
+    up_s = torch.stack([t for _, t in sorted(up_s)])
+    down_w = torch.stack([t for _, t in sorted(down_w)])
+    down_s = torch.stack([t for _, t in sorted(down_s)])
+
+    # Fuse gate+up into w1: [E, 2*intermediate, K//2]
+    w1 = torch.cat([gate_w, up_w], dim=1)
+    w1_scale = torch.cat([gate_s, up_s], dim=1)
+
+    # w2 = down_proj: [E, K//2, intermediate] - need to check layout
+    w2 = down_w
+    w2_scale = down_s
+
+    # Get scalar scales (use first expert's values)
+    g1_input_scale = sorted(gate_is)[0][1].item() if gate_is else 1.0
+    g1_scale_2 = sorted(gate_s2)[0][1].item() if gate_s2 else 1.0
+    g2_input_scale = sorted(down_is)[0][1].item() if down_is else 1.0
+    g2_scale_2 = sorted(down_s2)[0][1].item() if down_s2 else 1.0
+
+    print(f"Loaded layer {layer_idx}: {len(gate_w)} experts")
+    print(f"  w1: {w1.shape} {w1.dtype}")
+    print(f"  w1_scale: {w1_scale.shape} {w1_scale.dtype}")
+    print(f"  w2: {w2.shape} {w2.dtype}")
+    print(f"  w2_scale: {w2_scale.shape} {w2_scale.dtype}")
+    print(f"  g1_input_scale={g1_input_scale}, g1_scale_2={g1_scale_2}")
+    print(f"  g2_input_scale={g2_input_scale}, g2_scale_2={g2_scale_2}")
+
+    return w1, w1_scale, w2, w2_scale, g1_input_scale, g1_scale_2, g2_input_scale, g2_scale_2
 
 
-print("=" * 60)
-print("NVFP4 MoE NaN test")
-print("=" * 60)
+def run_test():
+    from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
 
-for num_tokens in [1, 4, 32, 128, 1024]:
-    for scale_label, scale_val in [("1.0", 1.0), ("small", 0.01), ("large", 100.0)]:
-        hidden, h_scale, w1, w1_scale, w2, w2_scale, router = make_inputs(
-            num_tokens, hidden_scale=scale_val)
-        out = run_moe(hidden, h_scale, w1, w1_scale, w2, w2_scale, router)
-        has_nan = torch.isnan(out).any().item()
-        has_inf = torch.isinf(out).any().item()
-        nan_count = torch.isnan(out).sum().item()
-        maxabs = out.abs().max().item() if not has_nan else float('nan')
-        status = "FAIL" if has_nan or has_inf else "OK"
-        print(f"  tokens={num_tokens:4d} scale={scale_label:5s} -> "
-              f"{status} has_nan={has_nan} nan_count={nan_count} "
-              f"has_inf={has_inf} maxabs={maxabs:.4f}")
+    device = torch.device("cuda:0")
 
-# Test with actual random data patterns (like warmup would produce)
-print("\n--- Random warmup-like patterns ---")
-for seed in range(10):
-    hidden, h_scale, w1, w1_scale, w2, w2_scale, router = make_inputs(
-        1024, hidden_scale=1.0, seed=seed)
-    out = run_moe(hidden, h_scale, w1, w1_scale, w2, w2_scale, router)
-    has_nan = torch.isnan(out).any().item()
-    nan_count = torch.isnan(out).sum().item()
-    maxabs = out.abs().max().item() if not has_nan else float('nan')
-    status = "FAIL" if has_nan else "OK"
-    print(f"  seed={seed} -> {status} has_nan={has_nan} nan_count={nan_count} "
-          f"maxabs={maxabs:.4f}")
+    # Load real weights
+    w1, w1_scale, w2, w2_scale, g1_is, g1_s2, g2_is, g2_s2 = load_expert_weights()
+    num_experts = w1.shape[0]
+    K = w1.shape[2] * 2  # packed, so real hidden = K//2 * 2
+    N = w2.shape[2]  # intermediate size
+
+    print(f"\nK={K}, N={N}, num_experts={num_experts}")
+
+    g1_scale = torch.tensor([g1_s2], dtype=torch.float32, device=device)
+    g1_alpha = torch.tensor([g1_is], dtype=torch.float32, device=device)
+    g2_alpha = torch.tensor([g2_is * g2_s2], dtype=torch.float32, device=device)
+
+    def make_hidden(M, pattern="random", seed=42):
+        torch.manual_seed(seed)
+        if pattern == "random":
+            h = torch.randint(0, 256, (M, K // 2), dtype=torch.uint8, device=device)
+        elif pattern == "zeros":
+            h = torch.zeros(M, K // 2, dtype=torch.uint8, device=device)
+        elif pattern == "ones":
+            h = torch.full((M, K // 2), 0x11, dtype=torch.uint8, device=device)
+        elif pattern == "max":
+            # Max FP4 value in both nibbles
+            h = torch.full((M, K // 2), 0x77, dtype=torch.uint8, device=device)
+        else:
+            h = torch.randint(0, 256, (M, K // 2), dtype=torch.uint8, device=device)
+
+        # Scale: one fp8 per block of 16 FP4 values
+        h_scale = torch.full((M, K // 16), 0x3C, dtype=torch.uint8,
+                             device=device).view(torch.float8_e4m3fn)
+        router = torch.randn(M, num_experts, dtype=torch.float32, device=device)
+        return h, h_scale, router
+
+    def run_moe(hidden, h_scale, router):
+        return trtllm_fp4_block_scale_moe(
+            routing_logits=router,
+            routing_bias=None,
+            hidden_states=hidden,
+            hidden_states_scale=h_scale,
+            gemm1_weights=w1,
+            gemm1_weights_scale=w1_scale,
+            gemm1_bias=None,
+            gemm1_alpha=None,
+            gemm1_beta=None,
+            gemm1_clamp_limit=None,
+            gemm2_weights=w2,
+            gemm2_weights_scale=w2_scale,
+            gemm2_bias=None,
+            output1_scale_scalar=g1_scale,
+            output1_scale_gate_scalar=g1_alpha,
+            output2_scale_scalar=g2_alpha,
+            num_experts=num_experts,
+            top_k=8,
+            n_group=4,
+            topk_group=3,
+            intermediate_size=N,
+            local_expert_offset=0,
+            local_num_experts=num_experts,
+            routed_scaling_factor=1.0,
+            routing_method_type=2,  # DeepSeekV3
+            do_finalize=True,
+            activation_type=3,  # SiLU
+        )[0]
+
+    print("\n" + "=" * 60)
+    print("NVFP4 MoE NaN test with real model weights")
+    print("=" * 60)
+
+    for M in [1, 4, 32, 128, 1024]:
+        for pattern in ["zeros", "ones", "random", "max"]:
+            try:
+                h, hs, r = make_hidden(M, pattern)
+                out = run_moe(h, hs, r)
+                has_nan = torch.isnan(out).any().item()
+                has_inf = torch.isinf(out).any().item()
+                nan_count = int(torch.isnan(out).sum().item())
+                maxabs = out.abs().max().item() if not has_nan else float("nan")
+                status = "FAIL" if has_nan or has_inf else "OK"
+                print(f"  M={M:4d} pattern={pattern:6s} -> {status} "
+                      f"has_nan={has_nan} nan_count={nan_count} "
+                      f"has_inf={has_inf} maxabs={maxabs:.4f}")
+            except Exception as e:
+                print(f"  M={M:4d} pattern={pattern:6s} -> ERROR: {e}")
+
+    # Test with multiple random seeds
+    print("\n--- Random seeds (M=1024) ---")
+    for seed in range(20):
+        try:
+            h, hs, r = make_hidden(1024, "random", seed=seed)
+            out = run_moe(h, hs, r)
+            has_nan = torch.isnan(out).any().item()
+            nan_count = int(torch.isnan(out).sum().item())
+            nan_frac = nan_count / out.numel()
+            maxabs = out.abs().max().item() if not has_nan else float("nan")
+            status = "FAIL" if has_nan else "OK"
+            print(f"  seed={seed:2d} -> {status} has_nan={has_nan} "
+                  f"nan_count={nan_count} ({nan_frac:.4%}) maxabs={maxabs:.4f}")
+        except Exception as e:
+            print(f"  seed={seed:2d} -> ERROR: {e}")
+
+
+if __name__ == "__main__":
+    run_test()
