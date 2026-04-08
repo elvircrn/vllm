@@ -744,10 +744,44 @@ class Worker(WorkerBase):
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         return self.model_runner.sample_tokens(grammar_output)
 
+    _kv_cache_pre_first_request_checked: bool = False
+
     @torch.inference_mode()
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        # One-shot full KV cache scan right before the first real request.
+        if not Worker._kv_cache_pre_first_request_checked:
+            Worker._kv_cache_pre_first_request_checked = True
+            import logging as _logging
+            _kv_log = _logging.getLogger("vllm.kv_cache_check")
+            for i, kv_cache in enumerate(self.model_runner.kv_caches):
+                if kv_cache is None or kv_cache.numel() == 0:
+                    continue
+                all_zero = (kv_cache == 0).all().item()
+                if kv_cache.dtype == torch.uint8:
+                    fp8_nan_mask = (kv_cache & 0x7F) == 0x7F
+                    has_nan = fp8_nan_mask.any().item()
+                    nan_count = int(fp8_nan_mask.sum().item())
+                else:
+                    has_nan = torch.isnan(kv_cache).any().item()
+                    nan_count = int(torch.isnan(kv_cache).sum().item())
+                has_inf = (
+                    torch.isinf(kv_cache).any().item()
+                    if kv_cache.dtype != torch.uint8 else False
+                )
+                nonzero_count = (
+                    int(kv_cache.nonzero().shape[0]) if not all_zero else 0
+                )
+                _kv_log.warning(
+                    "[KV_CACHE_PRE_FIRST_REQUEST] cache_idx=%d "
+                    "shape=%s dtype=%s "
+                    "all_zero=%s has_nan=%s nan_count=%d "
+                    "has_inf=%s nonzero_count=%d",
+                    i, list(kv_cache.shape), kv_cache.dtype,
+                    all_zero, has_nan, nan_count, has_inf, nonzero_count,
+                )
+
         # ensure any previous non-blocking PP sends are complete
         if self._pp_send_work:
             for handle in self._pp_send_work:
