@@ -849,8 +849,6 @@ class GPUModelRunner(
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
-        # Batch geometry stashed for NaN diagnostics.
-        self._last_batch_info: dict | None = None
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
         self.layerwise_nvtx_hooks_registered = False
@@ -4102,19 +4100,6 @@ class GPUModelRunner(
             slot_mappings,
         )
         self.kv_connector_output = kv_connector_output
-        # Stash batch geometry + diagnostics for NaN checks (survives
-        # execute_model_state being cleared by _dummy_run).
-        self._last_batch_info = {
-            "num_tokens": num_tokens_unpadded,
-            "num_tokens_padded": num_tokens_padded,
-            "num_reqs": num_reqs,
-            "num_reqs_padded": num_reqs_padded,
-            "num_tokens_across_dp": (
-                num_tokens_across_dp.tolist()
-                if num_tokens_across_dp is not None else None
-            ),
-            "slot_mappings": slot_mappings,
-        }
 
         # Now the batch has been launched we can wait for corrections from the
         # previous model forward without breaking async scheduling.

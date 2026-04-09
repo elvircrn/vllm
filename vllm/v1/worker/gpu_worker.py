@@ -761,7 +761,6 @@ class Worker(WorkerBase):
 
         dp_rank = self.vllm_config.parallel_config.data_parallel_rank
         dp_size = self.vllm_config.parallel_config.data_parallel_size
-        batch_info = getattr(self.model_runner, "_last_batch_info", None)
 
         for i, kv_cache in enumerate(self.model_runner.kv_caches):
             if kv_cache is None or kv_cache.numel() == 0:
@@ -808,7 +807,7 @@ class Worker(WorkerBase):
                 nan_mask_full[first_block_id, :, kv_c_dim:].sum().item())
 
             # --- Slot mapping sample ---
-            slot_info = self._get_slot_mapping_info(batch_info)
+            slot_info = self._get_slot_mapping_info()
 
             self._kv_nan_logger.warning(
                 "[KV_CACHE_NAN] tag=%s step=%d cache_idx=%d "
@@ -818,9 +817,7 @@ class Worker(WorkerBase):
                 "kv_c_nans=%d k_pe_nans=%d (dim %d+%d) "
                 "first_nan_step=%d is_first=%s "
                 "dp_rank=%d/%d "
-                "slot_mapping=%s "
-                "batch={toks=%d pad=%d reqs=%d reqs_pad=%d "
-                "across_dp=%s}",
+                "slot_mapping=%s",
                 tag, self._kv_nan_step, i,
                 list(kv_cache.shape), kv_cache.dtype,
                 nan_count, kv_cache.numel(),
@@ -832,36 +829,18 @@ class Worker(WorkerBase):
                 Worker._kv_nan_first_step[i], is_first,
                 dp_rank, dp_size,
                 slot_info,
-                batch_info.get("num_tokens", -1) if batch_info else -1,
-                batch_info.get("num_tokens_padded", -1) if batch_info else -1,
-                batch_info.get("num_reqs", -1) if batch_info else -1,
-                batch_info.get("num_reqs_padded", -1) if batch_info else -1,
-                batch_info.get("num_tokens_across_dp") if batch_info
-                else "no_batch",
             )
 
-    @staticmethod
-    def _get_slot_mapping_info(batch_info: dict | None) -> str:
-        if not batch_info:
-            return "no_batch"
-        sm = batch_info.get("slot_mappings_by_layer") or \
-             batch_info.get("slot_mappings")
-        if sm is None:
-            return "none"
-        if isinstance(sm, dict):
-            first_sm = next(iter(sm.values()), None)
-        elif isinstance(sm, list) and sm:
-            first_sm = next(iter(sm[0].values()), None) \
-                if isinstance(sm[0], dict) else sm[0]
-        else:
-            first_sm = sm
-        if first_sm is None or not isinstance(first_sm, torch.Tensor):
-            return "empty"
-        unique = first_sm.unique()
+    def _get_slot_mapping_info(self) -> str:
+        bt = getattr(self.model_runner, "block_tables", None)
+        if bt is None:
+            return "no_block_tables"
+        sm = bt.slot_mappings  # [num_groups, max_batched_tokens]
+        unique = sm.unique()
         if unique.numel() <= 20:
             return str([int(v) for v in unique.tolist()])
-        return (f"min={int(first_sm.min())} max={int(first_sm.max())} "
-                f"neg={int((first_sm < 0).sum())}/{first_sm.numel()}")
+        return (f"min={int(sm.min())} max={int(sm.max())} "
+                f"neg={int((sm < 0).sum())}/{sm.numel()}")
 
 
     @torch.inference_mode()
