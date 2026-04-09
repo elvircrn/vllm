@@ -832,10 +832,25 @@ class Worker(WorkerBase):
             )
 
     def _get_slot_mapping_info(self) -> str:
+        # V2: self.model_runner.block_tables.slot_mappings
         bt = getattr(self.model_runner, "block_tables", None)
-        if bt is None:
-            return "no_block_tables"
-        sm = bt.slot_mappings  # [num_groups, max_batched_tokens]
+        if bt is not None:
+            sm = bt.slot_mappings
+            return self._summarize_slot_mapping(sm)
+        # V1: self.model_runner.input_batch.block_table[0].slot_mapping.gpu
+        ib = getattr(self.model_runner, "input_batch", None)
+        if ib is not None:
+            mbt = getattr(ib, "block_table", None)
+            if mbt is not None:
+                try:
+                    sm = mbt[0].slot_mapping.gpu
+                    return self._summarize_slot_mapping(sm)
+                except (IndexError, AttributeError):
+                    pass
+        return "n/a"
+
+    @staticmethod
+    def _summarize_slot_mapping(sm: torch.Tensor) -> str:
         unique = sm.unique()
         if unique.numel() <= 20:
             return str([int(v) for v in unique.tolist()])
