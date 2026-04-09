@@ -748,7 +748,7 @@ class Worker(WorkerBase):
     _kv_nan_step: int = 0
     _kv_nan_enabled: bool | None = None
 
-    def _check_kv_cache_nan(self, tag: str) -> None:
+    def _check_kv_cache_nan(self, tag: str, num_tokens: int = 0) -> None:
         """Scan KV caches for NaN; only log when NaN is found."""
         if self._kv_nan_enabled is None:
             Worker._kv_nan_enabled = envs.VLLM_COMPUTE_NANS_IN_LOGITS
@@ -757,26 +757,52 @@ class Worker(WorkerBase):
         if self._kv_nan_logger is None:
             import logging as _logging
             Worker._kv_nan_logger = _logging.getLogger("vllm.kv_cache_check")
+
+        dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+        dp_size = self.vllm_config.parallel_config.data_parallel_size
+
         for i, kv_cache in enumerate(self.model_runner.kv_caches):
             if kv_cache is None or kv_cache.numel() == 0:
                 continue
+            # kv_cache shape: [num_blocks, 2, block_size, num_heads, head_dim]
+            # or [num_blocks, num_heads, head_dim] depending on layout
             if kv_cache.dtype == torch.uint8:
                 fp8_nan_mask = (kv_cache & 0x7F) == 0x7F
                 has_nan = fp8_nan_mask.any().item()
                 if not has_nan:
                     continue
                 nan_count = int(fp8_nan_mask.sum().item())
+                # Find which blocks have NaN
+                # Flatten to [num_blocks, -1] to get per-block NaN counts
+                flat = fp8_nan_mask.reshape(kv_cache.shape[0], -1)
+                block_nan_counts = flat.sum(dim=1)
             else:
-                has_nan = torch.isnan(kv_cache).any().item()
+                nan_mask = torch.isnan(kv_cache)
+                has_nan = nan_mask.any().item()
                 if not has_nan:
                     continue
-                nan_count = int(torch.isnan(kv_cache).sum().item())
+                nan_count = int(nan_mask.sum().item())
+                flat = nan_mask.reshape(kv_cache.shape[0], -1)
+                block_nan_counts = flat.sum(dim=1)
+
+            nan_blocks = block_nan_counts.nonzero(as_tuple=True)[0]
+            num_nan_blocks = int(nan_blocks.numel())
+            # Sample up to 10 block indices + their NaN counts
+            sample_n = min(10, num_nan_blocks)
+            sample_blocks = nan_blocks[:sample_n].tolist()
+            sample_counts = block_nan_counts[nan_blocks[:sample_n]].tolist()
+
             self._kv_nan_logger.warning(
                 "[KV_CACHE_NAN] tag=%s step=%d cache_idx=%d "
-                "shape=%s dtype=%s nan_count=%d total=%d",
+                "shape=%s dtype=%s nan_count=%d total=%d "
+                "nan_blocks=%d/%d sample_block_ids=%s sample_block_nans=%s "
+                "dp_rank=%d dp_size=%d num_tokens=%d",
                 tag, self._kv_nan_step, i,
                 list(kv_cache.shape), kv_cache.dtype,
                 nan_count, kv_cache.numel(),
+                num_nan_blocks, kv_cache.shape[0],
+                sample_blocks, sample_counts,
+                dp_rank, dp_size, num_tokens,
             )
 
     @torch.inference_mode()
@@ -928,9 +954,9 @@ class Worker(WorkerBase):
 
     def execute_dummy_batch(self) -> None:
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
-        self._check_kv_cache_nan("pre_dummy")
+        self._check_kv_cache_nan("pre_dummy", num_tokens=num_tokens)
         self.model_runner._dummy_run(num_tokens, uniform_decode=True)
-        self._check_kv_cache_nan("post_dummy")
+        self._check_kv_cache_nan("post_dummy", num_tokens=num_tokens)
         Worker._kv_nan_step += 1
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
