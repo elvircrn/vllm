@@ -4100,6 +4100,18 @@ class GPUModelRunner(
             slot_mappings,
         )
         self.kv_connector_output = kv_connector_output
+        # Stash lightweight batch geometry for NaN diagnostics (survives
+        # execute_model_state being cleared by _dummy_run).
+        self._last_batch_info = {
+            "num_tokens": num_tokens_unpadded,
+            "num_tokens_padded": num_tokens_padded,
+            "num_reqs": num_reqs,
+            "num_reqs_padded": num_reqs_padded,
+            "num_tokens_across_dp": (
+                num_tokens_across_dp.tolist()
+                if num_tokens_across_dp is not None else None
+            ),
+        }
 
         # Now the batch has been launched we can wait for corrections from the
         # previous model forward without breaking async scheduling.

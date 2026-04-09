@@ -1106,6 +1106,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kv_connector_output=kv_connector_output,
             num_tokens_across_dp=num_tokens_across_dp,
         )
+        # Stash lightweight batch geometry for NaN diagnostics (survives
+        # execute_model_state being cleared by _dummy_run).
+        self._last_batch_info = {
+            "num_tokens": input_batch.num_tokens,
+            "num_tokens_padded": input_batch.num_tokens_after_padding,
+            "num_reqs": input_batch.num_reqs,
+            "num_reqs_padded": input_batch.num_reqs_after_padding,
+            "num_tokens_across_dp": (
+                num_tokens_across_dp.tolist()
+                if num_tokens_across_dp is not None else None
+            ),
+        }
 
         if not self.is_last_pp_rank:
             # Non-last PP rank: return IntermediateTensors for sending.
