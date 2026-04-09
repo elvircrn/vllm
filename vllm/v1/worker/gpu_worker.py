@@ -744,44 +744,45 @@ class Worker(WorkerBase):
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         return self.model_runner.sample_tokens(grammar_output)
 
-    _kv_cache_pre_first_request_checked: bool = False
+    _kv_nan_logger = None
+    _kv_nan_step: int = 0
+    _kv_nan_enabled: bool | None = None
+
+    def _check_kv_cache_nan(self, tag: str) -> None:
+        """Scan KV caches for NaN; only log when NaN is found."""
+        if self._kv_nan_enabled is None:
+            Worker._kv_nan_enabled = envs.VLLM_COMPUTE_NANS_IN_LOGITS
+        if not self._kv_nan_enabled:
+            return
+        if self._kv_nan_logger is None:
+            import logging as _logging
+            Worker._kv_nan_logger = _logging.getLogger("vllm.kv_cache_check")
+        for i, kv_cache in enumerate(self.model_runner.kv_caches):
+            if kv_cache is None or kv_cache.numel() == 0:
+                continue
+            if kv_cache.dtype == torch.uint8:
+                fp8_nan_mask = (kv_cache & 0x7F) == 0x7F
+                has_nan = fp8_nan_mask.any().item()
+                if not has_nan:
+                    continue
+                nan_count = int(fp8_nan_mask.sum().item())
+            else:
+                has_nan = torch.isnan(kv_cache).any().item()
+                if not has_nan:
+                    continue
+                nan_count = int(torch.isnan(kv_cache).sum().item())
+            self._kv_nan_logger.warning(
+                "[KV_CACHE_NAN] tag=%s step=%d cache_idx=%d "
+                "shape=%s dtype=%s nan_count=%d total=%d",
+                tag, self._kv_nan_step, i,
+                list(kv_cache.shape), kv_cache.dtype,
+                nan_count, kv_cache.numel(),
+            )
 
     @torch.inference_mode()
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
-        # One-shot full KV cache scan right before the first real request.
-        if not Worker._kv_cache_pre_first_request_checked:
-            Worker._kv_cache_pre_first_request_checked = True
-            import logging as _logging
-            _kv_log = _logging.getLogger("vllm.kv_cache_check")
-            for i, kv_cache in enumerate(self.model_runner.kv_caches):
-                if kv_cache is None or kv_cache.numel() == 0:
-                    continue
-                all_zero = (kv_cache == 0).all().item()
-                if kv_cache.dtype == torch.uint8:
-                    fp8_nan_mask = (kv_cache & 0x7F) == 0x7F
-                    has_nan = fp8_nan_mask.any().item()
-                    nan_count = int(fp8_nan_mask.sum().item())
-                else:
-                    has_nan = torch.isnan(kv_cache).any().item()
-                    nan_count = int(torch.isnan(kv_cache).sum().item())
-                has_inf = (
-                    torch.isinf(kv_cache).any().item()
-                    if kv_cache.dtype != torch.uint8 else False
-                )
-                nonzero_count = (
-                    int(kv_cache.nonzero().shape[0]) if not all_zero else 0
-                )
-                _kv_log.warning(
-                    "[KV_CACHE_PRE_FIRST_REQUEST] cache_idx=%d "
-                    "shape=%s dtype=%s "
-                    "all_zero=%s has_nan=%s nan_count=%d "
-                    "has_inf=%s nonzero_count=%d",
-                    i, list(kv_cache.shape), kv_cache.dtype,
-                    all_zero, has_nan, nan_count, has_inf, nonzero_count,
-                )
-
         # ensure any previous non-blocking PP sends are complete
         if self._pp_send_work:
             for handle in self._pp_send_work:
@@ -927,7 +928,10 @@ class Worker(WorkerBase):
 
     def execute_dummy_batch(self) -> None:
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
+        self._check_kv_cache_nan("pre_dummy")
         self.model_runner._dummy_run(num_tokens, uniform_decode=True)
+        self._check_kv_cache_nan("post_dummy")
+        Worker._kv_nan_step += 1
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)
