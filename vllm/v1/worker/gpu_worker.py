@@ -747,6 +747,7 @@ class Worker(WorkerBase):
     _kv_nan_logger = None
     _kv_nan_step: int = 0
     _kv_nan_enabled: bool | None = None
+    _kv_nan_first_step: dict[int, int] = {}  # cache_idx -> first step with NaN
 
     def _check_kv_cache_nan(self, tag: str) -> None:
         """Scan KV caches for NaN; only log when NaN is found."""
@@ -760,57 +761,108 @@ class Worker(WorkerBase):
 
         dp_rank = self.vllm_config.parallel_config.data_parallel_rank
         dp_size = self.vllm_config.parallel_config.data_parallel_size
-
-        # Batch geometry from model runner (set during execute_model,
-        # survives _dummy_run clearing execute_model_state).
         batch_info = getattr(self.model_runner, "_last_batch_info", None)
 
         for i, kv_cache in enumerate(self.model_runner.kv_caches):
             if kv_cache is None or kv_cache.numel() == 0:
                 continue
-            if kv_cache.dtype == torch.uint8:
-                fp8_nan_mask = (kv_cache & 0x7F) == 0x7F
-                has_nan = fp8_nan_mask.any().item()
-                if not has_nan:
-                    continue
-                nan_count = int(fp8_nan_mask.sum().item())
-                flat = fp8_nan_mask.reshape(kv_cache.shape[0], -1)
-                block_nan_counts = flat.sum(dim=1)
-            else:
-                nan_mask = torch.isnan(kv_cache)
-                has_nan = nan_mask.any().item()
-                if not has_nan:
-                    continue
-                nan_count = int(nan_mask.sum().item())
-                flat = nan_mask.reshape(kv_cache.shape[0], -1)
-                block_nan_counts = flat.sum(dim=1)
 
+            # --- Detect NaN ---
+            if kv_cache.dtype == torch.uint8:
+                nan_mask_full = (kv_cache & 0x7F) == 0x7F
+            else:
+                nan_mask_full = torch.isnan(kv_cache)
+            if not nan_mask_full.any().item():
+                continue
+            nan_count = int(nan_mask_full.sum().item())
+
+            # --- First occurrence tracking ---
+            is_first = i not in Worker._kv_nan_first_step
+            if is_first:
+                Worker._kv_nan_first_step[i] = self._kv_nan_step
+
+            # --- Per-block breakdown ---
+            flat = nan_mask_full.reshape(kv_cache.shape[0], -1)
+            block_nan_counts = flat.sum(dim=1)
             nan_blocks = block_nan_counts.nonzero(as_tuple=True)[0]
             num_nan_blocks = int(nan_blocks.numel())
             sample_n = min(10, num_nan_blocks)
             sample_blocks = nan_blocks[:sample_n].tolist()
             sample_counts = block_nan_counts[nan_blocks[:sample_n]].tolist()
 
+            # --- Per-slot breakdown within first NaN block ---
+            first_block_id = nan_blocks[0].item()
+            block_data = nan_mask_full[first_block_id]  # [block_size, entry_dim]
+            slot_nan_counts = block_data.sum(dim=-1)  # [block_size]
+            nan_slots = slot_nan_counts.nonzero(
+                as_tuple=True)[0].tolist()[:10]
+            nan_slot_counts = slot_nan_counts[
+                slot_nan_counts > 0].tolist()[:10]
+
+            # --- KV component breakdown (kv_c vs k_pe for MLA) ---
+            entry_dim = kv_cache.shape[-1]
+            kv_c_dim = entry_dim - 64 if entry_dim > 64 else entry_dim
+            nan_in_kvc = int(
+                nan_mask_full[first_block_id, :, :kv_c_dim].sum().item())
+            nan_in_kpe = int(
+                nan_mask_full[first_block_id, :, kv_c_dim:].sum().item())
+
+            # --- Slot mapping sample ---
+            slot_info = self._get_slot_mapping_info(batch_info)
+
             self._kv_nan_logger.warning(
                 "[KV_CACHE_NAN] tag=%s step=%d cache_idx=%d "
-                "shape=%s dtype=%s nan_count=%d total=%d "
-                "nan_blocks=%d/%d sample_block_ids=%s sample_block_nans=%s "
-                "dp_rank=%d dp_size=%d "
-                "batch={num_tokens=%s num_tokens_padded=%s "
-                "num_reqs=%s num_reqs_padded=%s "
-                "tokens_across_dp=%s}",
+                "shape=%s dtype=%s nan_count=%d/%d "
+                "nan_blocks=%d/%d blocks=%s block_nans=%s "
+                "block[%d]_slots=%s block[%d]_slot_nans=%s "
+                "kv_c_nans=%d k_pe_nans=%d (dim %d+%d) "
+                "first_nan_step=%d is_first=%s "
+                "dp_rank=%d/%d "
+                "slot_mapping=%s "
+                "batch={toks=%d pad=%d reqs=%d reqs_pad=%d "
+                "across_dp=%s}",
                 tag, self._kv_nan_step, i,
                 list(kv_cache.shape), kv_cache.dtype,
                 nan_count, kv_cache.numel(),
                 num_nan_blocks, kv_cache.shape[0],
                 sample_blocks, sample_counts,
+                first_block_id, nan_slots,
+                first_block_id, nan_slot_counts,
+                nan_in_kvc, nan_in_kpe, kv_c_dim, entry_dim - kv_c_dim,
+                Worker._kv_nan_first_step[i], is_first,
                 dp_rank, dp_size,
-                batch_info.get("num_tokens") if batch_info else None,
-                batch_info.get("num_tokens_padded") if batch_info else None,
-                batch_info.get("num_reqs") if batch_info else None,
-                batch_info.get("num_reqs_padded") if batch_info else None,
-                batch_info.get("num_tokens_across_dp") if batch_info else None,
+                slot_info,
+                batch_info.get("num_tokens", -1) if batch_info else -1,
+                batch_info.get("num_tokens_padded", -1) if batch_info else -1,
+                batch_info.get("num_reqs", -1) if batch_info else -1,
+                batch_info.get("num_reqs_padded", -1) if batch_info else -1,
+                batch_info.get("num_tokens_across_dp") if batch_info
+                else "no_batch",
             )
+
+    @staticmethod
+    def _get_slot_mapping_info(batch_info: dict | None) -> str:
+        if not batch_info:
+            return "no_batch"
+        sm = batch_info.get("slot_mappings_by_layer") or \
+             batch_info.get("slot_mappings")
+        if sm is None:
+            return "none"
+        if isinstance(sm, dict):
+            first_sm = next(iter(sm.values()), None)
+        elif isinstance(sm, list) and sm:
+            first_sm = next(iter(sm[0].values()), None) \
+                if isinstance(sm[0], dict) else sm[0]
+        else:
+            first_sm = sm
+        if first_sm is None or not isinstance(first_sm, torch.Tensor):
+            return "empty"
+        unique = first_sm.unique()
+        if unique.numel() <= 20:
+            return str([int(v) for v in unique.tolist()])
+        return (f"min={int(first_sm.min())} max={int(first_sm.max())} "
+                f"neg={int((first_sm < 0).sum())}/{first_sm.numel()}")
+
 
     @torch.inference_mode()
     def execute_model(

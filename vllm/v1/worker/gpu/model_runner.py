@@ -239,6 +239,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # For transferring state from execute_model to subsequent sample_tokens call.
         self.execute_model_state: ExecuteModelState | None = None
+        # Batch geometry stashed for NaN diagnostics.
+        self._last_batch_info: dict | None = None
 
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
@@ -965,6 +967,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
+            self._last_batch_info = {
+                "num_tokens": num_toks,
+                "num_tokens_padded": 0,
+                "num_reqs": num_reqs,
+                "num_reqs_padded": 0,
+                "num_tokens_across_dp": (
+                    num_tokens_across_dp.tolist()
+                    if num_tokens_across_dp is not None else None
+                ),
+                "slot_mappings_by_layer": None,
+            }
             empty_output = self.kv_connector.no_forward(scheduler_output)
             return empty_output
 
@@ -1106,7 +1119,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kv_connector_output=kv_connector_output,
             num_tokens_across_dp=num_tokens_across_dp,
         )
-        # Stash lightweight batch geometry for NaN diagnostics (survives
+        # Stash batch geometry + diagnostics for NaN checks (survives
         # execute_model_state being cleared by _dummy_run).
         self._last_batch_info = {
             "num_tokens": input_batch.num_tokens,
@@ -1117,6 +1130,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_tokens_across_dp.tolist()
                 if num_tokens_across_dp is not None else None
             ),
+            "slot_mappings_by_layer": slot_mappings_by_layer,
         }
 
         if not self.is_last_pp_rank:
