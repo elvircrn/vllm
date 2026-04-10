@@ -213,6 +213,8 @@ class SchedulerStats:
     nan_in_embedding: bool = False
     nan_first_layer_hidden: int = -1
     nan_first_layer_residual: int = -1
+    nan_real_output: bool = False
+    nan_padded_output: bool = False
     nan_phase: str | None = None  # "prefill", "decode", or "mixed"
 
 

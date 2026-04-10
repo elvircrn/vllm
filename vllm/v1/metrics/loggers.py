@@ -170,6 +170,10 @@ class LoggingStatLogger(StatLoggerBase):
                 sources.append("lm_head")
             if scheduler_stats.nan_in_logits:
                 sources.append("logits")
+            if scheduler_stats.nan_real_output:
+                sources.append("REAL_OUTPUT")
+            if scheduler_stats.nan_padded_output:
+                sources.append("padded_output")
             if sources:
                 layer_info = ""
                 if scheduler_stats.nan_first_layer_hidden >= 0:
@@ -564,7 +568,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                           "input_ln", "qkv_proj", "o_proj",
                           "post_attn_ln",
                           "pre_norm_hidden", "pre_norm_residual",
-                          "embedding"):
+                          "embedding",
+                          "real_output", "padded_output"):
                 for phase in ("prefill", "decode", "mixed"):
                     self.counter_nan_occurrences[(source, phase)] = {
                         idx: counter_nan_occurrences.labels(
@@ -1219,6 +1224,12 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 if scheduler_stats.nan_in_embedding:
                     self.counter_nan_occurrences[
                         ("embedding", phase)][engine_idx].inc()
+                if scheduler_stats.nan_real_output:
+                    self.counter_nan_occurrences[
+                        ("real_output", phase)][engine_idx].inc()
+                if scheduler_stats.nan_padded_output:
+                    self.counter_nan_occurrences[
+                        ("padded_output", phase)][engine_idx].inc()
                 self.gauge_nan_first_layer_hidden[engine_idx].set(
                     scheduler_stats.nan_first_layer_hidden)
                 self.gauge_nan_first_layer_residual[engine_idx].set(

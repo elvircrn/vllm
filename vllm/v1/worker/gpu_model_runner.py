@@ -4383,13 +4383,27 @@ class GPUModelRunner(
                 spec_decode_metadata,
             )
 
-        # Check sample_hidden_states for NaN (after final RMSNorm, before
-        # lm_head). This runs outside CUDA graphs so no custom op needed.
+        # Check model output for NaN, split by real vs padded tokens.
+        # This runs outside CUDA graphs so no custom op needed.
         nan_in_hidden_states = False
-        if envs.VLLM_COMPUTE_NANS_IN_LOGITS and sample_hidden_states is not None:
-            nan_in_hidden_states = bool(
-                torch.any(torch.isnan(sample_hidden_states)).item()
+        nan_real_output = False
+        nan_padded_output = False
+        if envs.VLLM_COMPUTE_NANS_IN_LOGITS and hidden_states is not None:
+            num_real = scheduler_output.total_num_scheduled_tokens
+            num_total = hidden_states.shape[0]
+            if sample_hidden_states is not None:
+                nan_in_hidden_states = bool(
+                    torch.any(torch.isnan(sample_hidden_states)).item()
+                )
+            nan_real_output = bool(
+                torch.any(torch.isnan(hidden_states[:num_real])).item()
             )
+            if num_real < num_total:
+                nan_padded_output = bool(
+                    torch.any(
+                        torch.isnan(hidden_states[num_real:num_total])
+                    ).item()
+                )
 
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
@@ -4440,6 +4454,8 @@ class GPUModelRunner(
                 nan_in_embedding=nan_in_embedding,
                 nan_first_layer_hidden=nan_first_layer_hidden,
                 nan_first_layer_residual=nan_first_layer_residual,
+                nan_real_output=nan_real_output,
+                nan_padded_output=nan_padded_output,
                 cudagraph_stats=cudagraph_stats,
             )
 

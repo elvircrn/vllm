@@ -1322,6 +1322,8 @@ class Scheduler(SchedulerInterface):
         nan_in_embedding = model_runner_output.nan_in_embedding
         nan_first_layer_hidden = model_runner_output.nan_first_layer_hidden
         nan_first_layer_residual = model_runner_output.nan_first_layer_residual
+        nan_real_output = model_runner_output.nan_real_output
+        nan_padded_output = model_runner_output.nan_padded_output
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
 
@@ -1572,7 +1574,8 @@ class Scheduler(SchedulerInterface):
                         or nan_in_post_attn_ln
                         or nan_in_pre_norm_hidden
                         or nan_in_pre_norm_residual
-                        or nan_in_embedding)
+                        or nan_in_embedding
+                        or nan_real_output or nan_padded_output)
         nan_phase: str | None = None
         if has_any_nans:
             batch_has_prefill = False
@@ -1605,7 +1608,7 @@ class Scheduler(SchedulerInterface):
                 nan_in_pre_norm_hidden, nan_in_pre_norm_residual,
                 nan_in_embedding,
                 nan_first_layer_hidden, nan_first_layer_residual,
-                nan_phase,
+                nan_real_output, nan_padded_output, nan_phase,
             )
         ) is not None:
             # Return stats to only one of the front-ends.
@@ -2010,6 +2013,8 @@ class Scheduler(SchedulerInterface):
         nan_in_embedding: bool = False,
         nan_first_layer_hidden: int = -1,
         nan_first_layer_residual: int = -1,
+        nan_real_output: bool = False,
+        nan_padded_output: bool = False,
         nan_phase: str | None = None,
     ) -> SchedulerStats | None:
         if not self.log_stats:
@@ -2055,6 +2060,8 @@ class Scheduler(SchedulerInterface):
             nan_in_embedding=nan_in_embedding,
             nan_first_layer_hidden=nan_first_layer_hidden,
             nan_first_layer_residual=nan_first_layer_residual,
+            nan_real_output=nan_real_output,
+            nan_padded_output=nan_padded_output,
             nan_phase=nan_phase,
         )
 
