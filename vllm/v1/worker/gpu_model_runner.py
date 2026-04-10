@@ -4360,6 +4360,20 @@ class GPUModelRunner(
                         torch.isnan(hidden_states[num_real:num_total])
                     ).item()
                 )
+            if (nan_origin_component >= 0 or nan_real_output
+                    or nan_padded_output):
+                mask_true = int(
+                    self._nan_real_mask[:num_total].sum().item()
+                ) if self._nan_real_mask is not None else -1
+                logger.warning(
+                    "NaN detected: origin_all=%d origin_real=%d "
+                    "real_output=%s padded_output=%s "
+                    "num_real=%d num_total=%d (padding=%d) "
+                    "mask_true_count=%d",
+                    nan_origin_component, nan_origin_component_real,
+                    nan_real_output, nan_padded_output,
+                    num_real, num_total, num_total - num_real,
+                    mask_true)
 
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
@@ -5015,6 +5029,28 @@ class GPUModelRunner(
             num_layers, dtype=torch.bool, device=self.device)
         self._nan_per_layer_residual = torch.zeros(
             num_layers, dtype=torch.bool, device=self.device)
+
+        # One-time check: verify embedding weights are NaN-free.
+        from vllm.model_executor.layers.vocab_parallel_embedding import (
+            VocabParallelEmbedding,
+        )
+        for name, module in self.model.named_modules():
+            if isinstance(module, VocabParallelEmbedding):
+                w = module.weight.data
+                nan_mask = torch.isnan(w)
+                if nan_mask.any():
+                    nan_rows = nan_mask.any(dim=-1).nonzero(
+                        as_tuple=True)[0]
+                    nan_count = int(nan_mask.sum().item())
+                    logger.error(
+                        "EMBEDDING WEIGHT NaN: %s has %d NaN values "
+                        "in %d/%d rows (first 10 rows: %s)",
+                        name, nan_count, len(nan_rows), w.shape[0],
+                        nan_rows[:10].tolist())
+                else:
+                    logger.info(
+                        "Embedding weight check OK: %s [%s] all finite",
+                        name, list(w.shape))
 
         for module in self.model.modules():
             if isinstance(module, Attention):
