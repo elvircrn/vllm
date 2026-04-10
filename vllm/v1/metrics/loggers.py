@@ -581,6 +581,10 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.gauge_nan_origin = create_metric_per_engine(
                 gauge_nan_origin, per_engine_labelvalues
             )
+            # Initialize to -1 (no NaN) so Prometheus doesn't show
+            # default 0 which maps to EMBEDDING.
+            for g in self.gauge_nan_origin.values():
+                g.set(-1)
 
             gauge_nan_origin_real = self._gauge_cls(
                 name="vllm:nan_origin_component_real",
@@ -593,6 +597,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.gauge_nan_origin_real = create_metric_per_engine(
                 gauge_nan_origin_real, per_engine_labelvalues
             )
+            for g in self.gauge_nan_origin_real.values():
+                g.set(-1)
 
             gauge_nan_first_layer_hidden = self._gauge_cls(
                 name="vllm:nan_first_layer_hidden",
@@ -605,6 +611,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.gauge_nan_first_layer_hidden = create_metric_per_engine(
                 gauge_nan_first_layer_hidden, per_engine_labelvalues
             )
+            for g in self.gauge_nan_first_layer_hidden.values():
+                g.set(-1)
             gauge_nan_first_layer_residual = self._gauge_cls(
                 name="vllm:nan_first_layer_residual",
                 documentation=(
@@ -616,6 +624,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.gauge_nan_first_layer_residual = create_metric_per_engine(
                 gauge_nan_first_layer_residual, per_engine_labelvalues
             )
+            for g in self.gauge_nan_first_layer_residual.values():
+                g.set(-1)
 
         counter_prefix_cache_queries = self._counter_cls(
             name="vllm:prefix_cache_queries",
