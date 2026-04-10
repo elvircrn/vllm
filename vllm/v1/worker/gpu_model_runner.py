@@ -4311,6 +4311,14 @@ class GPUModelRunner(
                 spec_decode_metadata,
             )
 
+        # Check sample_hidden_states for NaN (after final RMSNorm, before
+        # lm_head). This runs outside CUDA graphs so no custom op needed.
+        nan_in_hidden_states = False
+        if envs.VLLM_COMPUTE_NANS_IN_LOGITS and sample_hidden_states is not None:
+            nan_in_hidden_states = bool(
+                torch.any(torch.isnan(sample_hidden_states)).item()
+            )
+
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
             # tokens on the CPU, so they are run after bookkeeping.
@@ -4350,6 +4358,7 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 nan_in_attention=nan_in_attention,
                 nan_in_moe=nan_in_moe,
+                nan_in_hidden_states=nan_in_hidden_states,
                 cudagraph_stats=cudagraph_stats,
             )
 

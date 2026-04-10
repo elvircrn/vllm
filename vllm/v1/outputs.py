@@ -201,6 +201,7 @@ class ModelRunnerOutput:
     # NaN source tracking: which layer type produced NaNs this step
     nan_in_attention: bool = False
     nan_in_moe: bool = False
+    nan_in_hidden_states: bool = False  # NaN in hidden states before lm_head
 
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None

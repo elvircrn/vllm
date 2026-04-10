@@ -202,6 +202,8 @@ class SchedulerStats:
     nan_in_attention: bool = False
     nan_in_moe: bool = False
     nan_in_logits: bool = False
+    nan_in_final_norm: bool = False  # NaN in hidden states after final RMSNorm
+    nan_in_lm_head: bool = False  # NaN introduced by lm_head projection
     nan_phase: str | None = None  # "prefill", "decode", or "mixed"
 
 

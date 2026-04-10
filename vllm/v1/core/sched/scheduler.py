@@ -1312,6 +1312,7 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         nan_in_attention = model_runner_output.nan_in_attention
         nan_in_moe = model_runner_output.nan_in_moe
+        nan_in_hidden_states = model_runner_output.nan_in_hidden_states
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
 
@@ -1551,7 +1552,13 @@ class Scheduler(SchedulerInterface):
         # Compute NaN source/phase info for metrics.
         nan_in_logits = (num_nans_in_logits is not None
                          and any(v > 0 for v in num_nans_in_logits.values()))
-        has_any_nans = nan_in_attention or nan_in_moe or nan_in_logits
+        # Derive fine-grained sources from hidden_states vs logits:
+        # final_norm: NaN in hidden_states (after final RMSNorm, before lm_head)
+        # lm_head: NaN in logits but NOT in hidden_states (lm_head introduced it)
+        nan_in_final_norm = nan_in_hidden_states
+        nan_in_lm_head = nan_in_logits and not nan_in_hidden_states
+        has_any_nans = (nan_in_attention or nan_in_moe or nan_in_logits
+                        or nan_in_hidden_states)
         nan_phase: str | None = None
         if has_any_nans:
             batch_has_prefill = False
@@ -1578,7 +1585,7 @@ class Scheduler(SchedulerInterface):
             stats := self.make_stats(
                 spec_decoding_stats, kv_connector_stats, cudagraph_stats,
                 perf_stats, nan_in_attention, nan_in_moe, nan_in_logits,
-                nan_phase,
+                nan_in_final_norm, nan_in_lm_head, nan_phase,
             )
         ) is not None:
             # Return stats to only one of the front-ends.
@@ -1972,6 +1979,8 @@ class Scheduler(SchedulerInterface):
         nan_in_attention: bool = False,
         nan_in_moe: bool = False,
         nan_in_logits: bool = False,
+        nan_in_final_norm: bool = False,
+        nan_in_lm_head: bool = False,
         nan_phase: str | None = None,
     ) -> SchedulerStats | None:
         if not self.log_stats:
@@ -2006,6 +2015,8 @@ class Scheduler(SchedulerInterface):
             nan_in_attention=nan_in_attention,
             nan_in_moe=nan_in_moe,
             nan_in_logits=nan_in_logits,
+            nan_in_final_norm=nan_in_final_norm,
+            nan_in_lm_head=nan_in_lm_head,
             nan_phase=nan_phase,
         )
 

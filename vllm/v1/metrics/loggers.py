@@ -150,6 +150,10 @@ class LoggingStatLogger(StatLoggerBase):
                 sources.append("attention")
             if scheduler_stats.nan_in_moe:
                 sources.append("moe")
+            if scheduler_stats.nan_in_final_norm:
+                sources.append("final_norm")
+            if scheduler_stats.nan_in_lm_head:
+                sources.append("lm_head")
             if scheduler_stats.nan_in_logits:
                 sources.append("logits")
             if sources:
@@ -533,7 +537,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.counter_nan_occurrences: dict[
                 tuple[str, str], dict[int, Counter]
             ] = {}
-            for source in ("attention", "moe", "logits"):
+            for source in ("attention", "moe", "logits",
+                          "final_norm", "lm_head"):
                 for phase in ("prefill", "decode", "mixed"):
                     self.counter_nan_occurrences[(source, phase)] = {
                         idx: counter_nan_occurrences.labels(
@@ -1138,6 +1143,12 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 if scheduler_stats.nan_in_logits:
                     self.counter_nan_occurrences[
                         ("logits", phase)][engine_idx].inc()
+                if scheduler_stats.nan_in_final_norm:
+                    self.counter_nan_occurrences[
+                        ("final_norm", phase)][engine_idx].inc()
+                if scheduler_stats.nan_in_lm_head:
+                    self.counter_nan_occurrences[
+                        ("lm_head", phase)][engine_idx].inc()
 
             if self.gauge_lora_info is not None:
                 running_lora_adapters = ",".join(
