@@ -488,22 +488,12 @@ class GPUModelRunner(
         # NOTE(yongji): flag to temporarily disable EPLB during scaling up/down
         self.eep_eplb_suppressed = False
 
-        # NaN detection flag tensors, shared across all layers of each type.
-        # Pre-allocated with fixed addresses for CUDA graph compatibility.
-        # Set up in load_model() when VLLM_COMPUTE_NANS_IN_LOGITS is enabled.
-        self._nan_flag_attention: torch.Tensor | None = None
-        self._nan_flag_moe: torch.Tensor | None = None
-        self._nan_flag_input_ln: torch.Tensor | None = None
-        self._nan_flag_qkv_proj: torch.Tensor | None = None
-        self._nan_flag_q_a_ln: torch.Tensor | None = None
-        self._nan_flag_q_b_proj: torch.Tensor | None = None
-        self._nan_flag_kv_a_ln: torch.Tensor | None = None
-        self._nan_flag_rotary: torch.Tensor | None = None
-        self._nan_flag_o_proj: torch.Tensor | None = None
-        self._nan_flag_post_attn_ln: torch.Tensor | None = None
-        self._nan_flag_pre_norm_hidden: torch.Tensor | None = None
-        self._nan_flag_pre_norm_residual: torch.Tensor | None = None
-        self._nan_flag_embedding: torch.Tensor | None = None
+        # NaN origin tracking. Single int32 flag reset to -1 each step.
+        # nan_first_component records the ID of the first component whose
+        # output contains NaN. Pre-allocated with fixed address for CUDA
+        # graph compatibility. Set up in load_model().
+        self._nan_origin_flag: torch.Tensor | None = None
+        # Per-layer NaN presence tracking (for first-layer identification).
         self._nan_per_layer_hidden: torch.Tensor | None = None
         self._nan_per_layer_residual: torch.Tensor | None = None
 
@@ -3377,52 +3367,18 @@ class GPUModelRunner(
         list[str],
         dict[str, int],
         list[int],
-        bool,
-        bool,
-        bool,
-        bool,
-        bool,
-        bool,
-        bool,
-        bool,
-        bool,
-        int,
-        int,
+        int,   # nan_origin_component
+        int,   # nan_first_layer_hidden
+        int,   # nan_first_layer_residual
     ]:
         num_nans_in_logits = {}
-        nan_in_attention = False
-        nan_in_moe = False
-        nan_in_input_ln = False
-        nan_in_qkv_proj = False
-        nan_in_q_a_ln = False
-        nan_in_q_b_proj = False
-        nan_in_kv_a_ln = False
-        nan_in_rotary = False
-        nan_in_o_proj = False
-        nan_in_post_attn_ln = False
-        nan_in_pre_norm_hidden = False
-        nan_in_pre_norm_residual = False
-        nan_in_embedding = False
+        nan_origin_component = -1
         nan_first_layer_hidden = -1
         nan_first_layer_residual = -1
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             num_nans_in_logits = self._get_nans_in_logits(logits)
-            if self._nan_flag_attention is not None:
-                nan_in_attention = self._nan_flag_attention.item()
-                nan_in_moe = self._nan_flag_moe.item()
-                nan_in_input_ln = self._nan_flag_input_ln.item()
-                nan_in_qkv_proj = self._nan_flag_qkv_proj.item()
-                nan_in_q_a_ln = self._nan_flag_q_a_ln.item()
-                nan_in_q_b_proj = self._nan_flag_q_b_proj.item()
-                nan_in_kv_a_ln = self._nan_flag_kv_a_ln.item()
-                nan_in_rotary = self._nan_flag_rotary.item()
-                nan_in_o_proj = self._nan_flag_o_proj.item()
-                nan_in_post_attn_ln = self._nan_flag_post_attn_ln.item()
-                nan_in_pre_norm_hidden = \
-                    self._nan_flag_pre_norm_hidden.item()
-                nan_in_pre_norm_residual = \
-                    self._nan_flag_pre_norm_residual.item()
-                nan_in_embedding = self._nan_flag_embedding.item()
+            if self._nan_origin_flag is not None:
+                nan_origin_component = int(self._nan_origin_flag.item())
                 # Find first layer with NaN in hidden/residual.
                 h_flags = self._nan_per_layer_hidden
                 r_flags = self._nan_per_layer_residual
@@ -3537,19 +3493,7 @@ class GPUModelRunner(
             req_ids_output_copy,
             req_id_to_index_output_copy,
             invalid_req_indices,
-            nan_in_attention,
-            nan_in_moe,
-            nan_in_input_ln,
-            nan_in_qkv_proj,
-            nan_in_q_a_ln,
-            nan_in_q_b_proj,
-            nan_in_kv_a_ln,
-            nan_in_rotary,
-            nan_in_o_proj,
-            nan_in_post_attn_ln,
-            nan_in_pre_norm_hidden,
-            nan_in_pre_norm_residual,
-            nan_in_embedding,
+            nan_origin_component,
             nan_first_layer_hidden,
             nan_first_layer_residual,
         )
@@ -4090,20 +4034,8 @@ class GPUModelRunner(
         )
 
         # Reset NaN detection flags before forward pass.
-        if self._nan_flag_attention is not None:
-            self._nan_flag_attention.fill_(False)
-            self._nan_flag_moe.fill_(False)
-            self._nan_flag_input_ln.fill_(False)
-            self._nan_flag_qkv_proj.fill_(False)
-            self._nan_flag_q_a_ln.fill_(False)
-            self._nan_flag_q_b_proj.fill_(False)
-            self._nan_flag_kv_a_ln.fill_(False)
-            self._nan_flag_rotary.fill_(False)
-            self._nan_flag_o_proj.fill_(False)
-            self._nan_flag_post_attn_ln.fill_(False)
-            self._nan_flag_pre_norm_hidden.fill_(False)
-            self._nan_flag_pre_norm_residual.fill_(False)
-            self._nan_flag_embedding.fill_(False)
+        if self._nan_origin_flag is not None:
+            self._nan_origin_flag.fill_(-1)
             self._nan_per_layer_hidden.fill_(False)
             self._nan_per_layer_residual.fill_(False)
 
@@ -4383,19 +4315,7 @@ class GPUModelRunner(
                 req_ids_output_copy,
                 req_id_to_index_output_copy,
                 invalid_req_indices,
-                nan_in_attention,
-                nan_in_moe,
-                nan_in_input_ln,
-                nan_in_qkv_proj,
-                nan_in_q_a_ln,
-                nan_in_q_b_proj,
-                nan_in_kv_a_ln,
-                nan_in_rotary,
-                nan_in_o_proj,
-                nan_in_post_attn_ln,
-                nan_in_pre_norm_hidden,
-                nan_in_pre_norm_residual,
-                nan_in_embedding,
+                nan_origin_component,
                 nan_first_layer_hidden,
                 nan_first_layer_residual,
             ) = self._bookkeeping_sync(
@@ -4466,20 +4386,8 @@ class GPUModelRunner(
                 if self.supports_mm_inputs
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
-                nan_in_attention=nan_in_attention,
-                nan_in_moe=nan_in_moe,
+                nan_origin_component=nan_origin_component,
                 nan_in_hidden_states=nan_in_hidden_states,
-                nan_in_input_ln=nan_in_input_ln,
-                nan_in_qkv_proj=nan_in_qkv_proj,
-                nan_in_q_a_ln=nan_in_q_a_ln,
-                nan_in_q_b_proj=nan_in_q_b_proj,
-                nan_in_kv_a_ln=nan_in_kv_a_ln,
-                nan_in_rotary=nan_in_rotary,
-                nan_in_o_proj=nan_in_o_proj,
-                nan_in_post_attn_ln=nan_in_post_attn_ln,
-                nan_in_pre_norm_hidden=nan_in_pre_norm_hidden,
-                nan_in_pre_norm_residual=nan_in_pre_norm_residual,
-                nan_in_embedding=nan_in_embedding,
                 nan_first_layer_hidden=nan_first_layer_hidden,
                 nan_first_layer_residual=nan_first_layer_residual,
                 nan_real_output=nan_real_output,
@@ -5059,10 +4967,10 @@ class GPUModelRunner(
         get_offloader().post_init()
 
     def _setup_nan_detection_flags(self) -> None:
-        """Pre-allocate shared NaN flag tensors and assign them to all
-        Attention, FusedMoE, MLA, and DecoderLayer modules. The nan_check
-        custom op writes to these during forward and its operations are
-        captured by CUDA graphs."""
+        """Pre-allocate the shared NaN origin flag and per-layer tracking
+        tensors, then assign them to all relevant modules. The
+        nan_first_component custom op writes to the origin flag during
+        forward and its operations are captured by CUDA graphs."""
         from vllm.model_executor.layers.fused_moe.layer import FusedMoE
         from vllm.model_executor.layers.mla import (
             MultiHeadLatentAttentionWrapper,
@@ -5072,32 +4980,9 @@ class GPUModelRunner(
             DeepseekV2Model,
         )
 
-        self._nan_flag_attention = torch.zeros(
-            1, dtype=torch.bool, device=self.device)
-        self._nan_flag_moe = torch.zeros(
-            1, dtype=torch.bool, device=self.device)
-        self._nan_flag_input_ln = torch.zeros(
-            1, dtype=torch.bool, device=self.device)
-        self._nan_flag_qkv_proj = torch.zeros(
-            1, dtype=torch.bool, device=self.device)
-        self._nan_flag_q_a_ln = torch.zeros(
-            1, dtype=torch.bool, device=self.device)
-        self._nan_flag_q_b_proj = torch.zeros(
-            1, dtype=torch.bool, device=self.device)
-        self._nan_flag_kv_a_ln = torch.zeros(
-            1, dtype=torch.bool, device=self.device)
-        self._nan_flag_rotary = torch.zeros(
-            1, dtype=torch.bool, device=self.device)
-        self._nan_flag_o_proj = torch.zeros(
-            1, dtype=torch.bool, device=self.device)
-        self._nan_flag_post_attn_ln = torch.zeros(
-            1, dtype=torch.bool, device=self.device)
-        self._nan_flag_pre_norm_hidden = torch.zeros(
-            1, dtype=torch.bool, device=self.device)
-        self._nan_flag_pre_norm_residual = torch.zeros(
-            1, dtype=torch.bool, device=self.device)
-        self._nan_flag_embedding = torch.zeros(
-            1, dtype=torch.bool, device=self.device)
+        # Single int32 flag: -1 = no NaN yet, otherwise component ID.
+        self._nan_origin_flag = torch.full(
+            (1,), -1, dtype=torch.int32, device=self.device)
 
         # Count decoder layers for per-layer tracking.
         num_layers = sum(
@@ -5111,27 +4996,17 @@ class GPUModelRunner(
 
         for module in self.model.modules():
             if isinstance(module, Attention):
-                module._nan_flag = self._nan_flag_attention
+                module._nan_flag = self._nan_origin_flag
             elif isinstance(module, FusedMoE):
-                module._nan_flag = self._nan_flag_moe
+                module._nan_flag = self._nan_origin_flag
             elif isinstance(module, MultiHeadLatentAttentionWrapper):
-                module._nan_flag_qkv_proj = self._nan_flag_qkv_proj
-                module._nan_flag_q_a_ln = self._nan_flag_q_a_ln
-                module._nan_flag_q_b_proj = self._nan_flag_q_b_proj
-                module._nan_flag_kv_a_ln = self._nan_flag_kv_a_ln
-                module._nan_flag_rotary = self._nan_flag_rotary
-                module._nan_flag_o_proj = self._nan_flag_o_proj
+                module._nan_origin_flag = self._nan_origin_flag
             elif isinstance(module, DeepseekV2DecoderLayer):
-                module._nan_flag_input_ln = self._nan_flag_input_ln
-                module._nan_flag_post_attn_ln = self._nan_flag_post_attn_ln
+                module._nan_origin_flag = self._nan_origin_flag
                 module._nan_per_layer_hidden = self._nan_per_layer_hidden
                 module._nan_per_layer_residual = self._nan_per_layer_residual
             elif isinstance(module, DeepseekV2Model):
-                module._nan_flag_embedding = self._nan_flag_embedding
-                module._nan_flag_pre_norm_hidden = \
-                    self._nan_flag_pre_norm_hidden
-                module._nan_flag_pre_norm_residual = \
-                    self._nan_flag_pre_norm_residual
+                module._nan_origin_flag = self._nan_origin_flag
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         """Extract Eagle3 auxiliary layer indices from speculative config.

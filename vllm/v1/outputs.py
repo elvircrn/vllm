@@ -198,21 +198,10 @@ class ModelRunnerOutput:
     # req_id -> num_nans_in_logits
     num_nans_in_logits: dict[str, int] | None = None
 
-    # NaN source tracking: which layer type produced NaNs this step
-    nan_in_attention: bool = False
-    nan_in_moe: bool = False
+    # NaN origin tracking: component ID that first produced NaN this step.
+    # -1 = no NaN. Uses NAN_COMPONENT_* IDs from attention.py.
+    nan_origin_component: int = -1
     nan_in_hidden_states: bool = False  # NaN in hidden states before lm_head
-    nan_in_input_ln: bool = False
-    nan_in_qkv_proj: bool = False
-    nan_in_q_a_ln: bool = False
-    nan_in_q_b_proj: bool = False
-    nan_in_kv_a_ln: bool = False
-    nan_in_rotary: bool = False
-    nan_in_o_proj: bool = False
-    nan_in_post_attn_ln: bool = False
-    nan_in_pre_norm_hidden: bool = False
-    nan_in_pre_norm_residual: bool = False
-    nan_in_embedding: bool = False
     nan_first_layer_hidden: int = -1
     nan_first_layer_residual: int = -1
     nan_real_output: bool = False

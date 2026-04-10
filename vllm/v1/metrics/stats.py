@@ -196,25 +196,14 @@ class SchedulerStats:
 
     perf_stats: PerfStats | None = None
 
-    # NaN source/phase tracking for this step.
-    # source: which layer type produced NaNs (attention, moe, logits)
-    # phase: prefill, decode, or mixed
-    nan_in_attention: bool = False
-    nan_in_moe: bool = False
+    # NaN origin tracking for this step.
+    # nan_origin_component: component ID that first produced NaN (-1 = none)
+    # nan_origin_name: human-readable name of the origin component
+    nan_origin_component: int = -1
+    nan_origin_name: str | None = None
     nan_in_logits: bool = False
     nan_in_final_norm: bool = False
     nan_in_lm_head: bool = False
-    nan_in_input_ln: bool = False
-    nan_in_qkv_proj: bool = False
-    nan_in_q_a_ln: bool = False
-    nan_in_q_b_proj: bool = False
-    nan_in_kv_a_ln: bool = False
-    nan_in_rotary: bool = False
-    nan_in_o_proj: bool = False
-    nan_in_post_attn_ln: bool = False
-    nan_in_pre_norm_hidden: bool = False
-    nan_in_pre_norm_residual: bool = False
-    nan_in_embedding: bool = False
     nan_first_layer_hidden: int = -1
     nan_first_layer_residual: int = -1
     nan_real_output: bool = False

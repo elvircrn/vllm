@@ -1310,20 +1310,8 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
-        nan_in_attention = model_runner_output.nan_in_attention
-        nan_in_moe = model_runner_output.nan_in_moe
+        nan_origin_component = model_runner_output.nan_origin_component
         nan_in_hidden_states = model_runner_output.nan_in_hidden_states
-        nan_in_input_ln = model_runner_output.nan_in_input_ln
-        nan_in_qkv_proj = model_runner_output.nan_in_qkv_proj
-        nan_in_q_a_ln = model_runner_output.nan_in_q_a_ln
-        nan_in_q_b_proj = model_runner_output.nan_in_q_b_proj
-        nan_in_kv_a_ln = model_runner_output.nan_in_kv_a_ln
-        nan_in_rotary = model_runner_output.nan_in_rotary
-        nan_in_o_proj = model_runner_output.nan_in_o_proj
-        nan_in_post_attn_ln = model_runner_output.nan_in_post_attn_ln
-        nan_in_pre_norm_hidden = model_runner_output.nan_in_pre_norm_hidden
-        nan_in_pre_norm_residual = model_runner_output.nan_in_pre_norm_residual
-        nan_in_embedding = model_runner_output.nan_in_embedding
         nan_first_layer_hidden = model_runner_output.nan_first_layer_hidden
         nan_first_layer_residual = model_runner_output.nan_first_layer_residual
         nan_real_output = model_runner_output.nan_real_output
@@ -1568,19 +1556,10 @@ class Scheduler(SchedulerInterface):
         nan_in_logits = (num_nans_in_logits is not None
                          and any(v > 0 for v in num_nans_in_logits.values()))
         # Derive fine-grained sources from hidden_states vs logits:
-        # final_norm: NaN in hidden_states (after final RMSNorm, before lm_head)
-        # lm_head: NaN in logits but NOT in hidden_states (lm_head introduced it)
         nan_in_final_norm = nan_in_hidden_states
         nan_in_lm_head = nan_in_logits and not nan_in_hidden_states
-        has_any_nans = (nan_in_attention or nan_in_moe or nan_in_logits
-                        or nan_in_hidden_states or nan_in_input_ln
-                        or nan_in_qkv_proj or nan_in_q_a_ln
-                        or nan_in_q_b_proj or nan_in_kv_a_ln
-                        or nan_in_rotary or nan_in_o_proj
-                        or nan_in_post_attn_ln
-                        or nan_in_pre_norm_hidden
-                        or nan_in_pre_norm_residual
-                        or nan_in_embedding
+        has_any_nans = (nan_origin_component >= 0 or nan_in_logits
+                        or nan_in_hidden_states
                         or nan_real_output or nan_padded_output)
         nan_phase: str | None = None
         if has_any_nans:
@@ -1604,16 +1583,18 @@ class Scheduler(SchedulerInterface):
             else:
                 nan_phase = "decode"
 
+        # Resolve origin component name for stats.
+        from vllm.model_executor.layers.attention.attention import (
+            NAN_COMPONENT_NAMES,
+        )
+        nan_origin_name = NAN_COMPONENT_NAMES.get(nan_origin_component)
+
         if (
             stats := self.make_stats(
                 spec_decoding_stats, kv_connector_stats, cudagraph_stats,
-                perf_stats, nan_in_attention, nan_in_moe, nan_in_logits,
-                nan_in_final_norm, nan_in_lm_head,
-                nan_in_input_ln, nan_in_qkv_proj,
-                nan_in_q_a_ln, nan_in_q_b_proj, nan_in_kv_a_ln,
-                nan_in_rotary, nan_in_o_proj, nan_in_post_attn_ln,
-                nan_in_pre_norm_hidden, nan_in_pre_norm_residual,
-                nan_in_embedding,
+                perf_stats,
+                nan_origin_component, nan_origin_name,
+                nan_in_logits, nan_in_final_norm, nan_in_lm_head,
                 nan_first_layer_hidden, nan_first_layer_residual,
                 nan_real_output, nan_padded_output, nan_phase,
             )
@@ -2006,22 +1987,11 @@ class Scheduler(SchedulerInterface):
         kv_connector_stats: KVConnectorStats | None = None,
         cudagraph_stats: CUDAGraphStat | None = None,
         perf_stats: PerfStats | None = None,
-        nan_in_attention: bool = False,
-        nan_in_moe: bool = False,
+        nan_origin_component: int = -1,
+        nan_origin_name: str | None = None,
         nan_in_logits: bool = False,
         nan_in_final_norm: bool = False,
         nan_in_lm_head: bool = False,
-        nan_in_input_ln: bool = False,
-        nan_in_qkv_proj: bool = False,
-        nan_in_q_a_ln: bool = False,
-        nan_in_q_b_proj: bool = False,
-        nan_in_kv_a_ln: bool = False,
-        nan_in_rotary: bool = False,
-        nan_in_o_proj: bool = False,
-        nan_in_post_attn_ln: bool = False,
-        nan_in_pre_norm_hidden: bool = False,
-        nan_in_pre_norm_residual: bool = False,
-        nan_in_embedding: bool = False,
         nan_first_layer_hidden: int = -1,
         nan_first_layer_residual: int = -1,
         nan_real_output: bool = False,
@@ -2057,22 +2027,11 @@ class Scheduler(SchedulerInterface):
             kv_connector_stats=connector_stats_payload,
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
-            nan_in_attention=nan_in_attention,
-            nan_in_moe=nan_in_moe,
+            nan_origin_component=nan_origin_component,
+            nan_origin_name=nan_origin_name,
             nan_in_logits=nan_in_logits,
             nan_in_final_norm=nan_in_final_norm,
             nan_in_lm_head=nan_in_lm_head,
-            nan_in_input_ln=nan_in_input_ln,
-            nan_in_qkv_proj=nan_in_qkv_proj,
-            nan_in_q_a_ln=nan_in_q_a_ln,
-            nan_in_q_b_proj=nan_in_q_b_proj,
-            nan_in_kv_a_ln=nan_in_kv_a_ln,
-            nan_in_rotary=nan_in_rotary,
-            nan_in_o_proj=nan_in_o_proj,
-            nan_in_post_attn_ln=nan_in_post_attn_ln,
-            nan_in_pre_norm_hidden=nan_in_pre_norm_hidden,
-            nan_in_pre_norm_residual=nan_in_pre_norm_residual,
-            nan_in_embedding=nan_in_embedding,
             nan_first_layer_hidden=nan_first_layer_hidden,
             nan_first_layer_residual=nan_first_layer_residual,
             nan_real_output=nan_real_output,

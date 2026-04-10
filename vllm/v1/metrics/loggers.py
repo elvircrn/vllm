@@ -145,57 +145,34 @@ class LoggingStatLogger(StatLoggerBase):
 
     def _track_nan_stats(self, scheduler_stats: SchedulerStats):
         if scheduler_stats.nan_phase:
-            sources = []
-            if scheduler_stats.nan_in_embedding:
-                sources.append("embedding")
-            if scheduler_stats.nan_in_input_ln:
-                sources.append("input_ln")
-            if scheduler_stats.nan_in_qkv_proj:
-                sources.append("qkv_proj")
-            if scheduler_stats.nan_in_q_a_ln:
-                sources.append("q_a_ln")
-            if scheduler_stats.nan_in_q_b_proj:
-                sources.append("q_b_proj")
-            if scheduler_stats.nan_in_kv_a_ln:
-                sources.append("kv_a_ln")
-            if scheduler_stats.nan_in_rotary:
-                sources.append("rotary")
-            if scheduler_stats.nan_in_attention:
-                sources.append("attention")
-            if scheduler_stats.nan_in_o_proj:
-                sources.append("o_proj")
-            if scheduler_stats.nan_in_post_attn_ln:
-                sources.append("post_attn_ln")
-            if scheduler_stats.nan_in_moe:
-                sources.append("moe")
-            if scheduler_stats.nan_in_pre_norm_hidden:
-                sources.append("pre_norm_hidden")
-            if scheduler_stats.nan_in_pre_norm_residual:
-                sources.append("pre_norm_residual")
+            origin = scheduler_stats.nan_origin_name or "unknown"
+            extras = []
             if scheduler_stats.nan_in_final_norm:
-                sources.append("final_norm")
+                extras.append("final_norm")
             if scheduler_stats.nan_in_lm_head:
-                sources.append("lm_head")
+                extras.append("lm_head")
             if scheduler_stats.nan_in_logits:
-                sources.append("logits")
+                extras.append("logits")
             if scheduler_stats.nan_real_output:
-                sources.append("REAL_OUTPUT")
+                extras.append("REAL_OUTPUT")
             if scheduler_stats.nan_padded_output:
-                sources.append("padded_output")
-            if sources:
-                layer_info = ""
-                if scheduler_stats.nan_first_layer_hidden >= 0:
-                    layer_info += (f" first_layer_hidden="
-                                  f"{scheduler_stats.nan_first_layer_hidden}")
-                if scheduler_stats.nan_first_layer_residual >= 0:
-                    layer_info += (f" first_layer_residual="
-                                  f"{scheduler_stats.nan_first_layer_residual}")
-                logger.warning(
-                    "NaN detected in %s during %s phase%s",
-                    "+".join(sources),
-                    scheduler_stats.nan_phase,
-                    layer_info,
-                )
+                extras.append("padded_output")
+
+            layer_info = ""
+            if scheduler_stats.nan_first_layer_hidden >= 0:
+                layer_info += (f" first_layer_hidden="
+                              f"{scheduler_stats.nan_first_layer_hidden}")
+            if scheduler_stats.nan_first_layer_residual >= 0:
+                layer_info += (f" first_layer_residual="
+                              f"{scheduler_stats.nan_first_layer_residual}")
+            extra_str = f" also_in={'+'.join(extras)}" if extras else ""
+            logger.warning(
+                "NaN ORIGIN: %s during %s phase%s%s",
+                origin,
+                scheduler_stats.nan_phase,
+                layer_info,
+                extra_str,
+            )
 
     def _get_throughput(self, tracked_stats: int, now: float) -> float:
         # Compute summary metrics for tracked stats
@@ -558,28 +535,27 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 counter_corrupted_requests, per_engine_labelvalues
             )
 
-            # NaN occurrence counter with source (attention/moe/logits) and
-            # phase (prefill/decode/mixed) labels.
+            # NaN occurrence counter with source and phase labels.
+            # source = origin component name or derived source (logits etc.)
             counter_nan_occurrences = self._counter_cls(
                 name="vllm:nan_occurrences_total",
                 documentation=(
                     "Number of forward steps where NaN was first produced "
-                    "by a given layer type, labeled by source and batch phase."
+                    "by a given component, labeled by source and batch phase."
                 ),
                 labelnames=labelnames + ["source", "phase"],
             )
             self.counter_nan_occurrences: dict[
                 tuple[str, str], dict[int, Counter]
             ] = {}
-            for source in ("attention", "moe", "logits",
-                          "final_norm", "lm_head",
-                          "input_ln", "qkv_proj",
-                          "q_a_ln", "q_b_proj", "kv_a_ln",
-                          "rotary", "o_proj",
-                          "post_attn_ln",
-                          "pre_norm_hidden", "pre_norm_residual",
-                          "embedding",
-                          "real_output", "padded_output"):
+            from vllm.model_executor.layers.attention.attention import (
+                NAN_COMPONENT_NAMES,
+            )
+            all_sources = list(NAN_COMPONENT_NAMES.values()) + [
+                "logits", "final_norm", "lm_head",
+                "real_output", "padded_output",
+            ]
+            for source in all_sources:
                 for phase in ("prefill", "decode", "mixed"):
                     self.counter_nan_occurrences[(source, phase)] = {
                         idx: counter_nan_occurrences.labels(
@@ -587,6 +563,19 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                         )
                         for idx in engine_indexes
                     }
+
+            # Gauge showing which component originated the NaN (-1 = none).
+            gauge_nan_origin = self._gauge_cls(
+                name="vllm:nan_origin_component",
+                documentation=(
+                    "Component ID that first produced NaN this step "
+                    "(-1 = no NaN). Use NAN_COMPONENT_NAMES for mapping."
+                ),
+                labelnames=labelnames,
+            )
+            self.gauge_nan_origin = create_metric_per_engine(
+                gauge_nan_origin, per_engine_labelvalues
+            )
 
             gauge_nan_first_layer_hidden = self._gauge_cls(
                 name="vllm:nan_first_layer_hidden",
@@ -1196,62 +1185,32 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     for gap in event.reuse_gaps_seconds:
                         reuse_hist.observe(gap)
 
-            if envs.VLLM_COMPUTE_NANS_IN_LOGITS and scheduler_stats.nan_phase:
-                phase = scheduler_stats.nan_phase
-                if scheduler_stats.nan_in_attention:
-                    self.counter_nan_occurrences[
-                        ("attention", phase)][engine_idx].inc()
-                if scheduler_stats.nan_in_moe:
-                    self.counter_nan_occurrences[
-                        ("moe", phase)][engine_idx].inc()
-                if scheduler_stats.nan_in_logits:
-                    self.counter_nan_occurrences[
-                        ("logits", phase)][engine_idx].inc()
-                if scheduler_stats.nan_in_final_norm:
-                    self.counter_nan_occurrences[
-                        ("final_norm", phase)][engine_idx].inc()
-                if scheduler_stats.nan_in_lm_head:
-                    self.counter_nan_occurrences[
-                        ("lm_head", phase)][engine_idx].inc()
-                if scheduler_stats.nan_in_input_ln:
-                    self.counter_nan_occurrences[
-                        ("input_ln", phase)][engine_idx].inc()
-                if scheduler_stats.nan_in_qkv_proj:
-                    self.counter_nan_occurrences[
-                        ("qkv_proj", phase)][engine_idx].inc()
-                if scheduler_stats.nan_in_q_a_ln:
-                    self.counter_nan_occurrences[
-                        ("q_a_ln", phase)][engine_idx].inc()
-                if scheduler_stats.nan_in_q_b_proj:
-                    self.counter_nan_occurrences[
-                        ("q_b_proj", phase)][engine_idx].inc()
-                if scheduler_stats.nan_in_kv_a_ln:
-                    self.counter_nan_occurrences[
-                        ("kv_a_ln", phase)][engine_idx].inc()
-                if scheduler_stats.nan_in_rotary:
-                    self.counter_nan_occurrences[
-                        ("rotary", phase)][engine_idx].inc()
-                if scheduler_stats.nan_in_o_proj:
-                    self.counter_nan_occurrences[
-                        ("o_proj", phase)][engine_idx].inc()
-                if scheduler_stats.nan_in_post_attn_ln:
-                    self.counter_nan_occurrences[
-                        ("post_attn_ln", phase)][engine_idx].inc()
-                if scheduler_stats.nan_in_pre_norm_hidden:
-                    self.counter_nan_occurrences[
-                        ("pre_norm_hidden", phase)][engine_idx].inc()
-                if scheduler_stats.nan_in_pre_norm_residual:
-                    self.counter_nan_occurrences[
-                        ("pre_norm_residual", phase)][engine_idx].inc()
-                if scheduler_stats.nan_in_embedding:
-                    self.counter_nan_occurrences[
-                        ("embedding", phase)][engine_idx].inc()
-                if scheduler_stats.nan_real_output:
-                    self.counter_nan_occurrences[
-                        ("real_output", phase)][engine_idx].inc()
-                if scheduler_stats.nan_padded_output:
-                    self.counter_nan_occurrences[
-                        ("padded_output", phase)][engine_idx].inc()
+            if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
+                self.gauge_nan_origin[engine_idx].set(
+                    scheduler_stats.nan_origin_component)
+                if scheduler_stats.nan_phase:
+                    phase = scheduler_stats.nan_phase
+                    # Record origin component as a counter.
+                    if scheduler_stats.nan_origin_name:
+                        self.counter_nan_occurrences[
+                            (scheduler_stats.nan_origin_name, phase)
+                        ][engine_idx].inc()
+                    # Record derived sources.
+                    if scheduler_stats.nan_in_logits:
+                        self.counter_nan_occurrences[
+                            ("logits", phase)][engine_idx].inc()
+                    if scheduler_stats.nan_in_final_norm:
+                        self.counter_nan_occurrences[
+                            ("final_norm", phase)][engine_idx].inc()
+                    if scheduler_stats.nan_in_lm_head:
+                        self.counter_nan_occurrences[
+                            ("lm_head", phase)][engine_idx].inc()
+                    if scheduler_stats.nan_real_output:
+                        self.counter_nan_occurrences[
+                            ("real_output", phase)][engine_idx].inc()
+                    if scheduler_stats.nan_padded_output:
+                        self.counter_nan_occurrences[
+                            ("padded_output", phase)][engine_idx].inc()
                 self.gauge_nan_first_layer_hidden[engine_idx].set(
                     scheduler_stats.nan_first_layer_hidden)
                 self.gauge_nan_first_layer_residual[engine_idx].set(

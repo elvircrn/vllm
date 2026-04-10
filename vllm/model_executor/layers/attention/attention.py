@@ -490,7 +490,8 @@ class Attention(nn.Module, AttentionLayerBase):
                 kv_cache_dummy_dep=kv_cache_dummy_dep,
             )
         if self._nan_flag is not None:
-            torch.ops.vllm.nan_detect(output, self._nan_flag)
+            torch.ops.vllm.nan_first_component(
+                output, self._nan_flag, NAN_COMPONENT_ATTENTION)
         return output.view(-1, hidden_size)
 
     def calc_kv_scales(self, query, key, value):
@@ -783,4 +784,69 @@ direct_register_custom_op(
     op_func=nan_detect_at,
     mutates_args=["flags"],
     fake_impl=nan_detect_at_fake,
+)
+
+
+# Component IDs for nan_first_component origin tracking.
+# Order matches the forward pass pipeline through a decoder layer.
+NAN_COMPONENT_EMBEDDING = 0
+NAN_COMPONENT_INPUT_LN = 1
+NAN_COMPONENT_QKV_PROJ = 2
+NAN_COMPONENT_Q_A_LN = 3
+NAN_COMPONENT_Q_B_PROJ = 4
+NAN_COMPONENT_KV_A_LN = 5
+NAN_COMPONENT_ROTARY = 6
+NAN_COMPONENT_ATTENTION = 7
+NAN_COMPONENT_O_PROJ = 8
+NAN_COMPONENT_POST_ATTN_LN = 9
+NAN_COMPONENT_MOE = 10
+NAN_COMPONENT_PRE_NORM_HIDDEN = 11
+NAN_COMPONENT_PRE_NORM_RESIDUAL = 12
+
+NAN_COMPONENT_NAMES = {
+    NAN_COMPONENT_EMBEDDING: "embedding",
+    NAN_COMPONENT_INPUT_LN: "input_ln",
+    NAN_COMPONENT_QKV_PROJ: "qkv_proj",
+    NAN_COMPONENT_Q_A_LN: "q_a_ln",
+    NAN_COMPONENT_Q_B_PROJ: "q_b_proj",
+    NAN_COMPONENT_KV_A_LN: "kv_a_ln",
+    NAN_COMPONENT_ROTARY: "rotary",
+    NAN_COMPONENT_ATTENTION: "attention",
+    NAN_COMPONENT_O_PROJ: "o_proj",
+    NAN_COMPONENT_POST_ATTN_LN: "post_attn_ln",
+    NAN_COMPONENT_MOE: "moe",
+    NAN_COMPONENT_PRE_NORM_HIDDEN: "pre_norm_hidden",
+    NAN_COMPONENT_PRE_NORM_RESIDUAL: "pre_norm_residual",
+}
+
+
+def nan_first_component(tensor: torch.Tensor, flag: torch.Tensor,
+                        component_id: int) -> None:
+    """Record the first component whose output contains NaN.
+
+    flag is a 1-element int32 tensor, reset to -1 each step.
+    Only writes component_id if the tensor has NaN AND no prior
+    component has been recorded yet (flag == -1). Layers execute
+    sequentially (0→N), so the first component in the first layer
+    to see NaN wins. All operations are GPU-side with no Python
+    branching, so this is safe for CUDA graph capture/replay.
+    """
+    has_nan = torch.any(torch.isnan(tensor))
+    not_yet_set = (flag[0] == -1)
+    flag[0] = torch.where(has_nan & not_yet_set,
+                          torch.tensor(component_id, dtype=torch.int32,
+                                       device=flag.device),
+                          flag[0])
+
+
+def nan_first_component_fake(tensor: torch.Tensor, flag: torch.Tensor,
+                             component_id: int) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="nan_first_component",
+    op_func=nan_first_component,
+    mutates_args=["flag"],
+    fake_impl=nan_first_component_fake,
 )
