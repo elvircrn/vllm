@@ -837,21 +837,21 @@ def nan_first_component(tensor: torch.Tensor, flag_all: torch.Tensor,
     All operations are pure GPU arithmetic — no torch.tensor() calls,
     no CPU→GPU copies — so this is safe for CUDA graph capture/replay.
     """
-    # Flatten to 2D [N, D] so the mask broadcast works for any tensor shape.
+    # Flatten to 2D [N, D] then reduce per-token → [N] bool vector.
+    # This avoids materializing a full [N, D] broadcast with the mask.
     flat = tensor.reshape(tensor.shape[0], -1)
-    nan_vals = torch.isnan(flat)
+    has_nan_per_token = torch.any(torch.isnan(flat), dim=-1)  # [N]
 
     # All tokens (real + padded).
-    # write_all is 1 if we should write, 0 otherwise (int32 arithmetic).
-    has_any_nan = torch.any(nan_vals)
+    has_any_nan = torch.any(has_nan_per_token)
     not_yet_all = (flag_all[0] == -1)
     write_all = (has_any_nan & not_yet_all).to(torch.int32)
     # flag = flag * (1 - w) + id * w  →  keeps flag when w=0, sets id when w=1
     flag_all[0] = flag_all[0] * (1 - write_all) + component_id * write_all
 
-    # Real tokens only.
-    mask_col = real_mask[:flat.shape[0]].unsqueeze(-1)  # [N, 1]
-    has_real_nan = torch.any(nan_vals & mask_col)
+    # Real tokens only — mask is [N], has_nan_per_token is [N], cheap AND.
+    has_real_nan = torch.any(
+        has_nan_per_token & real_mask[:has_nan_per_token.shape[0]])
     not_yet_real = (flag_real[0] == -1)
     write_real = (has_real_nan & not_yet_real).to(torch.int32)
     flag_real[0] = flag_real[0] * (1 - write_real) + component_id * write_real
