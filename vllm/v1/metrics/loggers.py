@@ -152,6 +152,12 @@ class LoggingStatLogger(StatLoggerBase):
                 sources.append("input_ln")
             if scheduler_stats.nan_in_qkv_proj:
                 sources.append("qkv_proj")
+            if scheduler_stats.nan_in_q_a_ln:
+                sources.append("q_a_ln")
+            if scheduler_stats.nan_in_q_b_proj:
+                sources.append("q_b_proj")
+            if scheduler_stats.nan_in_kv_a_ln:
+                sources.append("kv_a_ln")
             if scheduler_stats.nan_in_attention:
                 sources.append("attention")
             if scheduler_stats.nan_in_o_proj:
@@ -565,7 +571,9 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             ] = {}
             for source in ("attention", "moe", "logits",
                           "final_norm", "lm_head",
-                          "input_ln", "qkv_proj", "o_proj",
+                          "input_ln", "qkv_proj",
+                          "q_a_ln", "q_b_proj", "kv_a_ln",
+                          "o_proj",
                           "post_attn_ln",
                           "pre_norm_hidden", "pre_norm_residual",
                           "embedding",
@@ -1209,6 +1217,15 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 if scheduler_stats.nan_in_qkv_proj:
                     self.counter_nan_occurrences[
                         ("qkv_proj", phase)][engine_idx].inc()
+                if scheduler_stats.nan_in_q_a_ln:
+                    self.counter_nan_occurrences[
+                        ("q_a_ln", phase)][engine_idx].inc()
+                if scheduler_stats.nan_in_q_b_proj:
+                    self.counter_nan_occurrences[
+                        ("q_b_proj", phase)][engine_idx].inc()
+                if scheduler_stats.nan_in_kv_a_ln:
+                    self.counter_nan_occurrences[
+                        ("kv_a_ln", phase)][engine_idx].inc()
                 if scheduler_stats.nan_in_o_proj:
                     self.counter_nan_occurrences[
                         ("o_proj", phase)][engine_idx].inc()

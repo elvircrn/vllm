@@ -112,6 +112,9 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         # NaN detection flags — assigned by model runner when enabled.
         self._nan_flag_qkv_proj: torch.Tensor | None = None
+        self._nan_flag_q_a_ln: torch.Tensor | None = None
+        self._nan_flag_q_b_proj: torch.Tensor | None = None
+        self._nan_flag_kv_a_ln: torch.Tensor | None = None
         self._nan_flag_o_proj: torch.Tensor | None = None
 
     def forward(
@@ -142,8 +145,15 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 dim=-1,
             )
+            q_c_pre_ln = q_c
             q_c = self.q_a_layernorm(q_c)
+            if self._nan_flag_q_a_ln is not None:
+                torch.ops.vllm.nan_check(
+                    q_c_pre_ln, q_c, self._nan_flag_q_a_ln)
             q = self.q_b_proj(q_c)[0]
+            if self._nan_flag_q_b_proj is not None:
+                torch.ops.vllm.nan_check(
+                    q_c, q, self._nan_flag_q_b_proj)
         else:
             assert self.kv_a_proj_with_mqa is not None, (
                 "kv_a_proj_with_mqa is required when q_lora_rank is None"
@@ -156,6 +166,8 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv_c_normed = self.kv_a_layernorm(kv_c)
+        if self._nan_flag_kv_a_ln is not None:
+            torch.ops.vllm.nan_check(kv_c, kv_c_normed, self._nan_flag_kv_a_ln)
 
         q = q.view(-1, self.num_heads, self.qk_head_dim)
         # Add head dim of 1 to k_pe

@@ -1315,6 +1315,9 @@ class Scheduler(SchedulerInterface):
         nan_in_hidden_states = model_runner_output.nan_in_hidden_states
         nan_in_input_ln = model_runner_output.nan_in_input_ln
         nan_in_qkv_proj = model_runner_output.nan_in_qkv_proj
+        nan_in_q_a_ln = model_runner_output.nan_in_q_a_ln
+        nan_in_q_b_proj = model_runner_output.nan_in_q_b_proj
+        nan_in_kv_a_ln = model_runner_output.nan_in_kv_a_ln
         nan_in_o_proj = model_runner_output.nan_in_o_proj
         nan_in_post_attn_ln = model_runner_output.nan_in_post_attn_ln
         nan_in_pre_norm_hidden = model_runner_output.nan_in_pre_norm_hidden
@@ -1570,7 +1573,9 @@ class Scheduler(SchedulerInterface):
         nan_in_lm_head = nan_in_logits and not nan_in_hidden_states
         has_any_nans = (nan_in_attention or nan_in_moe or nan_in_logits
                         or nan_in_hidden_states or nan_in_input_ln
-                        or nan_in_qkv_proj or nan_in_o_proj
+                        or nan_in_qkv_proj or nan_in_q_a_ln
+                        or nan_in_q_b_proj or nan_in_kv_a_ln
+                        or nan_in_o_proj
                         or nan_in_post_attn_ln
                         or nan_in_pre_norm_hidden
                         or nan_in_pre_norm_residual
@@ -1603,8 +1608,9 @@ class Scheduler(SchedulerInterface):
                 spec_decoding_stats, kv_connector_stats, cudagraph_stats,
                 perf_stats, nan_in_attention, nan_in_moe, nan_in_logits,
                 nan_in_final_norm, nan_in_lm_head,
-                nan_in_input_ln, nan_in_qkv_proj, nan_in_o_proj,
-                nan_in_post_attn_ln,
+                nan_in_input_ln, nan_in_qkv_proj,
+                nan_in_q_a_ln, nan_in_q_b_proj, nan_in_kv_a_ln,
+                nan_in_o_proj, nan_in_post_attn_ln,
                 nan_in_pre_norm_hidden, nan_in_pre_norm_residual,
                 nan_in_embedding,
                 nan_first_layer_hidden, nan_first_layer_residual,
@@ -2006,6 +2012,9 @@ class Scheduler(SchedulerInterface):
         nan_in_lm_head: bool = False,
         nan_in_input_ln: bool = False,
         nan_in_qkv_proj: bool = False,
+        nan_in_q_a_ln: bool = False,
+        nan_in_q_b_proj: bool = False,
+        nan_in_kv_a_ln: bool = False,
         nan_in_o_proj: bool = False,
         nan_in_post_attn_ln: bool = False,
         nan_in_pre_norm_hidden: bool = False,
@@ -2053,6 +2062,9 @@ class Scheduler(SchedulerInterface):
             nan_in_lm_head=nan_in_lm_head,
             nan_in_input_ln=nan_in_input_ln,
             nan_in_qkv_proj=nan_in_qkv_proj,
+            nan_in_q_a_ln=nan_in_q_a_ln,
+            nan_in_q_b_proj=nan_in_q_b_proj,
+            nan_in_kv_a_ln=nan_in_kv_a_ln,
             nan_in_o_proj=nan_in_o_proj,
             nan_in_post_attn_ln=nan_in_post_attn_ln,
             nan_in_pre_norm_hidden=nan_in_pre_norm_hidden,
