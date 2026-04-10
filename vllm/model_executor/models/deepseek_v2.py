@@ -1121,6 +1121,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         # NaN detection flags — assigned by model runner when enabled.
         self._nan_flag_input_ln: torch.Tensor | None = None
         self._nan_flag_post_attn_ln: torch.Tensor | None = None
+        # Per-layer NaN presence flags (written to flags[layer_idx]).
+        self._nan_per_layer_hidden: torch.Tensor | None = None
+        self._nan_per_layer_residual: torch.Tensor | None = None
 
     def forward(
         self,
@@ -1176,6 +1179,12 @@ class DeepseekV2DecoderLayer(nn.Module):
             # The scaling of DeepseekV2MOE output would be done in the forward
             # of DeepseekV2MOE
             hidden_states *= 1.0 / self.routed_scaling_factor
+
+        if self._nan_per_layer_hidden is not None:
+            torch.ops.vllm.nan_detect_at(
+                hidden_states, self._nan_per_layer_hidden, self.layer_idx)
+            torch.ops.vllm.nan_detect_at(
+                residual, self._nan_per_layer_residual, self.layer_idx)
 
         return hidden_states, residual
 
@@ -1234,7 +1243,8 @@ class DeepseekV2Model(nn.Module):
 
         self.aux_hidden_state_layers = tuple[int, ...]()
 
-        # NaN detection flags for pre-final-norm inputs.
+        # NaN detection flags.
+        self._nan_flag_embedding: torch.Tensor | None = None
         self._nan_flag_pre_norm_hidden: torch.Tensor | None = None
         self._nan_flag_pre_norm_residual: torch.Tensor | None = None
 
@@ -1258,6 +1268,9 @@ class DeepseekV2Model(nn.Module):
                         "to DeepseekV2Model.forward"
                     )
                 hidden_states = self.embed_input_ids(input_ids)
+            if self._nan_flag_embedding is not None:
+                torch.ops.vllm.nan_detect(
+                    hidden_states, self._nan_flag_embedding)
             residual = None
         else:
             assert intermediate_tensors is not None

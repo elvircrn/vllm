@@ -146,6 +146,8 @@ class LoggingStatLogger(StatLoggerBase):
     def _track_nan_stats(self, scheduler_stats: SchedulerStats):
         if scheduler_stats.nan_phase:
             sources = []
+            if scheduler_stats.nan_in_embedding:
+                sources.append("embedding")
             if scheduler_stats.nan_in_input_ln:
                 sources.append("input_ln")
             if scheduler_stats.nan_in_qkv_proj:
@@ -169,10 +171,18 @@ class LoggingStatLogger(StatLoggerBase):
             if scheduler_stats.nan_in_logits:
                 sources.append("logits")
             if sources:
+                layer_info = ""
+                if scheduler_stats.nan_first_layer_hidden >= 0:
+                    layer_info += (f" first_layer_hidden="
+                                  f"{scheduler_stats.nan_first_layer_hidden}")
+                if scheduler_stats.nan_first_layer_residual >= 0:
+                    layer_info += (f" first_layer_residual="
+                                  f"{scheduler_stats.nan_first_layer_residual}")
                 logger.warning(
-                    "NaN detected in %s during %s phase",
+                    "NaN detected in %s during %s phase%s",
                     "+".join(sources),
                     scheduler_stats.nan_phase,
+                    layer_info,
                 )
 
     def _get_throughput(self, tracked_stats: int, now: float) -> float:
@@ -553,7 +563,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                           "final_norm", "lm_head",
                           "input_ln", "qkv_proj", "o_proj",
                           "post_attn_ln",
-                          "pre_norm_hidden", "pre_norm_residual"):
+                          "pre_norm_hidden", "pre_norm_residual",
+                          "embedding"):
                 for phase in ("prefill", "decode", "mixed"):
                     self.counter_nan_occurrences[(source, phase)] = {
                         idx: counter_nan_occurrences.labels(
@@ -561,6 +572,29 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                         )
                         for idx in engine_indexes
                     }
+
+            gauge_nan_first_layer_hidden = self._gauge_cls(
+                name="vllm:nan_first_layer_hidden",
+                documentation=(
+                    "First decoder layer index where hidden_states "
+                    "contains NaN (-1 if none)."
+                ),
+                labelnames=labelnames,
+            )
+            self.gauge_nan_first_layer_hidden = create_metric_per_engine(
+                gauge_nan_first_layer_hidden, per_engine_labelvalues
+            )
+            gauge_nan_first_layer_residual = self._gauge_cls(
+                name="vllm:nan_first_layer_residual",
+                documentation=(
+                    "First decoder layer index where residual "
+                    "contains NaN (-1 if none)."
+                ),
+                labelnames=labelnames,
+            )
+            self.gauge_nan_first_layer_residual = create_metric_per_engine(
+                gauge_nan_first_layer_residual, per_engine_labelvalues
+            )
 
         counter_prefix_cache_queries = self._counter_cls(
             name="vllm:prefix_cache_queries",
@@ -1182,6 +1216,13 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 if scheduler_stats.nan_in_pre_norm_residual:
                     self.counter_nan_occurrences[
                         ("pre_norm_residual", phase)][engine_idx].inc()
+                if scheduler_stats.nan_in_embedding:
+                    self.counter_nan_occurrences[
+                        ("embedding", phase)][engine_idx].inc()
+                self.gauge_nan_first_layer_hidden[engine_idx].set(
+                    scheduler_stats.nan_first_layer_hidden)
+                self.gauge_nan_first_layer_residual[engine_idx].set(
+                    scheduler_stats.nan_first_layer_residual)
 
             if self.gauge_lora_info is not None:
                 running_lora_adapters = ",".join(

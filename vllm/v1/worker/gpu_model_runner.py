@@ -499,6 +499,9 @@ class GPUModelRunner(
         self._nan_flag_post_attn_ln: torch.Tensor | None = None
         self._nan_flag_pre_norm_hidden: torch.Tensor | None = None
         self._nan_flag_pre_norm_residual: torch.Tensor | None = None
+        self._nan_flag_embedding: torch.Tensor | None = None
+        self._nan_per_layer_hidden: torch.Tensor | None = None
+        self._nan_per_layer_residual: torch.Tensor | None = None
 
         # Lazy initializations
         # self.model: nn.Module  # Set after load_model
@@ -3378,6 +3381,9 @@ class GPUModelRunner(
         bool,
         bool,
         bool,
+        bool,
+        int,
+        int,
     ]:
         num_nans_in_logits = {}
         nan_in_attention = False
@@ -3388,6 +3394,9 @@ class GPUModelRunner(
         nan_in_post_attn_ln = False
         nan_in_pre_norm_hidden = False
         nan_in_pre_norm_residual = False
+        nan_in_embedding = False
+        nan_first_layer_hidden = -1
+        nan_first_layer_residual = -1
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             num_nans_in_logits = self._get_nans_in_logits(logits)
             if self._nan_flag_attention is not None:
@@ -3401,6 +3410,16 @@ class GPUModelRunner(
                     self._nan_flag_pre_norm_hidden.item()
                 nan_in_pre_norm_residual = \
                     self._nan_flag_pre_norm_residual.item()
+                nan_in_embedding = self._nan_flag_embedding.item()
+                # Find first layer with NaN in hidden/residual.
+                h_flags = self._nan_per_layer_hidden
+                r_flags = self._nan_per_layer_residual
+                if h_flags.any():
+                    nan_first_layer_hidden = int(
+                        h_flags.nonzero(as_tuple=True)[0][0].item())
+                if r_flags.any():
+                    nan_first_layer_residual = int(
+                        r_flags.nonzero(as_tuple=True)[0][0].item())
 
         num_reqs = self.input_batch.num_reqs
         discard_sampled_tokens_req_indices = np.nonzero(
@@ -3514,6 +3533,9 @@ class GPUModelRunner(
             nan_in_post_attn_ln,
             nan_in_pre_norm_hidden,
             nan_in_pre_norm_residual,
+            nan_in_embedding,
+            nan_first_layer_hidden,
+            nan_first_layer_residual,
         )
 
     @contextmanager
@@ -4061,6 +4083,9 @@ class GPUModelRunner(
             self._nan_flag_post_attn_ln.fill_(False)
             self._nan_flag_pre_norm_hidden.fill_(False)
             self._nan_flag_pre_norm_residual.fill_(False)
+            self._nan_flag_embedding.fill_(False)
+            self._nan_per_layer_hidden.fill_(False)
+            self._nan_per_layer_residual.fill_(False)
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
@@ -4346,6 +4371,9 @@ class GPUModelRunner(
                 nan_in_post_attn_ln,
                 nan_in_pre_norm_hidden,
                 nan_in_pre_norm_residual,
+                nan_in_embedding,
+                nan_first_layer_hidden,
+                nan_first_layer_residual,
             ) = self._bookkeeping_sync(
                 scheduler_output,
                 sampler_output,
@@ -4409,6 +4437,9 @@ class GPUModelRunner(
                 nan_in_post_attn_ln=nan_in_post_attn_ln,
                 nan_in_pre_norm_hidden=nan_in_pre_norm_hidden,
                 nan_in_pre_norm_residual=nan_in_pre_norm_residual,
+                nan_in_embedding=nan_in_embedding,
+                nan_first_layer_hidden=nan_first_layer_hidden,
+                nan_first_layer_residual=nan_first_layer_residual,
                 cudagraph_stats=cudagraph_stats,
             )
 
@@ -5013,6 +5044,18 @@ class GPUModelRunner(
             1, dtype=torch.bool, device=self.device)
         self._nan_flag_pre_norm_residual = torch.zeros(
             1, dtype=torch.bool, device=self.device)
+        self._nan_flag_embedding = torch.zeros(
+            1, dtype=torch.bool, device=self.device)
+
+        # Count decoder layers for per-layer tracking.
+        num_layers = sum(
+            1 for m in self.model.modules()
+            if isinstance(m, DeepseekV2DecoderLayer)
+        )
+        self._nan_per_layer_hidden = torch.zeros(
+            num_layers, dtype=torch.bool, device=self.device)
+        self._nan_per_layer_residual = torch.zeros(
+            num_layers, dtype=torch.bool, device=self.device)
 
         for module in self.model.modules():
             if isinstance(module, Attention):
@@ -5025,7 +5068,10 @@ class GPUModelRunner(
             elif isinstance(module, DeepseekV2DecoderLayer):
                 module._nan_flag_input_ln = self._nan_flag_input_ln
                 module._nan_flag_post_attn_ln = self._nan_flag_post_attn_ln
+                module._nan_per_layer_hidden = self._nan_per_layer_hidden
+                module._nan_per_layer_residual = self._nan_per_layer_residual
             elif isinstance(module, DeepseekV2Model):
+                module._nan_flag_embedding = self._nan_flag_embedding
                 module._nan_flag_pre_norm_hidden = \
                     self._nan_flag_pre_norm_hidden
                 module._nan_flag_pre_norm_residual = \
