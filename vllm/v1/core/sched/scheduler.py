@@ -1310,6 +1310,8 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
+        nan_in_attention = model_runner_output.nan_in_attention
+        nan_in_moe = model_runner_output.nan_in_moe
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
 
@@ -1546,9 +1548,37 @@ class Scheduler(SchedulerInterface):
                     )
             finished_req_ids.clear()
 
+        # Compute NaN source/phase info for metrics.
+        nan_in_logits = (num_nans_in_logits is not None
+                         and any(v > 0 for v in num_nans_in_logits.values()))
+        has_any_nans = nan_in_attention or nan_in_moe or nan_in_logits
+        nan_phase: str | None = None
+        if has_any_nans:
+            batch_has_prefill = False
+            batch_has_decode = False
+            for req_id, num_tokens in num_scheduled_tokens.items():
+                request = self.requests.get(req_id)
+                if request is None:
+                    continue
+                computed_before = request.num_computed_tokens - num_tokens
+                if computed_before < request.num_prompt_tokens:
+                    batch_has_prefill = True
+                else:
+                    batch_has_decode = True
+                if batch_has_prefill and batch_has_decode:
+                    break
+            if batch_has_prefill and batch_has_decode:
+                nan_phase = "mixed"
+            elif batch_has_prefill:
+                nan_phase = "prefill"
+            else:
+                nan_phase = "decode"
+
         if (
             stats := self.make_stats(
-                spec_decoding_stats, kv_connector_stats, cudagraph_stats, perf_stats
+                spec_decoding_stats, kv_connector_stats, cudagraph_stats,
+                perf_stats, nan_in_attention, nan_in_moe, nan_in_logits,
+                nan_phase,
             )
         ) is not None:
             # Return stats to only one of the front-ends.
@@ -1939,6 +1969,10 @@ class Scheduler(SchedulerInterface):
         kv_connector_stats: KVConnectorStats | None = None,
         cudagraph_stats: CUDAGraphStat | None = None,
         perf_stats: PerfStats | None = None,
+        nan_in_attention: bool = False,
+        nan_in_moe: bool = False,
+        nan_in_logits: bool = False,
+        nan_phase: str | None = None,
     ) -> SchedulerStats | None:
         if not self.log_stats:
             return None
@@ -1969,6 +2003,10 @@ class Scheduler(SchedulerInterface):
             kv_connector_stats=connector_stats_payload,
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
+            nan_in_attention=nan_in_attention,
+            nan_in_moe=nan_in_moe,
+            nan_in_logits=nan_in_logits,
+            nan_phase=nan_phase,
         )
 
     def _get_encoder_cache_usage(self) -> float:

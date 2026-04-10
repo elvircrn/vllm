@@ -196,6 +196,14 @@ class SchedulerStats:
 
     perf_stats: PerfStats | None = None
 
+    # NaN source/phase tracking for this step.
+    # source: which layer type produced NaNs (attention, moe, logits)
+    # phase: prefill, decode, or mixed
+    nan_in_attention: bool = False
+    nan_in_moe: bool = False
+    nan_in_logits: bool = False
+    nan_phase: str | None = None  # "prefill", "decode", or "mixed"
+
 
 @dataclass
 class RequestStateStats:

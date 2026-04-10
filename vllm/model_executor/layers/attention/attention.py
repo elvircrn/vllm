@@ -394,6 +394,12 @@ class Attention(nn.Module, AttentionLayerBase):
                 else GroupShape.PER_TENSOR,
             )
 
+        # NaN detection flag. Set by model runner to a shared pre-allocated
+        # GPU tensor when VLLM_COMPUTE_NANS_IN_LOGITS is enabled. The
+        # nan_check custom op writes to this tensor during forward, and its
+        # operations are captured by CUDA graphs.
+        self._nan_flag: torch.Tensor | None = None
+
     def forward(
         self,
         query: torch.Tensor,
@@ -483,6 +489,8 @@ class Attention(nn.Module, AttentionLayerBase):
                 self.layer_name,
                 kv_cache_dummy_dep=kv_cache_dummy_dep,
             )
+        if self._nan_flag is not None:
+            torch.ops.vllm.nan_check(query, output, self._nan_flag)
         return output.view(-1, hidden_size)
 
     def calc_kv_scales(self, query, key, value):
@@ -708,4 +716,35 @@ direct_register_custom_op(
     op_func=unified_attention_with_output,
     mutates_args=["output", "output_block_scale"],
     fake_impl=unified_attention_with_output_fake,
+)
+
+
+def nan_check(inp: torch.Tensor, output: torch.Tensor,
+              flag: torch.Tensor) -> None:
+    """Flag NaN only if this layer ORIGINATED the NaN.
+
+    Checks that the output has NaN but the input does NOT. This ensures
+    that only the first layer to produce NaN is flagged, rather than all
+    downstream layers that merely propagate it.
+
+    Registered as a custom op so it is opaque to torch.compile (no graph
+    breaks) and its GPU operations are captured by CUDA graphs. The flag
+    tensor must be pre-allocated and persistent so that CUDA graph replay
+    writes to the correct memory address.
+    """
+    has_nan_output = torch.any(torch.isnan(output))
+    has_nan_input = torch.any(torch.isnan(inp))
+    flag.logical_or_(has_nan_output & ~has_nan_input)
+
+
+def nan_check_fake(inp: torch.Tensor, output: torch.Tensor,
+                   flag: torch.Tensor) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="nan_check",
+    op_func=nan_check,
+    mutates_args=["flag"],
+    fake_impl=nan_check_fake,
 )

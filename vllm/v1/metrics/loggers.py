@@ -143,6 +143,22 @@ class LoggingStatLogger(StatLoggerBase):
         self.num_corrupted_reqs += iteration_stats.num_corrupted_reqs
         self.num_preemptions += iteration_stats.num_preempted_reqs
 
+    def _track_nan_stats(self, scheduler_stats: SchedulerStats):
+        if scheduler_stats.nan_phase:
+            sources = []
+            if scheduler_stats.nan_in_attention:
+                sources.append("attention")
+            if scheduler_stats.nan_in_moe:
+                sources.append("moe")
+            if scheduler_stats.nan_in_logits:
+                sources.append("logits")
+            if sources:
+                logger.warning(
+                    "NaN detected in %s during %s phase",
+                    "+".join(sources),
+                    scheduler_stats.nan_phase,
+                )
+
     def _get_throughput(self, tracked_stats: int, now: float) -> float:
         # Compute summary metrics for tracked stats
         delta_time = now - self.last_log_time
@@ -177,6 +193,8 @@ class LoggingStatLogger(StatLoggerBase):
                 self.spec_decoding_logging.observe(scheduler_stats.spec_decoding_stats)
             if kv_connector_stats := scheduler_stats.kv_connector_stats:
                 self.kv_connector_logging.observe(kv_connector_stats)
+            if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
+                self._track_nan_stats(scheduler_stats)
             if (
                 self.cudagraph_logging is not None
                 and scheduler_stats.cudagraph_stats is not None
@@ -501,6 +519,28 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.counter_corrupted_requests = create_metric_per_engine(
                 counter_corrupted_requests, per_engine_labelvalues
             )
+
+            # NaN occurrence counter with source (attention/moe/logits) and
+            # phase (prefill/decode/mixed) labels.
+            counter_nan_occurrences = self._counter_cls(
+                name="vllm:nan_occurrences_total",
+                documentation=(
+                    "Number of forward steps where NaN was first produced "
+                    "by a given layer type, labeled by source and batch phase."
+                ),
+                labelnames=labelnames + ["source", "phase"],
+            )
+            self.counter_nan_occurrences: dict[
+                tuple[str, str], dict[int, Counter]
+            ] = {}
+            for source in ("attention", "moe", "logits"):
+                for phase in ("prefill", "decode", "mixed"):
+                    self.counter_nan_occurrences[(source, phase)] = {
+                        idx: counter_nan_occurrences.labels(
+                            model_name, str(idx), source, phase
+                        )
+                        for idx in engine_indexes
+                    }
 
         counter_prefix_cache_queries = self._counter_cls(
             name="vllm:prefix_cache_queries",
@@ -1086,6 +1126,18 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     idle_hist.observe(event.idle_seconds)
                     for gap in event.reuse_gaps_seconds:
                         reuse_hist.observe(gap)
+
+            if envs.VLLM_COMPUTE_NANS_IN_LOGITS and scheduler_stats.nan_phase:
+                phase = scheduler_stats.nan_phase
+                if scheduler_stats.nan_in_attention:
+                    self.counter_nan_occurrences[
+                        ("attention", phase)][engine_idx].inc()
+                if scheduler_stats.nan_in_moe:
+                    self.counter_nan_occurrences[
+                        ("moe", phase)][engine_idx].inc()
+                if scheduler_stats.nan_in_logits:
+                    self.counter_nan_occurrences[
+                        ("logits", phase)][engine_idx].inc()
 
             if self.gauge_lora_info is not None:
                 running_lora_adapters = ",".join(

@@ -480,13 +480,19 @@ class GPUModelRunner(
         self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
 
         self.eplb_state: EplbState | None = None
-        # NOTE(yongji): flag to temporarily disable EPLB during scaling up/down
-        self.eep_eplb_suppressed = False
         """
         State of the expert parallelism load balancer.
 
         Will be lazily initialized when the model is loaded.
         """
+        # NOTE(yongji): flag to temporarily disable EPLB during scaling up/down
+        self.eep_eplb_suppressed = False
+
+        # NaN detection flag tensors, shared across all layers of each type.
+        # Pre-allocated with fixed addresses for CUDA graph compatibility.
+        # Set up in load_model() when VLLM_COMPUTE_NANS_IN_LOGITS is enabled.
+        self._nan_flag_attention: torch.Tensor | None = None
+        self._nan_flag_moe: torch.Tensor | None = None
 
         # Lazy initializations
         # self.model: nn.Module  # Set after load_model
@@ -3358,10 +3364,17 @@ class GPUModelRunner(
         list[str],
         dict[str, int],
         list[int],
+        bool,
+        bool,
     ]:
         num_nans_in_logits = {}
+        nan_in_attention = False
+        nan_in_moe = False
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             num_nans_in_logits = self._get_nans_in_logits(logits)
+            if self._nan_flag_attention is not None:
+                nan_in_attention = self._nan_flag_attention.item()
+                nan_in_moe = self._nan_flag_moe.item()
 
         num_reqs = self.input_batch.num_reqs
         discard_sampled_tokens_req_indices = np.nonzero(
@@ -3467,6 +3480,8 @@ class GPUModelRunner(
             req_ids_output_copy,
             req_id_to_index_output_copy,
             invalid_req_indices,
+            nan_in_attention,
+            nan_in_moe,
         )
 
     @contextmanager
@@ -4004,6 +4019,11 @@ class GPUModelRunner(
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
 
+        # Reset NaN detection flags before forward pass.
+        if self._nan_flag_attention is not None:
+            self._nan_flag_attention.fill_(False)
+            self._nan_flag_moe.fill_(False)
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         # When spec decode is enabled, defer connector finalization
@@ -4280,6 +4300,8 @@ class GPUModelRunner(
                 req_ids_output_copy,
                 req_id_to_index_output_copy,
                 invalid_req_indices,
+                nan_in_attention,
+                nan_in_moe,
             ) = self._bookkeeping_sync(
                 scheduler_output,
                 sampler_output,
@@ -4326,6 +4348,8 @@ class GPUModelRunner(
                 if self.supports_mm_inputs
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
+                nan_in_attention=nan_in_attention,
+                nan_in_moe=nan_in_moe,
                 cudagraph_stats=cudagraph_stats,
             )
 
@@ -4894,7 +4918,28 @@ class GPUModelRunner(
                     self.model, self.vllm_config, CUDAGraphMode.NONE, self.device
                 )
 
+        # Wire up NaN detection flags on Attention and FusedMoE modules.
+        if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
+            self._setup_nan_detection_flags()
+
         get_offloader().post_init()
+
+    def _setup_nan_detection_flags(self) -> None:
+        """Pre-allocate shared NaN flag tensors and assign them to all
+        Attention and FusedMoE modules. The nan_check custom op writes to
+        these during forward and its operations are captured by CUDA graphs."""
+        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+
+        self._nan_flag_attention = torch.zeros(
+            1, dtype=torch.bool, device=self.device)
+        self._nan_flag_moe = torch.zeros(
+            1, dtype=torch.bool, device=self.device)
+
+        for module in self.model.modules():
+            if isinstance(module, Attention):
+                module._nan_flag = self._nan_flag_attention
+            elif isinstance(module, FusedMoE):
+                module._nan_flag = self._nan_flag_moe
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         """Extract Eagle3 auxiliary layer indices from speculative config.

@@ -583,6 +583,12 @@ class FusedMoE(CustomOp):
             enable_dbo=self.vllm_config.parallel_config.enable_dbo,
         )
 
+        # NaN detection flag. Set by model runner to a shared pre-allocated
+        # GPU tensor when VLLM_COMPUTE_NANS_IN_LOGITS is enabled. The
+        # nan_check custom op writes to this tensor during forward, and its
+        # operations are captured by CUDA graphs.
+        self._nan_flag: torch.Tensor | None = None
+
     # TODO(bnell): This method is provided as a hook so vllm/lora/layers/fused_moe.py
     # can safely swap out the quant_method. We should figure out a less
     # intrusive way to do this.
@@ -1540,7 +1546,11 @@ class FusedMoE(CustomOp):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        return self.forward_native(hidden_states, router_logits)
+        result = self.forward_native(hidden_states, router_logits)
+        if self._nan_flag is not None:
+            output = result[0] if isinstance(result, tuple) else result
+            torch.ops.vllm.nan_check(hidden_states, output, self._nan_flag)
+        return result
 
     @classmethod
     def make_expert_params_mapping(
