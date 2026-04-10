@@ -1550,7 +1550,8 @@ class FusedMoE(CustomOp):
         if self._nan_flag is not None:
             output = result[0] if isinstance(result, tuple) else result
             torch.ops.vllm.nan_first_component(
-                output, self._nan_flag, 10)  # MOE
+                output, self._nan_flag, self._nan_flag_real,
+                10, self._nan_real_mask)  # MOE
         return result
 
     @classmethod

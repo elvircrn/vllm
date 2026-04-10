@@ -488,11 +488,13 @@ class GPUModelRunner(
         # NOTE(yongji): flag to temporarily disable EPLB during scaling up/down
         self.eep_eplb_suppressed = False
 
-        # NaN origin tracking. Single int32 flag reset to -1 each step.
-        # nan_first_component records the ID of the first component whose
-        # output contains NaN. Pre-allocated with fixed address for CUDA
-        # graph compatibility. Set up in load_model().
+        # NaN origin tracking. Two int32 flags reset to -1 each step.
+        # _nan_origin_flag: first component with NaN in ANY token (real+pad)
+        # _nan_origin_flag_real: first component with NaN in REAL tokens only
+        # _nan_real_mask: bool[max_tokens], True for real token positions
         self._nan_origin_flag: torch.Tensor | None = None
+        self._nan_origin_flag_real: torch.Tensor | None = None
+        self._nan_real_mask: torch.Tensor | None = None
         # Per-layer NaN presence tracking (for first-layer identification).
         self._nan_per_layer_hidden: torch.Tensor | None = None
         self._nan_per_layer_residual: torch.Tensor | None = None
@@ -3367,18 +3369,22 @@ class GPUModelRunner(
         list[str],
         dict[str, int],
         list[int],
-        int,   # nan_origin_component
+        int,   # nan_origin_component (all tokens)
+        int,   # nan_origin_component_real (real tokens only)
         int,   # nan_first_layer_hidden
         int,   # nan_first_layer_residual
     ]:
         num_nans_in_logits = {}
         nan_origin_component = -1
+        nan_origin_component_real = -1
         nan_first_layer_hidden = -1
         nan_first_layer_residual = -1
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             num_nans_in_logits = self._get_nans_in_logits(logits)
             if self._nan_origin_flag is not None:
                 nan_origin_component = int(self._nan_origin_flag.item())
+                nan_origin_component_real = int(
+                    self._nan_origin_flag_real.item())
                 # Find first layer with NaN in hidden/residual.
                 h_flags = self._nan_per_layer_hidden
                 r_flags = self._nan_per_layer_residual
@@ -3494,6 +3500,7 @@ class GPUModelRunner(
             req_id_to_index_output_copy,
             invalid_req_indices,
             nan_origin_component,
+            nan_origin_component_real,
             nan_first_layer_hidden,
             nan_first_layer_residual,
         )
@@ -4033,9 +4040,13 @@ class GPUModelRunner(
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
 
-        # Reset NaN detection flags before forward pass.
+        # Reset NaN detection flags and update real-token mask.
         if self._nan_origin_flag is not None:
             self._nan_origin_flag.fill_(-1)
+            self._nan_origin_flag_real.fill_(-1)
+            num_real = scheduler_output.total_num_scheduled_tokens
+            self._nan_real_mask.fill_(False)
+            self._nan_real_mask[:num_real] = True
             self._nan_per_layer_hidden.fill_(False)
             self._nan_per_layer_residual.fill_(False)
 
@@ -4316,6 +4327,7 @@ class GPUModelRunner(
                 req_id_to_index_output_copy,
                 invalid_req_indices,
                 nan_origin_component,
+                nan_origin_component_real,
                 nan_first_layer_hidden,
                 nan_first_layer_residual,
             ) = self._bookkeeping_sync(
@@ -4387,6 +4399,7 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 nan_origin_component=nan_origin_component,
+                nan_origin_component_real=nan_origin_component_real,
                 nan_in_hidden_states=nan_in_hidden_states,
                 nan_first_layer_hidden=nan_first_layer_hidden,
                 nan_first_layer_residual=nan_first_layer_residual,
@@ -4967,9 +4980,9 @@ class GPUModelRunner(
         get_offloader().post_init()
 
     def _setup_nan_detection_flags(self) -> None:
-        """Pre-allocate the shared NaN origin flag and per-layer tracking
-        tensors, then assign them to all relevant modules. The
-        nan_first_component custom op writes to the origin flag during
+        """Pre-allocate the shared NaN origin flags, real-token mask, and
+        per-layer tracking tensors, then assign them to all relevant modules.
+        The nan_first_component custom op writes to the origin flags during
         forward and its operations are captured by CUDA graphs."""
         from vllm.model_executor.layers.fused_moe.layer import FusedMoE
         from vllm.model_executor.layers.mla import (
@@ -4980,9 +4993,18 @@ class GPUModelRunner(
             DeepseekV2Model,
         )
 
-        # Single int32 flag: -1 = no NaN yet, otherwise component ID.
+        # Two int32 flags: -1 = no NaN yet, otherwise component ID.
+        # flag_all: any token (real + padded)
+        # flag_real: real tokens only (using mask)
         self._nan_origin_flag = torch.full(
             (1,), -1, dtype=torch.int32, device=self.device)
+        self._nan_origin_flag_real = torch.full(
+            (1,), -1, dtype=torch.int32, device=self.device)
+
+        # Bool mask: True for real token positions, False for padding.
+        # Updated each step before the forward pass.
+        self._nan_real_mask = torch.zeros(
+            self.max_num_tokens, dtype=torch.bool, device=self.device)
 
         # Count decoder layers for per-layer tracking.
         num_layers = sum(
@@ -4997,16 +5019,26 @@ class GPUModelRunner(
         for module in self.model.modules():
             if isinstance(module, Attention):
                 module._nan_flag = self._nan_origin_flag
+                module._nan_flag_real = self._nan_origin_flag_real
+                module._nan_real_mask = self._nan_real_mask
             elif isinstance(module, FusedMoE):
                 module._nan_flag = self._nan_origin_flag
+                module._nan_flag_real = self._nan_origin_flag_real
+                module._nan_real_mask = self._nan_real_mask
             elif isinstance(module, MultiHeadLatentAttentionWrapper):
                 module._nan_origin_flag = self._nan_origin_flag
+                module._nan_origin_flag_real = self._nan_origin_flag_real
+                module._nan_real_mask = self._nan_real_mask
             elif isinstance(module, DeepseekV2DecoderLayer):
                 module._nan_origin_flag = self._nan_origin_flag
+                module._nan_origin_flag_real = self._nan_origin_flag_real
+                module._nan_real_mask = self._nan_real_mask
                 module._nan_per_layer_hidden = self._nan_per_layer_hidden
                 module._nan_per_layer_residual = self._nan_per_layer_residual
             elif isinstance(module, DeepseekV2Model):
                 module._nan_origin_flag = self._nan_origin_flag
+                module._nan_origin_flag_real = self._nan_origin_flag_real
+                module._nan_real_mask = self._nan_real_mask
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         """Extract Eagle3 auxiliary layer indices from speculative config.

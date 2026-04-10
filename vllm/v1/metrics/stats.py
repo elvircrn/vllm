@@ -199,8 +199,10 @@ class SchedulerStats:
     # NaN origin tracking for this step.
     # nan_origin_component: component ID that first produced NaN (-1 = none)
     # nan_origin_name: human-readable name of the origin component
-    nan_origin_component: int = -1
+    nan_origin_component: int = -1       # all tokens (real + padded)
     nan_origin_name: str | None = None
+    nan_origin_component_real: int = -1  # real tokens only
+    nan_origin_name_real: str | None = None
     nan_in_logits: bool = False
     nan_in_final_norm: bool = False
     nan_in_lm_head: bool = False

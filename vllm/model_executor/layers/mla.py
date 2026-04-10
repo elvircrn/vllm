@@ -110,10 +110,10 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         self.prefix = prefix
 
-        # NaN first-component flag — shared int32 tensor, reset to -1 each
-        # step. nan_first_component records the ID of the first component
-        # whose output contains NaN. Assigned by model runner.
+        # NaN origin tracking — assigned by model runner.
         self._nan_origin_flag: torch.Tensor | None = None
+        self._nan_origin_flag_real: torch.Tensor | None = None
+        self._nan_real_mask: torch.Tensor | None = None
 
     def forward(
         self,
@@ -138,7 +138,9 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
             if self._nan_origin_flag is not None:
                 torch.ops.vllm.nan_first_component(
-                    qkv_lora, self._nan_origin_flag, 2)  # QKV_PROJ
+                    qkv_lora, self._nan_origin_flag,
+                    self._nan_origin_flag_real, 2,
+                    self._nan_real_mask)  # QKV_PROJ
             q_c, kv_lora = qkv_lora.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 dim=-1,
@@ -146,11 +148,15 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             q_c = self.q_a_layernorm(q_c)
             if self._nan_origin_flag is not None:
                 torch.ops.vllm.nan_first_component(
-                    q_c, self._nan_origin_flag, 3)  # Q_A_LN
+                    q_c, self._nan_origin_flag,
+                    self._nan_origin_flag_real, 3,
+                    self._nan_real_mask)  # Q_A_LN
             q = self.q_b_proj(q_c)[0]
             if self._nan_origin_flag is not None:
                 torch.ops.vllm.nan_first_component(
-                    q, self._nan_origin_flag, 4)  # Q_B_PROJ
+                    q, self._nan_origin_flag,
+                    self._nan_origin_flag_real, 4,
+                    self._nan_real_mask)  # Q_B_PROJ
         else:
             assert self.kv_a_proj_with_mqa is not None, (
                 "kv_a_proj_with_mqa is required when q_lora_rank is None"
@@ -165,7 +171,9 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         kv_c_normed = self.kv_a_layernorm(kv_c)
         if self._nan_origin_flag is not None:
             torch.ops.vllm.nan_first_component(
-                kv_c_normed, self._nan_origin_flag, 5)  # KV_A_LN
+                kv_c_normed, self._nan_origin_flag,
+                self._nan_origin_flag_real, 5,
+                self._nan_real_mask)  # KV_A_LN
 
         q = q.view(-1, self.num_heads, self.qk_head_dim)
         # Add head dim of 1 to k_pe
@@ -177,7 +185,9 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             )
             if self._nan_origin_flag is not None:
                 torch.ops.vllm.nan_first_component(
-                    q, self._nan_origin_flag, 6)  # ROTARY
+                    q, self._nan_origin_flag,
+                    self._nan_origin_flag_real, 6,
+                    self._nan_real_mask)  # ROTARY
 
         if self.indexer and self.is_sparse:
             _topk_indices = self.indexer(
@@ -197,5 +207,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         output, _ = self.o_proj(attn_out)
         if self._nan_origin_flag is not None:
             torch.ops.vllm.nan_first_component(
-                output, self._nan_origin_flag, 8)  # O_PROJ
+                output, self._nan_origin_flag,
+                self._nan_origin_flag_real, 8,
+                self._nan_real_mask)  # O_PROJ
         return output

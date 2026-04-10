@@ -491,7 +491,8 @@ class Attention(nn.Module, AttentionLayerBase):
             )
         if self._nan_flag is not None:
             torch.ops.vllm.nan_first_component(
-                output, self._nan_flag, NAN_COMPONENT_ATTENTION)
+                output, self._nan_flag, self._nan_flag_real,
+                NAN_COMPONENT_ATTENTION, self._nan_real_mask)
         return output.view(-1, hidden_size)
 
     def calc_kv_scales(self, query, key, value):
@@ -820,33 +821,54 @@ NAN_COMPONENT_NAMES = {
 }
 
 
-def nan_first_component(tensor: torch.Tensor, flag: torch.Tensor,
-                        component_id: int) -> None:
+def nan_first_component(tensor: torch.Tensor, flag_all: torch.Tensor,
+                        flag_real: torch.Tensor, component_id: int,
+                        real_mask: torch.Tensor) -> None:
     """Record the first component whose output contains NaN.
 
-    flag is a 1-element int32 tensor, reset to -1 each step.
-    Only writes component_id if the tensor has NaN AND no prior
-    component has been recorded yet (flag == -1). Layers execute
-    sequentially (0→N), so the first component in the first layer
-    to see NaN wins. All operations are GPU-side with no Python
-    branching, so this is safe for CUDA graph capture/replay.
+    Writes to two flags:
+      flag_all  — first component with NaN in ANY token (real or padded)
+      flag_real — first component with NaN in REAL tokens only
+
+    Both are 1-element int32 tensors, reset to -1 each step.
+    real_mask is a bool tensor [max_tokens]; True for real token positions.
+
+    Only writes component_id if NaN is found AND the flag is still -1.
+    All operations are GPU-side with no Python branching — CUDA graph safe.
     """
-    has_nan = torch.any(torch.isnan(tensor))
-    not_yet_set = (flag[0] == -1)
-    flag[0] = torch.where(has_nan & not_yet_set,
-                          torch.tensor(component_id, dtype=torch.int32,
-                                       device=flag.device),
-                          flag[0])
+    # Flatten to 2D [N, D] so the mask broadcast works for any tensor shape.
+    flat = tensor.reshape(tensor.shape[0], -1)
+    nan_vals = torch.isnan(flat)
+
+    # All tokens (real + padded).
+    has_any_nan = torch.any(nan_vals)
+    not_yet_all = (flag_all[0] == -1)
+    flag_all[0] = torch.where(
+        has_any_nan & not_yet_all,
+        torch.tensor(component_id, dtype=torch.int32,
+                     device=flag_all.device),
+        flag_all[0])
+
+    # Real tokens only.
+    mask_col = real_mask[:flat.shape[0]].unsqueeze(-1)  # [N, 1]
+    has_real_nan = torch.any(nan_vals & mask_col)
+    not_yet_real = (flag_real[0] == -1)
+    flag_real[0] = torch.where(
+        has_real_nan & not_yet_real,
+        torch.tensor(component_id, dtype=torch.int32,
+                     device=flag_real.device),
+        flag_real[0])
 
 
-def nan_first_component_fake(tensor: torch.Tensor, flag: torch.Tensor,
-                             component_id: int) -> None:
+def nan_first_component_fake(tensor: torch.Tensor, flag_all: torch.Tensor,
+                             flag_real: torch.Tensor, component_id: int,
+                             real_mask: torch.Tensor) -> None:
     return
 
 
 direct_register_custom_op(
     op_name="nan_first_component",
     op_func=nan_first_component,
-    mutates_args=["flag"],
+    mutates_args=["flag_all", "flag_real"],
     fake_impl=nan_first_component_fake,
 )

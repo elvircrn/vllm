@@ -1311,6 +1311,7 @@ class Scheduler(SchedulerInterface):
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         nan_origin_component = model_runner_output.nan_origin_component
+        nan_origin_component_real = model_runner_output.nan_origin_component_real
         nan_in_hidden_states = model_runner_output.nan_in_hidden_states
         nan_first_layer_hidden = model_runner_output.nan_first_layer_hidden
         nan_first_layer_residual = model_runner_output.nan_first_layer_residual
@@ -1583,17 +1584,20 @@ class Scheduler(SchedulerInterface):
             else:
                 nan_phase = "decode"
 
-        # Resolve origin component name for stats.
+        # Resolve origin component names for stats.
         from vllm.model_executor.layers.attention.attention import (
             NAN_COMPONENT_NAMES,
         )
         nan_origin_name = NAN_COMPONENT_NAMES.get(nan_origin_component)
+        nan_origin_name_real = NAN_COMPONENT_NAMES.get(
+            nan_origin_component_real)
 
         if (
             stats := self.make_stats(
                 spec_decoding_stats, kv_connector_stats, cudagraph_stats,
                 perf_stats,
                 nan_origin_component, nan_origin_name,
+                nan_origin_component_real, nan_origin_name_real,
                 nan_in_logits, nan_in_final_norm, nan_in_lm_head,
                 nan_first_layer_hidden, nan_first_layer_residual,
                 nan_real_output, nan_padded_output, nan_phase,
@@ -1989,6 +1993,8 @@ class Scheduler(SchedulerInterface):
         perf_stats: PerfStats | None = None,
         nan_origin_component: int = -1,
         nan_origin_name: str | None = None,
+        nan_origin_component_real: int = -1,
+        nan_origin_name_real: str | None = None,
         nan_in_logits: bool = False,
         nan_in_final_norm: bool = False,
         nan_in_lm_head: bool = False,
@@ -2029,6 +2035,8 @@ class Scheduler(SchedulerInterface):
             perf_stats=perf_stats,
             nan_origin_component=nan_origin_component,
             nan_origin_name=nan_origin_name,
+            nan_origin_component_real=nan_origin_component_real,
+            nan_origin_name_real=nan_origin_name_real,
             nan_in_logits=nan_in_logits,
             nan_in_final_norm=nan_in_final_norm,
             nan_in_lm_head=nan_in_lm_head,

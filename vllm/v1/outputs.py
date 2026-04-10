@@ -200,7 +200,8 @@ class ModelRunnerOutput:
 
     # NaN origin tracking: component ID that first produced NaN this step.
     # -1 = no NaN. Uses NAN_COMPONENT_* IDs from attention.py.
-    nan_origin_component: int = -1
+    nan_origin_component: int = -1       # all tokens (real + padded)
+    nan_origin_component_real: int = -1  # real tokens only
     nan_in_hidden_states: bool = False  # NaN in hidden states before lm_head
     nan_first_layer_hidden: int = -1
     nan_first_layer_residual: int = -1
