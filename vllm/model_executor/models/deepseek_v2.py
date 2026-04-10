@@ -1234,6 +1234,10 @@ class DeepseekV2Model(nn.Module):
 
         self.aux_hidden_state_layers = tuple[int, ...]()
 
+        # NaN detection flags for pre-final-norm inputs.
+        self._nan_flag_pre_norm_hidden: torch.Tensor | None = None
+        self._nan_flag_pre_norm_residual: torch.Tensor | None = None
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -1290,6 +1294,11 @@ class DeepseekV2Model(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
+        if self._nan_flag_pre_norm_hidden is not None:
+            torch.ops.vllm.nan_detect(
+                hidden_states, self._nan_flag_pre_norm_hidden)
+            torch.ops.vllm.nan_detect(
+                residual, self._nan_flag_pre_norm_residual)
         hidden_states, _ = self.norm(hidden_states, residual)
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states

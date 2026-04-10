@@ -497,6 +497,8 @@ class GPUModelRunner(
         self._nan_flag_qkv_proj: torch.Tensor | None = None
         self._nan_flag_o_proj: torch.Tensor | None = None
         self._nan_flag_post_attn_ln: torch.Tensor | None = None
+        self._nan_flag_pre_norm_hidden: torch.Tensor | None = None
+        self._nan_flag_pre_norm_residual: torch.Tensor | None = None
 
         # Lazy initializations
         # self.model: nn.Module  # Set after load_model
@@ -3374,6 +3376,8 @@ class GPUModelRunner(
         bool,
         bool,
         bool,
+        bool,
+        bool,
     ]:
         num_nans_in_logits = {}
         nan_in_attention = False
@@ -3382,6 +3386,8 @@ class GPUModelRunner(
         nan_in_qkv_proj = False
         nan_in_o_proj = False
         nan_in_post_attn_ln = False
+        nan_in_pre_norm_hidden = False
+        nan_in_pre_norm_residual = False
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             num_nans_in_logits = self._get_nans_in_logits(logits)
             if self._nan_flag_attention is not None:
@@ -3391,6 +3397,10 @@ class GPUModelRunner(
                 nan_in_qkv_proj = self._nan_flag_qkv_proj.item()
                 nan_in_o_proj = self._nan_flag_o_proj.item()
                 nan_in_post_attn_ln = self._nan_flag_post_attn_ln.item()
+                nan_in_pre_norm_hidden = \
+                    self._nan_flag_pre_norm_hidden.item()
+                nan_in_pre_norm_residual = \
+                    self._nan_flag_pre_norm_residual.item()
 
         num_reqs = self.input_batch.num_reqs
         discard_sampled_tokens_req_indices = np.nonzero(
@@ -3502,6 +3512,8 @@ class GPUModelRunner(
             nan_in_qkv_proj,
             nan_in_o_proj,
             nan_in_post_attn_ln,
+            nan_in_pre_norm_hidden,
+            nan_in_pre_norm_residual,
         )
 
     @contextmanager
@@ -4047,6 +4059,8 @@ class GPUModelRunner(
             self._nan_flag_qkv_proj.fill_(False)
             self._nan_flag_o_proj.fill_(False)
             self._nan_flag_post_attn_ln.fill_(False)
+            self._nan_flag_pre_norm_hidden.fill_(False)
+            self._nan_flag_pre_norm_residual.fill_(False)
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
@@ -4330,6 +4344,8 @@ class GPUModelRunner(
                 nan_in_qkv_proj,
                 nan_in_o_proj,
                 nan_in_post_attn_ln,
+                nan_in_pre_norm_hidden,
+                nan_in_pre_norm_residual,
             ) = self._bookkeeping_sync(
                 scheduler_output,
                 sampler_output,
@@ -4391,6 +4407,8 @@ class GPUModelRunner(
                 nan_in_qkv_proj=nan_in_qkv_proj,
                 nan_in_o_proj=nan_in_o_proj,
                 nan_in_post_attn_ln=nan_in_post_attn_ln,
+                nan_in_pre_norm_hidden=nan_in_pre_norm_hidden,
+                nan_in_pre_norm_residual=nan_in_pre_norm_residual,
                 cudagraph_stats=cudagraph_stats,
             )
 
@@ -4976,6 +4994,7 @@ class GPUModelRunner(
         )
         from vllm.model_executor.models.deepseek_v2 import (
             DeepseekV2DecoderLayer,
+            DeepseekV2Model,
         )
 
         self._nan_flag_attention = torch.zeros(
@@ -4990,6 +5009,10 @@ class GPUModelRunner(
             1, dtype=torch.bool, device=self.device)
         self._nan_flag_post_attn_ln = torch.zeros(
             1, dtype=torch.bool, device=self.device)
+        self._nan_flag_pre_norm_hidden = torch.zeros(
+            1, dtype=torch.bool, device=self.device)
+        self._nan_flag_pre_norm_residual = torch.zeros(
+            1, dtype=torch.bool, device=self.device)
 
         for module in self.model.modules():
             if isinstance(module, Attention):
@@ -5002,6 +5025,11 @@ class GPUModelRunner(
             elif isinstance(module, DeepseekV2DecoderLayer):
                 module._nan_flag_input_ln = self._nan_flag_input_ln
                 module._nan_flag_post_attn_ln = self._nan_flag_post_attn_ln
+            elif isinstance(module, DeepseekV2Model):
+                module._nan_flag_pre_norm_hidden = \
+                    self._nan_flag_pre_norm_hidden
+                module._nan_flag_pre_norm_residual = \
+                    self._nan_flag_pre_norm_residual
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         """Extract Eagle3 auxiliary layer indices from speculative config.

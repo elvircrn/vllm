@@ -748,3 +748,20 @@ direct_register_custom_op(
     mutates_args=["flag"],
     fake_impl=nan_check_fake,
 )
+
+
+def nan_detect(tensor: torch.Tensor, flag: torch.Tensor) -> None:
+    """Flag if tensor contains any NaN (unconditionally)."""
+    flag.logical_or_(torch.any(torch.isnan(tensor)))
+
+
+def nan_detect_fake(tensor: torch.Tensor, flag: torch.Tensor) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="nan_detect",
+    op_func=nan_detect,
+    mutates_args=["flag"],
+    fake_impl=nan_detect_fake,
+)

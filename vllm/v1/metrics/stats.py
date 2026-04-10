@@ -208,6 +208,8 @@ class SchedulerStats:
     nan_in_qkv_proj: bool = False
     nan_in_o_proj: bool = False
     nan_in_post_attn_ln: bool = False
+    nan_in_pre_norm_hidden: bool = False
+    nan_in_pre_norm_residual: bool = False
     nan_phase: str | None = None  # "prefill", "decode", or "mixed"
 
 

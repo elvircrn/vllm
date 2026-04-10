@@ -158,6 +158,10 @@ class LoggingStatLogger(StatLoggerBase):
                 sources.append("post_attn_ln")
             if scheduler_stats.nan_in_moe:
                 sources.append("moe")
+            if scheduler_stats.nan_in_pre_norm_hidden:
+                sources.append("pre_norm_hidden")
+            if scheduler_stats.nan_in_pre_norm_residual:
+                sources.append("pre_norm_residual")
             if scheduler_stats.nan_in_final_norm:
                 sources.append("final_norm")
             if scheduler_stats.nan_in_lm_head:
@@ -548,7 +552,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             for source in ("attention", "moe", "logits",
                           "final_norm", "lm_head",
                           "input_ln", "qkv_proj", "o_proj",
-                          "post_attn_ln"):
+                          "post_attn_ln",
+                          "pre_norm_hidden", "pre_norm_residual"):
                 for phase in ("prefill", "decode", "mixed"):
                     self.counter_nan_occurrences[(source, phase)] = {
                         idx: counter_nan_occurrences.labels(
@@ -1171,6 +1176,12 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 if scheduler_stats.nan_in_post_attn_ln:
                     self.counter_nan_occurrences[
                         ("post_attn_ln", phase)][engine_idx].inc()
+                if scheduler_stats.nan_in_pre_norm_hidden:
+                    self.counter_nan_occurrences[
+                        ("pre_norm_hidden", phase)][engine_idx].inc()
+                if scheduler_stats.nan_in_pre_norm_residual:
+                    self.counter_nan_occurrences[
+                        ("pre_norm_residual", phase)][engine_idx].inc()
 
             if self.gauge_lora_info is not None:
                 running_lora_adapters = ",".join(
