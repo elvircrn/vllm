@@ -498,6 +498,7 @@ class GPUModelRunner(
         self._nan_flag_q_a_ln: torch.Tensor | None = None
         self._nan_flag_q_b_proj: torch.Tensor | None = None
         self._nan_flag_kv_a_ln: torch.Tensor | None = None
+        self._nan_flag_rotary: torch.Tensor | None = None
         self._nan_flag_o_proj: torch.Tensor | None = None
         self._nan_flag_post_attn_ln: torch.Tensor | None = None
         self._nan_flag_pre_norm_hidden: torch.Tensor | None = None
@@ -3396,6 +3397,7 @@ class GPUModelRunner(
         nan_in_q_a_ln = False
         nan_in_q_b_proj = False
         nan_in_kv_a_ln = False
+        nan_in_rotary = False
         nan_in_o_proj = False
         nan_in_post_attn_ln = False
         nan_in_pre_norm_hidden = False
@@ -3413,6 +3415,7 @@ class GPUModelRunner(
                 nan_in_q_a_ln = self._nan_flag_q_a_ln.item()
                 nan_in_q_b_proj = self._nan_flag_q_b_proj.item()
                 nan_in_kv_a_ln = self._nan_flag_kv_a_ln.item()
+                nan_in_rotary = self._nan_flag_rotary.item()
                 nan_in_o_proj = self._nan_flag_o_proj.item()
                 nan_in_post_attn_ln = self._nan_flag_post_attn_ln.item()
                 nan_in_pre_norm_hidden = \
@@ -3541,6 +3544,7 @@ class GPUModelRunner(
             nan_in_q_a_ln,
             nan_in_q_b_proj,
             nan_in_kv_a_ln,
+            nan_in_rotary,
             nan_in_o_proj,
             nan_in_post_attn_ln,
             nan_in_pre_norm_hidden,
@@ -4094,6 +4098,7 @@ class GPUModelRunner(
             self._nan_flag_q_a_ln.fill_(False)
             self._nan_flag_q_b_proj.fill_(False)
             self._nan_flag_kv_a_ln.fill_(False)
+            self._nan_flag_rotary.fill_(False)
             self._nan_flag_o_proj.fill_(False)
             self._nan_flag_post_attn_ln.fill_(False)
             self._nan_flag_pre_norm_hidden.fill_(False)
@@ -4385,6 +4390,7 @@ class GPUModelRunner(
                 nan_in_q_a_ln,
                 nan_in_q_b_proj,
                 nan_in_kv_a_ln,
+                nan_in_rotary,
                 nan_in_o_proj,
                 nan_in_post_attn_ln,
                 nan_in_pre_norm_hidden,
@@ -4468,6 +4474,7 @@ class GPUModelRunner(
                 nan_in_q_a_ln=nan_in_q_a_ln,
                 nan_in_q_b_proj=nan_in_q_b_proj,
                 nan_in_kv_a_ln=nan_in_kv_a_ln,
+                nan_in_rotary=nan_in_rotary,
                 nan_in_o_proj=nan_in_o_proj,
                 nan_in_post_attn_ln=nan_in_post_attn_ln,
                 nan_in_pre_norm_hidden=nan_in_pre_norm_hidden,
@@ -5079,6 +5086,8 @@ class GPUModelRunner(
             1, dtype=torch.bool, device=self.device)
         self._nan_flag_kv_a_ln = torch.zeros(
             1, dtype=torch.bool, device=self.device)
+        self._nan_flag_rotary = torch.zeros(
+            1, dtype=torch.bool, device=self.device)
         self._nan_flag_o_proj = torch.zeros(
             1, dtype=torch.bool, device=self.device)
         self._nan_flag_post_attn_ln = torch.zeros(
@@ -5110,6 +5119,7 @@ class GPUModelRunner(
                 module._nan_flag_q_a_ln = self._nan_flag_q_a_ln
                 module._nan_flag_q_b_proj = self._nan_flag_q_b_proj
                 module._nan_flag_kv_a_ln = self._nan_flag_kv_a_ln
+                module._nan_flag_rotary = self._nan_flag_rotary
                 module._nan_flag_o_proj = self._nan_flag_o_proj
             elif isinstance(module, DeepseekV2DecoderLayer):
                 module._nan_flag_input_ln = self._nan_flag_input_ln

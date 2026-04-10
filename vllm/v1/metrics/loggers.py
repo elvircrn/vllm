@@ -158,6 +158,8 @@ class LoggingStatLogger(StatLoggerBase):
                 sources.append("q_b_proj")
             if scheduler_stats.nan_in_kv_a_ln:
                 sources.append("kv_a_ln")
+            if scheduler_stats.nan_in_rotary:
+                sources.append("rotary")
             if scheduler_stats.nan_in_attention:
                 sources.append("attention")
             if scheduler_stats.nan_in_o_proj:
@@ -573,7 +575,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                           "final_norm", "lm_head",
                           "input_ln", "qkv_proj",
                           "q_a_ln", "q_b_proj", "kv_a_ln",
-                          "o_proj",
+                          "rotary", "o_proj",
                           "post_attn_ln",
                           "pre_norm_hidden", "pre_norm_residual",
                           "embedding",
@@ -1226,6 +1228,9 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 if scheduler_stats.nan_in_kv_a_ln:
                     self.counter_nan_occurrences[
                         ("kv_a_ln", phase)][engine_idx].inc()
+                if scheduler_stats.nan_in_rotary:
+                    self.counter_nan_occurrences[
+                        ("rotary", phase)][engine_idx].inc()
                 if scheduler_stats.nan_in_o_proj:
                     self.counter_nan_occurrences[
                         ("o_proj", phase)][engine_idx].inc()

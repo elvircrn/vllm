@@ -490,7 +490,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 kv_cache_dummy_dep=kv_cache_dummy_dep,
             )
         if self._nan_flag is not None:
-            torch.ops.vllm.nan_check(query, output, self._nan_flag)
+            torch.ops.vllm.nan_detect(output, self._nan_flag)
         return output.view(-1, hidden_size)
 
     def calc_kv_scales(self, query, key, value):

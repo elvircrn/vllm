@@ -1549,7 +1549,7 @@ class FusedMoE(CustomOp):
         result = self.forward_native(hidden_states, router_logits)
         if self._nan_flag is not None:
             output = result[0] if isinstance(result, tuple) else result
-            torch.ops.vllm.nan_check(hidden_states, output, self._nan_flag)
+            torch.ops.vllm.nan_detect(output, self._nan_flag)
         return result
 
     @classmethod

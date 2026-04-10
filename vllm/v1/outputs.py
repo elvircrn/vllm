@@ -207,6 +207,7 @@ class ModelRunnerOutput:
     nan_in_q_a_ln: bool = False
     nan_in_q_b_proj: bool = False
     nan_in_kv_a_ln: bool = False
+    nan_in_rotary: bool = False
     nan_in_o_proj: bool = False
     nan_in_post_attn_ln: bool = False
     nan_in_pre_norm_hidden: bool = False
