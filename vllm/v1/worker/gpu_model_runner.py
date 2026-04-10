@@ -493,6 +493,10 @@ class GPUModelRunner(
         # Set up in load_model() when VLLM_COMPUTE_NANS_IN_LOGITS is enabled.
         self._nan_flag_attention: torch.Tensor | None = None
         self._nan_flag_moe: torch.Tensor | None = None
+        self._nan_flag_input_ln: torch.Tensor | None = None
+        self._nan_flag_qkv_proj: torch.Tensor | None = None
+        self._nan_flag_o_proj: torch.Tensor | None = None
+        self._nan_flag_post_attn_ln: torch.Tensor | None = None
 
         # Lazy initializations
         # self.model: nn.Module  # Set after load_model
@@ -3366,15 +3370,27 @@ class GPUModelRunner(
         list[int],
         bool,
         bool,
+        bool,
+        bool,
+        bool,
+        bool,
     ]:
         num_nans_in_logits = {}
         nan_in_attention = False
         nan_in_moe = False
+        nan_in_input_ln = False
+        nan_in_qkv_proj = False
+        nan_in_o_proj = False
+        nan_in_post_attn_ln = False
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             num_nans_in_logits = self._get_nans_in_logits(logits)
             if self._nan_flag_attention is not None:
                 nan_in_attention = self._nan_flag_attention.item()
                 nan_in_moe = self._nan_flag_moe.item()
+                nan_in_input_ln = self._nan_flag_input_ln.item()
+                nan_in_qkv_proj = self._nan_flag_qkv_proj.item()
+                nan_in_o_proj = self._nan_flag_o_proj.item()
+                nan_in_post_attn_ln = self._nan_flag_post_attn_ln.item()
 
         num_reqs = self.input_batch.num_reqs
         discard_sampled_tokens_req_indices = np.nonzero(
@@ -3482,6 +3498,10 @@ class GPUModelRunner(
             invalid_req_indices,
             nan_in_attention,
             nan_in_moe,
+            nan_in_input_ln,
+            nan_in_qkv_proj,
+            nan_in_o_proj,
+            nan_in_post_attn_ln,
         )
 
     @contextmanager
@@ -4023,6 +4043,10 @@ class GPUModelRunner(
         if self._nan_flag_attention is not None:
             self._nan_flag_attention.fill_(False)
             self._nan_flag_moe.fill_(False)
+            self._nan_flag_input_ln.fill_(False)
+            self._nan_flag_qkv_proj.fill_(False)
+            self._nan_flag_o_proj.fill_(False)
+            self._nan_flag_post_attn_ln.fill_(False)
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
@@ -4302,6 +4326,10 @@ class GPUModelRunner(
                 invalid_req_indices,
                 nan_in_attention,
                 nan_in_moe,
+                nan_in_input_ln,
+                nan_in_qkv_proj,
+                nan_in_o_proj,
+                nan_in_post_attn_ln,
             ) = self._bookkeeping_sync(
                 scheduler_output,
                 sampler_output,
@@ -4359,6 +4387,10 @@ class GPUModelRunner(
                 nan_in_attention=nan_in_attention,
                 nan_in_moe=nan_in_moe,
                 nan_in_hidden_states=nan_in_hidden_states,
+                nan_in_input_ln=nan_in_input_ln,
+                nan_in_qkv_proj=nan_in_qkv_proj,
+                nan_in_o_proj=nan_in_o_proj,
+                nan_in_post_attn_ln=nan_in_post_attn_ln,
                 cudagraph_stats=cudagraph_stats,
             )
 
@@ -4935,13 +4967,28 @@ class GPUModelRunner(
 
     def _setup_nan_detection_flags(self) -> None:
         """Pre-allocate shared NaN flag tensors and assign them to all
-        Attention and FusedMoE modules. The nan_check custom op writes to
-        these during forward and its operations are captured by CUDA graphs."""
+        Attention, FusedMoE, MLA, and DecoderLayer modules. The nan_check
+        custom op writes to these during forward and its operations are
+        captured by CUDA graphs."""
         from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+        from vllm.model_executor.layers.mla import (
+            MultiHeadLatentAttentionWrapper,
+        )
+        from vllm.model_executor.models.deepseek_v2 import (
+            DeepseekV2DecoderLayer,
+        )
 
         self._nan_flag_attention = torch.zeros(
             1, dtype=torch.bool, device=self.device)
         self._nan_flag_moe = torch.zeros(
+            1, dtype=torch.bool, device=self.device)
+        self._nan_flag_input_ln = torch.zeros(
+            1, dtype=torch.bool, device=self.device)
+        self._nan_flag_qkv_proj = torch.zeros(
+            1, dtype=torch.bool, device=self.device)
+        self._nan_flag_o_proj = torch.zeros(
+            1, dtype=torch.bool, device=self.device)
+        self._nan_flag_post_attn_ln = torch.zeros(
             1, dtype=torch.bool, device=self.device)
 
         for module in self.model.modules():
@@ -4949,6 +4996,12 @@ class GPUModelRunner(
                 module._nan_flag = self._nan_flag_attention
             elif isinstance(module, FusedMoE):
                 module._nan_flag = self._nan_flag_moe
+            elif isinstance(module, MultiHeadLatentAttentionWrapper):
+                module._nan_flag_qkv_proj = self._nan_flag_qkv_proj
+                module._nan_flag_o_proj = self._nan_flag_o_proj
+            elif isinstance(module, DeepseekV2DecoderLayer):
+                module._nan_flag_input_ln = self._nan_flag_input_ln
+                module._nan_flag_post_attn_ln = self._nan_flag_post_attn_ln
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         """Extract Eagle3 auxiliary layer indices from speculative config.

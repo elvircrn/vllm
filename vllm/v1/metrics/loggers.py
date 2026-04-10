@@ -146,8 +146,16 @@ class LoggingStatLogger(StatLoggerBase):
     def _track_nan_stats(self, scheduler_stats: SchedulerStats):
         if scheduler_stats.nan_phase:
             sources = []
+            if scheduler_stats.nan_in_input_ln:
+                sources.append("input_ln")
+            if scheduler_stats.nan_in_qkv_proj:
+                sources.append("qkv_proj")
             if scheduler_stats.nan_in_attention:
                 sources.append("attention")
+            if scheduler_stats.nan_in_o_proj:
+                sources.append("o_proj")
+            if scheduler_stats.nan_in_post_attn_ln:
+                sources.append("post_attn_ln")
             if scheduler_stats.nan_in_moe:
                 sources.append("moe")
             if scheduler_stats.nan_in_final_norm:
@@ -538,7 +546,9 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 tuple[str, str], dict[int, Counter]
             ] = {}
             for source in ("attention", "moe", "logits",
-                          "final_norm", "lm_head"):
+                          "final_norm", "lm_head",
+                          "input_ln", "qkv_proj", "o_proj",
+                          "post_attn_ln"):
                 for phase in ("prefill", "decode", "mixed"):
                     self.counter_nan_occurrences[(source, phase)] = {
                         idx: counter_nan_occurrences.labels(
@@ -1149,6 +1159,18 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 if scheduler_stats.nan_in_lm_head:
                     self.counter_nan_occurrences[
                         ("lm_head", phase)][engine_idx].inc()
+                if scheduler_stats.nan_in_input_ln:
+                    self.counter_nan_occurrences[
+                        ("input_ln", phase)][engine_idx].inc()
+                if scheduler_stats.nan_in_qkv_proj:
+                    self.counter_nan_occurrences[
+                        ("qkv_proj", phase)][engine_idx].inc()
+                if scheduler_stats.nan_in_o_proj:
+                    self.counter_nan_occurrences[
+                        ("o_proj", phase)][engine_idx].inc()
+                if scheduler_stats.nan_in_post_attn_ln:
+                    self.counter_nan_occurrences[
+                        ("post_attn_ln", phase)][engine_idx].inc()
 
             if self.gauge_lora_info is not None:
                 running_lora_adapters = ",".join(

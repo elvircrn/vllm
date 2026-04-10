@@ -202,6 +202,10 @@ class ModelRunnerOutput:
     nan_in_attention: bool = False
     nan_in_moe: bool = False
     nan_in_hidden_states: bool = False  # NaN in hidden states before lm_head
+    nan_in_input_ln: bool = False
+    nan_in_qkv_proj: bool = False
+    nan_in_o_proj: bool = False
+    nan_in_post_attn_ln: bool = False
 
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None

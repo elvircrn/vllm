@@ -1118,6 +1118,10 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
 
+        # NaN detection flags — assigned by model runner when enabled.
+        self._nan_flag_input_ln: torch.Tensor | None = None
+        self._nan_flag_post_attn_ln: torch.Tensor | None = None
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1131,6 +1135,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        if self._nan_flag_input_ln is not None:
+            torch.ops.vllm.nan_check(
+                residual, hidden_states, self._nan_flag_input_ln)
 
         attn_kwargs = {
             "positions": positions,
@@ -1155,6 +1162,11 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if self._nan_flag_post_attn_ln is not None:
+            # residual is the pre-norm sum (attn_out + old_residual),
+            # hidden_states is the normed output.
+            torch.ops.vllm.nan_check(
+                residual, hidden_states, self._nan_flag_post_attn_ln)
         hidden_states = self.mlp(hidden_states)
 
         if isinstance(self.mlp, DeepseekV2MLP) and hidden_states.dtype == torch.float16:

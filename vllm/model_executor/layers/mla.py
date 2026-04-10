@@ -110,6 +110,10 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         self.prefix = prefix
 
+        # NaN detection flags — assigned by model runner when enabled.
+        self._nan_flag_qkv_proj: torch.Tensor | None = None
+        self._nan_flag_o_proj: torch.Tensor | None = None
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -131,6 +135,9 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             )
 
             qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+            if self._nan_flag_qkv_proj is not None:
+                torch.ops.vllm.nan_check(
+                    hidden_states, qkv_lora, self._nan_flag_qkv_proj)
             q_c, kv_lora = qkv_lora.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 dim=-1,
@@ -174,4 +181,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
         )
 
-        return self.o_proj(attn_out)[0]
+        output, _ = self.o_proj(attn_out)
+        if self._nan_flag_o_proj is not None:
+            torch.ops.vllm.nan_check(attn_out, output, self._nan_flag_o_proj)
+        return output
