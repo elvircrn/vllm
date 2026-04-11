@@ -1185,6 +1185,11 @@ class DeepseekV2DecoderLayer(nn.Module):
                 self._nan_origin_flag_real, 9,
                 self._nan_real_mask)  # POST_ATTN_LN
         hidden_states = self.mlp(hidden_states)
+        if self._nan_origin_flag is not None and nan_check_enabled(14):
+            torch.ops.vllm.nan_first_component(
+                hidden_states, self._nan_origin_flag,
+                self._nan_origin_flag_real, 14,
+                self._nan_real_mask)  # MLP_OUTPUT
 
         if isinstance(self.mlp, DeepseekV2MLP) and hidden_states.dtype == torch.float16:
             # Fix FP16 overflow
