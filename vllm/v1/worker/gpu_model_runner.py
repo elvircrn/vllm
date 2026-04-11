@@ -3297,6 +3297,12 @@ class GPUModelRunner(
             if num_input_tokens > num_scheduled_tokens:
                 self.positions[num_scheduled_tokens:num_input_tokens].zero_()
 
+        # Zero input_ids for DP-padding so embedding produces finite
+        # hidden_states.  Without this, stale CUDA-graph buffers carry
+        # NaN through the entire forward pass (attention, FP4 quant, MoE).
+        if input_ids is not None and num_input_tokens > num_scheduled_tokens:
+            self.input_ids.gpu[num_scheduled_tokens:num_input_tokens].zero_()
+
         if is_first_rank:
             intermediate_tensors = None
         else:
