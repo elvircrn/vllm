@@ -5148,19 +5148,21 @@ class GPUModelRunner(
 
     @staticmethod
     def _has_nan_per_block(kv: torch.Tensor) -> torch.Tensor:
-        """Return a bool tensor of shape (num_blocks,) indicating NaN.
+        """Return a bool tensor of shape (shape[0],) indicating NaN.
 
-        Each kv tensor is (num_blocks, dimension).
-        Handles float8_e4m3fn (NaN bit pattern 0x7F / 0xFF) and
-        regular float dtypes via torch.isnan().
+        KV cache shapes vary by backend:
+          MLA:        (num_blocks, block_size, head_size)
+          FlashAttn:  (2, num_blocks, block_size, num_kv_heads, head_size)
+        We flatten all dims after dim-0 and check per first-dim entry.
+        For MLA this gives per-block NaN detection.
         """
         if kv.dtype.is_floating_point and kv.element_size() == 1:
             # fp8 — torch.isnan doesn't work; check bit pattern.
             # E4M3FN NaN: S.1111.111 → (byte & 0x7F) == 0x7F
-            raw = kv.view(torch.uint8)
+            raw = kv.reshape(kv.shape[0], -1).view(torch.uint8)
             return ((raw & 0x7F) == 0x7F).any(dim=1)
 
-        return torch.isnan(kv).any(dim=1)
+        return torch.isnan(kv.reshape(kv.shape[0], -1)).any(dim=1)
 
     def _audit_kv_cache_nans(self) -> tuple[int, int, list[int]]:
         """Scan KV cache tensors for NaN blocks, per layer.

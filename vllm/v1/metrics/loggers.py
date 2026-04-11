@@ -450,12 +450,14 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         dp_rank = str(vllm_config.parallel_config.data_parallel_rank)
-        labelnames = ["model_name", "engine", "rank"]
+        local_rank = str(envs.LOCAL_RANK)
+        labelnames = ["model_name", "engine", "dp_rank", "local_rank"]
         model_name = vllm_config.model_config.served_model_name
         max_model_len = vllm_config.model_config.max_model_len
 
         self.per_engine_labelvalues: dict[int, list[object]] = {
-            idx: [model_name, str(idx), dp_rank] for idx in engine_indexes
+            idx: [model_name, str(idx), dp_rank, local_rank]
+            for idx in engine_indexes
         }
         per_engine_labelvalues = self.per_engine_labelvalues
 
@@ -510,8 +512,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         for s in sleep_state:
             self.gauge_engine_sleep_state[s] = {
                 idx: gauge_engine_sleep_state.labels(
-                    engine=idx, model_name=model_name, rank=dp_rank,
-                    sleep_state=s
+                    model_name, str(idx), dp_rank, local_rank, s
                 )
                 for idx in engine_indexes
             }
@@ -566,7 +567,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 for phase in ("prefill", "decode", "mixed"):
                     self.counter_nan_occurrences[(source, phase)] = {
                         idx: counter_nan_occurrences.labels(
-                            model_name, str(idx), dp_rank, source, phase
+                            model_name, str(idx), dp_rank, local_rank,
+                            source, phase
                         )
                         for idx in engine_indexes
                     }
@@ -768,7 +770,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         for source in PromptTokenStats.ALL_SOURCES:
             self.counter_prompt_tokens_by_source[source] = {
                 idx: counter_prompt_tokens_by_source.labels(
-                    model_name, str(idx), dp_rank, source
+                    model_name, str(idx), dp_rank, local_rank, source
                 )
                 for idx in engine_indexes
             }
@@ -811,7 +813,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         for reason in FinishReason:
             self.counter_request_success[reason] = {
                 idx: counter_request_success_base.labels(
-                    model_name, str(idx), dp_rank, str(reason)
+                    model_name, str(idx), dp_rank, local_rank, str(reason)
                 )
                 for idx in engine_indexes
             }
