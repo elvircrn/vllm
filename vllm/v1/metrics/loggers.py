@@ -1289,7 +1289,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     scheduler_stats.kv_cache_nan_per_layer
                 ):
                     self._gauge_kv_nan_per_layer.labels(
-                        *lv, layer=str(layer_idx)
+                        *lv, str(layer_idx)
                     ).set(count)
 
             if self.gauge_lora_info is not None:
