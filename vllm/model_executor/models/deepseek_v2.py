@@ -359,8 +359,10 @@ class DeepseekV2MoE(nn.Module):
 
         # Zero out DP padding tokens so they don't contaminate real
         # tokens through expert routing / EP all-to-all dispatch.
+        # Use masked_fill instead of multiply because NaN * 0 = NaN.
         if self._dp_padding_mask is not None:
-            hidden_states = hidden_states * self._dp_padding_mask[:num_tokens]
+            hidden_states = hidden_states.masked_fill(
+                self._dp_padding_mask[:num_tokens] < 0.5, 0.0)
 
         # Chunk the hidden states so they aren't replicated across TP ranks.
         # This avoids duplicate computation in self.experts.
