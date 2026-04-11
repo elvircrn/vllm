@@ -1184,7 +1184,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             # of DeepseekV2MOE
             hidden_states *= 1.0 / self.routed_scaling_factor
 
-        if self._nan_per_layer_hidden is not None:
+        if self._nan_per_layer_hidden is not None and nan_check_enabled(13):
             torch.ops.vllm.nan_detect_at(
                 hidden_states, self._nan_per_layer_hidden, self.layer_idx)
             torch.ops.vllm.nan_detect_at(
