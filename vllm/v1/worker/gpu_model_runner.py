@@ -5157,7 +5157,7 @@ class GPUModelRunner(
         if kv.dtype.is_floating_point and kv.element_size() == 1:
             # fp8 — torch.isnan doesn't work; check bit pattern.
             # E4M3FN NaN: S.1111.111 → (byte & 0x7F) == 0x7F
-            raw = kv.reshape(kv.shape[0], -1).view(torch.uint8)
+            raw = kv.view(torch.uint8)
             return ((raw & 0x7F) == 0x7F).any(dim=1)
 
         return torch.isnan(kv).any(dim=1)
