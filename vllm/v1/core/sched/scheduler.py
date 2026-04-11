@@ -1320,6 +1320,7 @@ class Scheduler(SchedulerInterface):
         kv_cache_nan_total_blocks = model_runner_output.kv_cache_nan_total_blocks
         kv_cache_nan_affected_layers = (
             model_runner_output.kv_cache_nan_affected_layers)
+        kv_cache_nan_per_layer = model_runner_output.kv_cache_nan_per_layer
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
 
@@ -1605,6 +1606,7 @@ class Scheduler(SchedulerInterface):
                 nan_first_layer_hidden, nan_first_layer_residual,
                 nan_real_output, nan_padded_output, nan_phase,
                 kv_cache_nan_total_blocks, kv_cache_nan_affected_layers,
+                kv_cache_nan_per_layer,
             )
         ) is not None:
             # Return stats to only one of the front-ends.
@@ -2009,6 +2011,7 @@ class Scheduler(SchedulerInterface):
         nan_phase: str | None = None,
         kv_cache_nan_total_blocks: int = 0,
         kv_cache_nan_affected_layers: int = 0,
+        kv_cache_nan_per_layer: list[int] | None = None,
     ) -> SchedulerStats | None:
         if not self.log_stats:
             return None
@@ -2053,6 +2056,7 @@ class Scheduler(SchedulerInterface):
             nan_phase=nan_phase,
             kv_cache_nan_total_blocks=kv_cache_nan_total_blocks,
             kv_cache_nan_affected_layers=kv_cache_nan_affected_layers,
+            kv_cache_nan_per_layer=kv_cache_nan_per_layer or [],
         )
 
     def _get_encoder_cache_usage(self) -> float:

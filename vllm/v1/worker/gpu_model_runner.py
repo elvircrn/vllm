@@ -509,6 +509,7 @@ class GPUModelRunner(
         self._kv_audit_step: int = 0
         self._kv_audit_total_blocks: int = 0
         self._kv_audit_affected_layers: int = 0
+        self._kv_audit_per_layer: list[int] = []
 
         # Lazy initializations
         # self.model: nn.Module  # Set after load_model
@@ -4063,7 +4064,8 @@ class GPUModelRunner(
             if self._kv_audit_step >= self._kv_audit_interval:
                 self._kv_audit_step = 0
                 (self._kv_audit_total_blocks,
-                 self._kv_audit_affected_layers, _) = (
+                 self._kv_audit_affected_layers,
+                 self._kv_audit_per_layer) = (
                     self._audit_kv_cache_nans())
 
         # Reset NaN detection flags and update real-token mask.
@@ -4452,6 +4454,7 @@ class GPUModelRunner(
                 nan_padded_output=nan_padded_output,
                 kv_cache_nan_total_blocks=self._kv_audit_total_blocks,
                 kv_cache_nan_affected_layers=self._kv_audit_affected_layers,
+                kv_cache_nan_per_layer=self._kv_audit_per_layer,
                 cudagraph_stats=cudagraph_stats,
             )
 

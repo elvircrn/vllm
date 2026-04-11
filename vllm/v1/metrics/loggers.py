@@ -651,6 +651,15 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.gauge_kv_nan_layers = create_metric_per_engine(
                 gauge_kv_nan_layers, per_engine_labelvalues
             )
+            # Per-layer gauge with dynamic "layer" label.
+            self._gauge_kv_nan_per_layer = self._gauge_cls(
+                name="vllm:kv_cache_nan_blocks_per_layer",
+                documentation=(
+                    "NaN blocks in KV cache per layer."
+                ),
+                multiprocess_mode="mostrecent",
+                labelnames=labelnames + ["layer"],
+            )
 
         counter_prefix_cache_queries = self._counter_cls(
             name="vllm:prefix_cache_queries",
@@ -1275,6 +1284,13 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     scheduler_stats.kv_cache_nan_total_blocks)
                 self.gauge_kv_nan_layers[engine_idx].set(
                     scheduler_stats.kv_cache_nan_affected_layers)
+                lv = self.per_engine_labelvalues[engine_idx]
+                for layer_idx, count in enumerate(
+                    scheduler_stats.kv_cache_nan_per_layer
+                ):
+                    self._gauge_kv_nan_per_layer.labels(
+                        *lv, layer=str(layer_idx)
+                    ).set(count)
 
             if self.gauge_lora_info is not None:
                 running_lora_adapters = ",".join(

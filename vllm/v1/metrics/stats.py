@@ -215,6 +215,7 @@ class SchedulerStats:
     # KV cache NaN audit results.
     kv_cache_nan_total_blocks: int = 0
     kv_cache_nan_affected_layers: int = 0
+    kv_cache_nan_per_layer: list[int] = field(default_factory=list)
 
 
 @dataclass
