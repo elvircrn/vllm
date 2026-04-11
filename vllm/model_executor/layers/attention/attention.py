@@ -489,7 +489,8 @@ class Attention(nn.Module, AttentionLayerBase):
                 self.layer_name,
                 kv_cache_dummy_dep=kv_cache_dummy_dep,
             )
-        if self._nan_flag is not None:
+        if self._nan_flag is not None and nan_check_enabled(
+                NAN_COMPONENT_ATTENTION):
             torch.ops.vllm.nan_first_component(
                 output, self._nan_flag, self._nan_flag_real,
                 NAN_COMPONENT_ATTENTION, self._nan_real_mask)
@@ -819,6 +820,26 @@ NAN_COMPONENT_NAMES = {
     NAN_COMPONENT_PRE_NORM_HIDDEN: "pre_norm_hidden",
     NAN_COMPONENT_PRE_NORM_RESIDUAL: "pre_norm_residual",
 }
+
+# Parsed once at import time from VLLM_NAN_CHECK_COMPONENTS.
+# Controls which check-points act as torch.compile barriers.
+_NAN_ENABLED_COMPONENTS: frozenset[int] | None = None
+
+
+def nan_check_enabled(component_id: int) -> bool:
+    """Return True if the NaN barrier for this component should fire."""
+    global _NAN_ENABLED_COMPONENTS
+    if _NAN_ENABLED_COMPONENTS is None:
+        import vllm.envs as envs
+        raw = envs.VLLM_NAN_CHECK_COMPONENTS
+        if raw == "all":
+            _NAN_ENABLED_COMPONENTS = frozenset(range(20))
+        elif raw == "none":
+            _NAN_ENABLED_COMPONENTS = frozenset()
+        else:
+            _NAN_ENABLED_COMPONENTS = frozenset(
+                int(x.strip()) for x in raw.split(","))
+    return component_id in _NAN_ENABLED_COMPONENTS
 
 
 def nan_first_component(tensor: torch.Tensor, flag_all: torch.Tensor,

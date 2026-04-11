@@ -7,6 +7,7 @@ import torch
 from vllm.config import CacheConfig
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention import MLAAttention
+from vllm.model_executor.layers.attention.attention import nan_check_enabled
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
 
@@ -136,7 +137,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             )
 
             qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
-            if self._nan_origin_flag is not None:
+            if self._nan_origin_flag is not None and nan_check_enabled(2):
                 torch.ops.vllm.nan_first_component(
                     qkv_lora, self._nan_origin_flag,
                     self._nan_origin_flag_real, 2,
@@ -146,13 +147,13 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                 dim=-1,
             )
             q_c = self.q_a_layernorm(q_c)
-            if self._nan_origin_flag is not None:
+            if self._nan_origin_flag is not None and nan_check_enabled(3):
                 torch.ops.vllm.nan_first_component(
                     q_c, self._nan_origin_flag,
                     self._nan_origin_flag_real, 3,
                     self._nan_real_mask)  # Q_A_LN
             q = self.q_b_proj(q_c)[0]
-            if self._nan_origin_flag is not None:
+            if self._nan_origin_flag is not None and nan_check_enabled(4):
                 torch.ops.vllm.nan_first_component(
                     q, self._nan_origin_flag,
                     self._nan_origin_flag_real, 4,
@@ -169,7 +170,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv_c_normed = self.kv_a_layernorm(kv_c)
-        if self._nan_origin_flag is not None:
+        if self._nan_origin_flag is not None and nan_check_enabled(5):
             torch.ops.vllm.nan_first_component(
                 kv_c_normed, self._nan_origin_flag,
                 self._nan_origin_flag_real, 5,
@@ -183,7 +184,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
                 positions, q[..., self.qk_nope_head_dim :], k_pe
             )
-            if self._nan_origin_flag is not None:
+            if self._nan_origin_flag is not None and nan_check_enabled(6):
                 torch.ops.vllm.nan_first_component(
                     q, self._nan_origin_flag,
                     self._nan_origin_flag_real, 6,
@@ -205,7 +206,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         )
 
         output, _ = self.o_proj(attn_out)
-        if self._nan_origin_flag is not None:
+        if self._nan_origin_flag is not None and nan_check_enabled(8):
             torch.ops.vllm.nan_first_component(
                 output, self._nan_origin_flag,
                 self._nan_origin_flag_real, 8,

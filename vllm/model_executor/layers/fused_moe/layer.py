@@ -1548,6 +1548,11 @@ class FusedMoE(CustomOp):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         result = self.forward_native(hidden_states, router_logits)
         if self._nan_flag is not None:
+            from vllm.model_executor.layers.attention.attention import (
+                nan_check_enabled,
+            )
+            if not nan_check_enabled(10):
+                return result
             output = result[0] if isinstance(result, tuple) else result
             torch.ops.vllm.nan_first_component(
                 output, self._nan_flag, self._nan_flag_real,
