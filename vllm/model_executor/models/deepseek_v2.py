@@ -46,6 +46,7 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.attention.attention import nan_check_enabled
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe import (
     GateLinear,
@@ -1139,7 +1140,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        if self._nan_origin_flag is not None:
+        if self._nan_origin_flag is not None and nan_check_enabled(1):
             torch.ops.vllm.nan_first_component(
                 hidden_states, self._nan_origin_flag,
                 self._nan_origin_flag_real, 1,
@@ -1168,7 +1169,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        if self._nan_origin_flag is not None:
+        if self._nan_origin_flag is not None and nan_check_enabled(9):
             torch.ops.vllm.nan_first_component(
                 hidden_states, self._nan_origin_flag,
                 self._nan_origin_flag_real, 9,
@@ -1271,7 +1272,7 @@ class DeepseekV2Model(nn.Module):
                         "to DeepseekV2Model.forward"
                     )
                 hidden_states = self.embed_input_ids(input_ids)
-            if self._nan_origin_flag is not None:
+            if self._nan_origin_flag is not None and nan_check_enabled(0):
                 torch.ops.vllm.nan_first_component(
                     hidden_states, self._nan_origin_flag,
                     self._nan_origin_flag_real, 0,
@@ -1313,14 +1314,16 @@ class DeepseekV2Model(nn.Module):
             )
 
         if self._nan_origin_flag is not None:
-            torch.ops.vllm.nan_first_component(
-                hidden_states, self._nan_origin_flag,
-                self._nan_origin_flag_real, 11,
-                self._nan_real_mask)  # PRE_NORM_HIDDEN
-            torch.ops.vllm.nan_first_component(
-                residual, self._nan_origin_flag,
-                self._nan_origin_flag_real, 12,
-                self._nan_real_mask)  # PRE_NORM_RESIDUAL
+            if nan_check_enabled(11):
+                torch.ops.vllm.nan_first_component(
+                    hidden_states, self._nan_origin_flag,
+                    self._nan_origin_flag_real, 11,
+                    self._nan_real_mask)  # PRE_NORM_HIDDEN
+            if nan_check_enabled(12):
+                torch.ops.vllm.nan_first_component(
+                    residual, self._nan_origin_flag,
+                    self._nan_origin_flag_real, 12,
+                    self._nan_real_mask)  # PRE_NORM_RESIDUAL
         hidden_states, _ = self.norm(hidden_states, residual)
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
