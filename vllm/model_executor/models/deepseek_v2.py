@@ -348,9 +348,19 @@ class DeepseekV2MoE(nn.Module):
             else torch.bfloat16
         )
 
+        # DP padding mask — assigned by model runner when DP > 1.
+        # Pre-allocated buffer of shape (max_num_tokens, 1); contents
+        # updated each step (1.0 for real tokens, 0.0 for padding).
+        self._dp_padding_mask: torch.Tensor | None = None
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+
+        # Zero out DP padding tokens so they don't contaminate real
+        # tokens through expert routing / EP all-to-all dispatch.
+        if self._dp_padding_mask is not None:
+            hidden_states = hidden_states * self._dp_padding_mask[:num_tokens]
 
         # Chunk the hidden states so they aren't replicated across TP ranks.
         # This avoids duplicate computation in self.experts.

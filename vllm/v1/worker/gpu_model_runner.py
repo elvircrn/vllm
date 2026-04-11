@@ -499,6 +499,11 @@ class GPUModelRunner(
         self._nan_per_layer_hidden: torch.Tensor | None = None
         self._nan_per_layer_residual: torch.Tensor | None = None
 
+        # DP padding mask — zeros out padding tokens before MoE to prevent
+        # contamination of real tokens through expert routing / EP dispatch.
+        # Shape (max_num_tokens, 1), filled each step in _preprocess.
+        self._dp_padding_mask: torch.Tensor | None = None
+
         # Lazy initializations
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
@@ -4056,6 +4061,11 @@ class GPUModelRunner(
             self._nan_per_layer_hidden.fill_(False)
             self._nan_per_layer_residual.fill_(False)
 
+        # Update DP padding mask: 1.0 for real tokens, 0.0 for padding.
+        if self._dp_padding_mask is not None:
+            self._dp_padding_mask[:num_tokens_unpadded].fill_(1.0)
+            self._dp_padding_mask[num_tokens_unpadded:].fill_(0.0)
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         # When spec decode is enabled, defer connector finalization
@@ -4997,6 +5007,10 @@ class GPUModelRunner(
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             self._setup_nan_detection_flags()
 
+        # Allocate DP padding mask for MoE layers when using data parallelism.
+        if self.parallel_config.data_parallel_size > 1:
+            self._setup_dp_padding_mask()
+
         get_offloader().post_init()
 
     def _setup_nan_detection_flags(self) -> None:
@@ -5081,6 +5095,29 @@ class GPUModelRunner(
                 module._nan_origin_flag = self._nan_origin_flag
                 module._nan_origin_flag_real = self._nan_origin_flag_real
                 module._nan_real_mask = self._nan_real_mask
+
+    def _setup_dp_padding_mask(self) -> None:
+        """Pre-allocate a DP padding mask and assign it to all DeepseekV2MoE
+        modules. The mask is filled each step in _preprocess: 1.0 for real
+        tokens, 0.0 for DP padding tokens."""
+        from vllm.model_executor.models.deepseek_v2 import DeepseekV2MoE
+
+        self._dp_padding_mask = torch.ones(
+            self.max_num_tokens, 1,
+            dtype=self.dtype, device=self.device)
+
+        assigned = 0
+        for module in self.model.modules():
+            if isinstance(module, DeepseekV2MoE):
+                module._dp_padding_mask = self._dp_padding_mask
+                assigned += 1
+
+        if assigned > 0:
+            logger.info(
+                "DP padding mask assigned to %d MoE layers", assigned)
+        else:
+            # No DeepseekV2MoE modules found — not a DeepSeek model.
+            self._dp_padding_mask = None
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         """Extract Eagle3 auxiliary layer indices from speculative config.
@@ -5662,6 +5699,11 @@ class GPUModelRunner(
                 num_tokens_padded = ubatch_slices_padded[0].num_tokens
                 if num_tokens_across_dp is not None:
                     num_tokens_across_dp[:] = num_tokens_padded
+
+            # During dummy/capture runs, mark all tokens as real (no padding).
+            if self._dp_padding_mask is not None:
+                self._dp_padding_mask[:num_tokens_padded].fill_(1.0)
+                self._dp_padding_mask[num_tokens_padded:].fill_(0.0)
 
             with (
                 self.maybe_randomize_inputs(input_ids, inputs_embeds),
