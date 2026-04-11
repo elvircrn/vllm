@@ -5154,8 +5154,10 @@ class GPUModelRunner(
         Handles float8_e4m3fn (NaN bit pattern 0x7F / 0xFF) and
         regular float dtypes via torch.isnan().
         """
-        if kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
-            raw = kv.view(torch.uint8)
+        if kv.dtype.is_floating_point and kv.element_size() == 1:
+            # fp8 — torch.isnan doesn't work; check bit pattern.
+            # E4M3FN NaN: S.1111.111 → (byte & 0x7F) == 0x7F
+            raw = kv.contiguous().view(torch.uint8)
             return ((raw & 0x7F) == 0x7F).any(dim=1)
 
         return torch.isnan(kv).any(dim=1)
