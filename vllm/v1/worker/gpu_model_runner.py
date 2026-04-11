@@ -5179,16 +5179,7 @@ class GPUModelRunner(
             if count > 0:
                 affected += 1
 
-        if total > 0:
-            detail = ", ".join(
-                f"L{i}={c}" for i, c in enumerate(per_layer) if c > 0
-            )
-            logger.warning(
-                "KV cache NaN audit: %d NaN blocks across %d/%d layers "
-                "[%s] (dtype=%s)",
-                total, affected, len(self.kv_caches), detail,
-                self.kv_caches[0].dtype,
-            )
+        # No logging — results go to Prometheus only.
         return total, affected, per_layer
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
