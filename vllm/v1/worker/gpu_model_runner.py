@@ -5018,6 +5018,9 @@ class GPUModelRunner(
         per-layer tracking tensors, then assign them to all relevant modules.
         The nan_first_component custom op writes to the origin flags during
         forward and its operations are captured by CUDA graphs."""
+        from vllm.model_executor.layers.attention.mla_attention import (
+            MLAAttention,
+        )
         from vllm.model_executor.layers.fused_moe.layer import FusedMoE
         from vllm.model_executor.layers.mla import (
             MultiHeadLatentAttentionWrapper,
@@ -5074,6 +5077,10 @@ class GPUModelRunner(
 
         for module in self.model.modules():
             if isinstance(module, Attention):
+                module._nan_flag = self._nan_origin_flag
+                module._nan_flag_real = self._nan_origin_flag_real
+                module._nan_real_mask = self._nan_real_mask
+            elif isinstance(module, MLAAttention):
                 module._nan_flag = self._nan_origin_flag
                 module._nan_flag_real = self._nan_origin_flag_real
                 module._nan_real_mask = self._nan_real_mask

@@ -220,6 +220,7 @@ from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.attention.attention import (
     _init_kv_cache_quant,
     get_attention_context,
+    nan_check_enabled,
     set_default_quant_scales,
     should_load_quant_weights,
 )
@@ -455,6 +456,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             compile_native=True,
         )
 
+        # NaN origin tracking — assigned by model runner.
+        self._nan_flag: torch.Tensor | None = None
+        self._nan_flag_real: torch.Tensor | None = None
+        self._nan_real_mask: torch.Tensor | None = None
+
     @property
     def chunked_prefill_workspace_size(self) -> int:
         if self._chunked_prefill_workspace_size is None:
@@ -486,6 +492,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             assert isinstance(slot_mapping, dict), (
                 f"Expected slot_mapping to be a dict, got {type(slot_mapping)}. "
             )
+            if self._nan_flag is not None and nan_check_enabled(15):
+                torch.ops.vllm.nan_first_component(
+                    kv_c_normed, self._nan_flag,
+                    self._nan_flag_real, 15,
+                    self._nan_real_mask)  # KV_CACHE_IN
             self.impl.do_kv_cache_update(
                 kv_c_normed,
                 k_pe,
@@ -505,6 +516,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
             return output
         else:
+            if self._nan_flag is not None and nan_check_enabled(15):
+                torch.ops.vllm.nan_first_component(
+                    kv_c_normed, self._nan_flag,
+                    self._nan_flag_real, 15,
+                    self._nan_real_mask)  # KV_CACHE_IN
             kv_cache_dummy_dep = torch.ops.vllm.unified_mla_kv_cache_update(
                 kv_c_normed,
                 k_pe,

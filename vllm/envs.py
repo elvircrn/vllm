@@ -1418,7 +1418,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # e.g. "2,7,10" = only QKV_PROJ, ATTENTION, MOE.
     # IDs: 0=EMBEDDING 1=INPUT_LN 2=QKV_PROJ 3=Q_A_LN 4=Q_B_PROJ
     #      5=KV_A_LN 6=ROTARY 7=ATTENTION 8=O_PROJ 9=POST_ATTN_LN 10=MOE
-    #      14=MLP_OUTPUT
+    #      14=MLP_OUTPUT 15=KV_CACHE_IN
     "VLLM_NAN_CHECK_COMPONENTS": lambda: os.getenv(
         "VLLM_NAN_CHECK_COMPONENTS", "all"
     ),
