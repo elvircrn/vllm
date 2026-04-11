@@ -5143,6 +5143,26 @@ class GPUModelRunner(
             # No DeepseekV2MoE modules found — not a DeepSeek model.
             self._dp_padding_mask = None
 
+    @staticmethod
+    def _has_nan_per_block(kv: torch.Tensor) -> torch.Tensor:
+        """Return a bool tensor of shape (num_blocks,) indicating NaN.
+
+        Handles float8_e4m3fn (NaN bit pattern 0x7F / 0xFF) and
+        regular float dtypes via torch.isnan().
+        """
+        # Flatten to (num_blocks, -1)
+        num_blocks = kv.shape[0] if kv.dim() <= 3 else kv.shape[1]
+        flat = kv.reshape(num_blocks, -1) if kv.dim() <= 3 \
+            else kv.reshape(kv.shape[0] * kv.shape[1], -1)
+
+        if kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+            # torch.isnan doesn't work on float8.
+            # E4M3FN NaN: sign.1111.111 → (byte & 0x7F) == 0x7F
+            raw = flat.view(torch.uint8)
+            return ((raw & 0x7F) == 0x7F).any(dim=1)
+
+        return torch.isnan(flat).any(dim=1)
+
     def _audit_kv_cache_nans(self) -> tuple[int, int, list[int]]:
         """Scan KV cache tensors for NaN blocks, per layer.
 
@@ -5153,13 +5173,7 @@ class GPUModelRunner(
         total = 0
         affected = 0
         for layer_idx, kv in enumerate(self.kv_caches):
-            # kv shape: (num_blocks, block_size, head_size) for MLA
-            #       or: (2, num_blocks, block_size, num_heads, head_size)
-            # Use reshape to flatten all dims except the block dim.
-            num_blocks = kv.shape[0] if kv.dim() <= 3 else kv.shape[1]
-            flat = kv.reshape(num_blocks, -1) if kv.dim() <= 3 \
-                else kv.reshape(kv.shape[0] * kv.shape[1], -1)
-            nan_mask = torch.isnan(flat).any(dim=1)
+            nan_mask = self._has_nan_per_block(kv)
             count = int(nan_mask.sum().item())
             per_layer.append(count)
             total += count
@@ -5172,8 +5186,9 @@ class GPUModelRunner(
             )
             logger.warning(
                 "KV cache NaN audit: %d NaN blocks across %d/%d layers "
-                "[%s]",
+                "[%s] (dtype=%s)",
                 total, affected, len(self.kv_caches), detail,
+                self.kv_caches[0].dtype,
             )
         return total, affected, per_layer
 
