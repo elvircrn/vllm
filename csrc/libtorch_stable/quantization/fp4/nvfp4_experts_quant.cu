@@ -109,6 +109,13 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
       }
     }
 
+    // Rows beyond all experts' range are DP padding.  Their default
+    // expert_idx=0, rowIdx_in_expert=0 would race with and overwrite
+    // expert 0 row 0's real scale factor.  Suppress the SF write for
+    // these rows (the thread still participates in warp shuffles).
+    bool is_padding = (static_cast<uint32_t>(rowIdx) >=
+                       __ldca(&input_offset_by_experts[n_experts]));
+
     // Load input and optionally apply fused SiLU+Mul
     int64_t inOffset = rowIdx * inColsPerRow + colIdx;
     PackedVec in_vec = reinterpret_cast<PackedVec const*>(in)[inOffset];
@@ -135,9 +142,10 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
         SFout + output_scale_offset_by_experts[expert_idx] * numKTiles;
 
     auto sf_out =
-        cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
+        is_padding ? nullptr
+                   : cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
                                            CVT_FP4_NUM_THREADS_PER_SF>(
-            rowIdx_in_expert, colIdx, numKTiles, SFout_in_expert);
+                         rowIdx_in_expert, colIdx, numKTiles, SFout_in_expert);
 
     out_pos = cvt_warp_fp16_to_fp4<Type, CVT_FP4_NUM_THREADS_PER_SF, UE8M0_SF>(
         quant_input, SFScaleVal, sf_out);
@@ -220,6 +228,10 @@ __global__ void __launch_bounds__(1024, VLLM_BLOCKS_PER_SM(1024))
       }
     }
 
+    // Rows beyond all experts' range are DP padding — suppress SF write.
+    bool is_padding = (static_cast<uint32_t>(rowIdx) >=
+                       shared_input_offsets[n_experts]);
+
     // Load input and optionally apply fused SiLU+Mul
     int64_t inOffset = rowIdx * inColsPerRow + colIdx;
     PackedVec in_vec = reinterpret_cast<PackedVec const*>(in)[inOffset];
@@ -241,9 +253,10 @@ __global__ void __launch_bounds__(1024, VLLM_BLOCKS_PER_SM(1024))
         SFout + output_scale_offset_by_experts[expert_idx] * numKTiles;
 
     auto sf_out =
-        cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
+        is_padding ? nullptr
+                   : cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
                                            CVT_FP4_NUM_THREADS_PER_SF>(
-            rowIdx_in_expert, colIdx, numKTiles, SFout_in_expert);
+                         rowIdx_in_expert, colIdx, numKTiles, SFout_in_expert);
 
     out_pos = cvt_warp_fp16_to_fp4<Type, CVT_FP4_NUM_THREADS_PER_SF, UE8M0_SF>(
         quant_input, SFScaleVal, sf_out);
