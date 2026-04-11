@@ -192,6 +192,7 @@ if TYPE_CHECKING:
     VLLM_SSM_CONV_STATE_LAYOUT: Literal["SD", "DS"] | None = None
     VLLM_COMPUTE_NANS_IN_LOGITS: bool = False
     VLLM_NAN_CHECK_COMPONENTS: str = "all"
+    VLLM_KV_CACHE_NAN_AUDIT: int = 0
     VLLM_USE_NVFP4_CT_EMULATIONS: bool = False
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: Literal[
         "FP", "INT8", "INT6", "INT4", "NONE"
@@ -1421,6 +1422,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #      14=MLP_OUTPUT 15=KV_CACHE_IN
     "VLLM_NAN_CHECK_COMPONENTS": lambda: os.getenv(
         "VLLM_NAN_CHECK_COMPONENTS", "all"
+    ),
+    # Audit KV cache for NaN before every N-th model call.
+    # 0 = disabled (default), N > 0 = check every N steps.
+    # Logs per-layer NaN block counts and publishes totals to Prometheus.
+    "VLLM_KV_CACHE_NAN_AUDIT": lambda: int(
+        os.getenv("VLLM_KV_CACHE_NAN_AUDIT", "0")
     ),
     # Controls whether or not emulations are used for NVFP4
     # generations on machines < 100 for compressed-tensors

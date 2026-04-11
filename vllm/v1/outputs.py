@@ -208,6 +208,10 @@ class ModelRunnerOutput:
     nan_real_output: bool = False
     nan_padded_output: bool = False
 
+    # KV cache NaN audit results (populated when VLLM_KV_CACHE_NAN_AUDIT > 0).
+    kv_cache_nan_total_blocks: int = 0
+    kv_cache_nan_affected_layers: int = 0
+
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 

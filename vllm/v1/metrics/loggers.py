@@ -627,6 +627,31 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             for g in self.gauge_nan_first_layer_residual.values():
                 g.set(-1)
 
+        if envs.VLLM_KV_CACHE_NAN_AUDIT > 0:
+            gauge_kv_nan_total = self._gauge_cls(
+                name="vllm:kv_cache_nan_total_blocks",
+                documentation=(
+                    "Total KV cache blocks containing NaN across all layers."
+                ),
+                multiprocess_mode="mostrecent",
+                labelnames=labelnames,
+            )
+            self.gauge_kv_nan_total = create_metric_per_engine(
+                gauge_kv_nan_total, per_engine_labelvalues
+            )
+            gauge_kv_nan_layers = self._gauge_cls(
+                name="vllm:kv_cache_nan_affected_layers",
+                documentation=(
+                    "Number of KV cache layers containing at least one "
+                    "NaN block."
+                ),
+                multiprocess_mode="mostrecent",
+                labelnames=labelnames,
+            )
+            self.gauge_kv_nan_layers = create_metric_per_engine(
+                gauge_kv_nan_layers, per_engine_labelvalues
+            )
+
         counter_prefix_cache_queries = self._counter_cls(
             name="vllm:prefix_cache_queries",
             documentation=(
@@ -1244,6 +1269,12 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     scheduler_stats.nan_first_layer_hidden)
                 self.gauge_nan_first_layer_residual[engine_idx].set(
                     scheduler_stats.nan_first_layer_residual)
+
+            if envs.VLLM_KV_CACHE_NAN_AUDIT > 0:
+                self.gauge_kv_nan_total[engine_idx].set(
+                    scheduler_stats.kv_cache_nan_total_blocks)
+                self.gauge_kv_nan_layers[engine_idx].set(
+                    scheduler_stats.kv_cache_nan_affected_layers)
 
             if self.gauge_lora_info is not None:
                 running_lora_adapters = ",".join(

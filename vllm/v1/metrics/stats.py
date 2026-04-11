@@ -212,6 +212,10 @@ class SchedulerStats:
     nan_padded_output: bool = False
     nan_phase: str | None = None  # "prefill", "decode", or "mixed"
 
+    # KV cache NaN audit results.
+    kv_cache_nan_total_blocks: int = 0
+    kv_cache_nan_affected_layers: int = 0
+
 
 @dataclass
 class RequestStateStats:
