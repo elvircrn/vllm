@@ -643,6 +643,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.gauge_kv_nan_total = create_metric_per_engine(
                 gauge_kv_nan_total, per_engine_labelvalues
             )
+            for g in self.gauge_kv_nan_total.values():
+                g.set(0)
             gauge_kv_nan_layers = self._gauge_cls(
                 name="vllm:kv_cache_nan_affected_layers",
                 documentation=(
@@ -655,6 +657,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.gauge_kv_nan_layers = create_metric_per_engine(
                 gauge_kv_nan_layers, per_engine_labelvalues
             )
+            for g in self.gauge_kv_nan_layers.values():
+                g.set(0)
             # Per-layer gauge with dynamic "layer" label.
             self._gauge_kv_nan_per_layer = self._gauge_cls(
                 name="vllm:kv_cache_nan_blocks_per_layer",
