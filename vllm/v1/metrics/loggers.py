@@ -668,17 +668,20 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 multiprocess_mode="mostrecent",
                 labelnames=labelnames + ["layer"],
             )
-            self._gauge_kv_nan_first_block = self._gauge_cls(
-                name="vllm:kv_cache_nan_first_block_per_layer",
+            self._gauge_kv_nan_block = self._gauge_cls(
+                name="vllm:kv_cache_nan_block",
                 documentation=(
-                    "First NaN block index in KV cache per layer "
-                    "(-1 if none)."
+                    "1 if this (layer, block) contains NaN, 0 otherwise."
                 ),
                 multiprocess_mode="mostrecent",
-                labelnames=labelnames + ["layer"],
+                labelnames=labelnames + ["layer", "block"],
             )
-            # Initialize per-layer gauges to 0 so they appear in
-            # Prometheus scrapes before the first audit runs.
+            # Track previously-set (layer, block) pairs so we can clear
+            # stale entries when blocks become clean.
+            self._prev_nan_blocks: dict[int, set[tuple[str, str]]] = {
+                eid: set() for eid in per_engine_labelvalues
+            }
+            # Initialize per-layer count gauges to 0.
             num_layers = getattr(
                 vllm_config.model_config.hf_config,
                 "num_hidden_layers", 0)
@@ -686,8 +689,6 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 for layer in range(num_layers):
                     self._gauge_kv_nan_per_layer.labels(
                         *lv, str(layer)).set(0)
-                    self._gauge_kv_nan_first_block.labels(
-                        *lv, str(layer)).set(-1)
 
         counter_prefix_cache_queries = self._counter_cls(
             name="vllm:prefix_cache_queries",
@@ -1319,12 +1320,23 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     self._gauge_kv_nan_per_layer.labels(
                         *lv, str(layer_idx)
                     ).set(count)
-                for layer_idx, blk in enumerate(
-                    scheduler_stats.kv_cache_nan_first_block
+                # Set per-(layer, block) NaN gauges and clear stale ones.
+                cur_set: set[tuple[str, str]] = set()
+                for layer_idx, blk_ids in enumerate(
+                    scheduler_stats.kv_cache_nan_block_ids
                 ):
-                    self._gauge_kv_nan_first_block.labels(
-                        *lv, str(layer_idx)
-                    ).set(blk)
+                    layer_s = str(layer_idx)
+                    for blk in blk_ids:
+                        blk_s = str(blk)
+                        cur_set.add((layer_s, blk_s))
+                        self._gauge_kv_nan_block.labels(
+                            *lv, layer_s, blk_s).set(1)
+                # Clear blocks that were NaN last time but are clean now.
+                prev = self._prev_nan_blocks[engine_idx]
+                for key in prev - cur_set:
+                    self._gauge_kv_nan_block.labels(
+                        *lv, key[0], key[1]).set(0)
+                self._prev_nan_blocks[engine_idx] = cur_set
 
             if self.gauge_lora_info is not None:
                 running_lora_adapters = ",".join(

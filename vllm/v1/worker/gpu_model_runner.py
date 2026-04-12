@@ -510,7 +510,7 @@ class GPUModelRunner(
         self._kv_audit_total_blocks: int = 0
         self._kv_audit_affected_layers: int = 0
         self._kv_audit_per_layer: list[int] = []
-        self._kv_audit_first_block: list[int] = []
+        self._kv_audit_block_ids: list[list[int]] = []
 
         # Lazy initializations
         # self.model: nn.Module  # Set after load_model
@@ -4067,7 +4067,7 @@ class GPUModelRunner(
                 (self._kv_audit_total_blocks,
                  self._kv_audit_affected_layers,
                  self._kv_audit_per_layer,
-                 self._kv_audit_first_block) = (
+                 self._kv_audit_block_ids) = (
                     self._audit_kv_cache_nans())
 
         # Reset NaN detection flags and update real-token mask.
@@ -4457,7 +4457,7 @@ class GPUModelRunner(
                 kv_cache_nan_total_blocks=self._kv_audit_total_blocks,
                 kv_cache_nan_affected_layers=self._kv_audit_affected_layers,
                 kv_cache_nan_per_layer=self._kv_audit_per_layer,
-                kv_cache_nan_first_block=self._kv_audit_first_block,
+                kv_cache_nan_block_ids=self._kv_audit_block_ids,
                 cudagraph_stats=cudagraph_stats,
             )
 
@@ -5170,15 +5170,15 @@ class GPUModelRunner(
 
     def _audit_kv_cache_nans(
         self,
-    ) -> tuple[int, int, list[int], list[int]]:
+    ) -> tuple[int, int, list[int], list[list[int]]]:
         """Scan KV cache tensors for NaN blocks, per layer.
 
         Returns:
             (total_nan_blocks, affected_layers, per_layer_counts,
-             per_layer_first_block)
+             per_layer_block_ids)
         """
         per_layer: list[int] = []
-        first_block: list[int] = []
+        block_ids: list[list[int]] = []
         total = 0
         affected = 0
         for layer_idx, kv in enumerate(self.kv_caches):
@@ -5188,12 +5188,12 @@ class GPUModelRunner(
             total += count
             if count > 0:
                 affected += 1
-                first_block.append(
-                    int(nan_mask.nonzero(as_tuple=False)[0].item()))
+                block_ids.append(
+                    nan_mask.nonzero(as_tuple=False).flatten().tolist())
             else:
-                first_block.append(-1)
+                block_ids.append([])
 
-        return total, affected, per_layer, first_block
+        return total, affected, per_layer, block_ids
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         """Extract Eagle3 auxiliary layer indices from speculative config.

@@ -212,7 +212,7 @@ class ModelRunnerOutput:
     kv_cache_nan_total_blocks: int = 0
     kv_cache_nan_affected_layers: int = 0
     kv_cache_nan_per_layer: list[int] = field(default_factory=list)
-    kv_cache_nan_first_block: list[int] = field(default_factory=list)
+    kv_cache_nan_block_ids: list[list[int]] = field(default_factory=list)
 
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
