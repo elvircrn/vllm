@@ -668,6 +668,15 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 multiprocess_mode="mostrecent",
                 labelnames=labelnames + ["layer"],
             )
+            self._gauge_kv_nan_first_block = self._gauge_cls(
+                name="vllm:kv_cache_nan_first_block_per_layer",
+                documentation=(
+                    "First NaN block index in KV cache per layer "
+                    "(-1 if none)."
+                ),
+                multiprocess_mode="mostrecent",
+                labelnames=labelnames + ["layer"],
+            )
             # Initialize per-layer gauges to 0 so they appear in
             # Prometheus scrapes before the first audit runs.
             num_layers = getattr(
@@ -677,6 +686,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 for layer in range(num_layers):
                     self._gauge_kv_nan_per_layer.labels(
                         *lv, str(layer)).set(0)
+                    self._gauge_kv_nan_first_block.labels(
+                        *lv, str(layer)).set(-1)
 
         counter_prefix_cache_queries = self._counter_cls(
             name="vllm:prefix_cache_queries",
@@ -1308,6 +1319,12 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     self._gauge_kv_nan_per_layer.labels(
                         *lv, str(layer_idx)
                     ).set(count)
+                for layer_idx, blk in enumerate(
+                    scheduler_stats.kv_cache_nan_first_block
+                ):
+                    self._gauge_kv_nan_first_block.labels(
+                        *lv, str(layer_idx)
+                    ).set(blk)
 
             if self.gauge_lora_info is not None:
                 running_lora_adapters = ",".join(

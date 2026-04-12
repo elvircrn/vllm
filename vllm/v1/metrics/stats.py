@@ -216,6 +216,7 @@ class SchedulerStats:
     kv_cache_nan_total_blocks: int = 0
     kv_cache_nan_affected_layers: int = 0
     kv_cache_nan_per_layer: list[int] = field(default_factory=list)
+    kv_cache_nan_first_block: list[int] = field(default_factory=list)
 
 
 @dataclass

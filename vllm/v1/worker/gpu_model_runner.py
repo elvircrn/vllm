@@ -510,6 +510,7 @@ class GPUModelRunner(
         self._kv_audit_total_blocks: int = 0
         self._kv_audit_affected_layers: int = 0
         self._kv_audit_per_layer: list[int] = []
+        self._kv_audit_first_block: list[int] = []
 
         # Lazy initializations
         # self.model: nn.Module  # Set after load_model
@@ -4065,7 +4066,8 @@ class GPUModelRunner(
                 self._kv_audit_step = 0
                 (self._kv_audit_total_blocks,
                  self._kv_audit_affected_layers,
-                 self._kv_audit_per_layer) = (
+                 self._kv_audit_per_layer,
+                 self._kv_audit_first_block) = (
                     self._audit_kv_cache_nans())
 
         # Reset NaN detection flags and update real-token mask.
@@ -4455,6 +4457,7 @@ class GPUModelRunner(
                 kv_cache_nan_total_blocks=self._kv_audit_total_blocks,
                 kv_cache_nan_affected_layers=self._kv_audit_affected_layers,
                 kv_cache_nan_per_layer=self._kv_audit_per_layer,
+                kv_cache_nan_first_block=self._kv_audit_first_block,
                 cudagraph_stats=cudagraph_stats,
             )
 
@@ -5165,13 +5168,17 @@ class GPUModelRunner(
 
         return torch.isnan(kv.reshape(kv.shape[0], -1)).any(dim=1)
 
-    def _audit_kv_cache_nans(self) -> tuple[int, int, list[int]]:
+    def _audit_kv_cache_nans(
+        self,
+    ) -> tuple[int, int, list[int], list[int]]:
         """Scan KV cache tensors for NaN blocks, per layer.
 
         Returns:
-            (total_nan_blocks, affected_layers, per_layer_counts)
+            (total_nan_blocks, affected_layers, per_layer_counts,
+             per_layer_first_block)
         """
         per_layer: list[int] = []
+        first_block: list[int] = []
         total = 0
         affected = 0
         for layer_idx, kv in enumerate(self.kv_caches):
@@ -5181,19 +5188,12 @@ class GPUModelRunner(
             total += count
             if count > 0:
                 affected += 1
-                block_ids = nan_mask.nonzero(as_tuple=False).flatten()
-                sample = block_ids[:20].tolist()
-                logger.warning(
-                    "KV cache NaN: layer %d — %d/%d blocks, "
-                    "block_ids(first 20): %s",
-                    layer_idx, count, kv.shape[0], sample)
+                first_block.append(
+                    int(nan_mask.nonzero(as_tuple=False)[0].item()))
+            else:
+                first_block.append(-1)
 
-        if total > 0:
-            logger.warning(
-                "KV cache NaN audit: %d total NaN blocks across "
-                "%d/%d layers", total, affected, len(per_layer))
-
-        return total, affected, per_layer
+        return total, affected, per_layer, first_block
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         """Extract Eagle3 auxiliary layer indices from speculative config.
