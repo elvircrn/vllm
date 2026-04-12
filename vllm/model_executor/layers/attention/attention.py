@@ -813,6 +813,8 @@ NAN_COMPONENT_ATTN_V_UP_PROJ = 19
 NAN_COMPONENT_ATTN_MHA_OUT = 20
 NAN_COMPONENT_ATTN_MQA_Q = 21
 NAN_COMPONENT_KV_CACHE_IN_KPE = 22
+NAN_COMPONENT_KV_CACHE_IN_COMPILED = 23
+NAN_COMPONENT_KV_CACHE_IN_KPE_COMPILED = 24
 
 NAN_COMPONENT_NAMES = {
     NAN_COMPONENT_EMBEDDING: "embedding",
@@ -837,6 +839,8 @@ NAN_COMPONENT_NAMES = {
     NAN_COMPONENT_ATTN_MHA_OUT: "attn_mha_out",
     NAN_COMPONENT_ATTN_MQA_Q: "attn_mqa_q",
     NAN_COMPONENT_KV_CACHE_IN_KPE: "kv_cache_in_kpe",
+    NAN_COMPONENT_KV_CACHE_IN_COMPILED: "kv_cache_in_compiled",
+    NAN_COMPONENT_KV_CACHE_IN_KPE_COMPILED: "kv_cache_in_kpe_compiled",
 }
 
 # Parsed once at import time from VLLM_NAN_CHECK_COMPONENTS.
@@ -851,7 +855,7 @@ def nan_check_enabled(component_id: int) -> bool:
         import vllm.envs as envs
         raw = envs.VLLM_NAN_CHECK_COMPONENTS
         if raw == "all":
-            _NAN_ENABLED_COMPONENTS = frozenset(range(23))
+            _NAN_ENABLED_COMPONENTS = frozenset(range(25))
         elif raw == "none":
             _NAN_ENABLED_COMPONENTS = frozenset()
         else:
