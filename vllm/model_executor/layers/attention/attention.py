@@ -811,6 +811,7 @@ NAN_COMPONENT_ATTN_Q_ABSORBED = 17
 NAN_COMPONENT_ATTN_FA3_OUT = 18
 NAN_COMPONENT_ATTN_V_UP_PROJ = 19
 NAN_COMPONENT_ATTN_MHA_OUT = 20
+NAN_COMPONENT_ATTN_MQA_Q = 21
 
 NAN_COMPONENT_NAMES = {
     NAN_COMPONENT_EMBEDDING: "embedding",
@@ -833,6 +834,7 @@ NAN_COMPONENT_NAMES = {
     NAN_COMPONENT_ATTN_FA3_OUT: "attn_fa3_out",
     NAN_COMPONENT_ATTN_V_UP_PROJ: "attn_v_up_proj",
     NAN_COMPONENT_ATTN_MHA_OUT: "attn_mha_out",
+    NAN_COMPONENT_ATTN_MQA_Q: "attn_mqa_q",
 }
 
 # Parsed once at import time from VLLM_NAN_CHECK_COMPONENTS.
@@ -847,7 +849,7 @@ def nan_check_enabled(component_id: int) -> bool:
         import vllm.envs as envs
         raw = envs.VLLM_NAN_CHECK_COMPONENTS
         if raw == "all":
-            _NAN_ENABLED_COMPONENTS = frozenset(range(21))
+            _NAN_ENABLED_COMPONENTS = frozenset(range(22))
         elif raw == "none":
             _NAN_ENABLED_COMPONENTS = frozenset()
         else:

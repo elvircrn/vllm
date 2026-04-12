@@ -716,6 +716,19 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 # mqa_q do allgather in head dim.
                 mqa_q = get_dcp_group().all_gather(mqa_q, dim=1)
 
+            if self._nan_flag is not None and nan_check_enabled(21):
+                if isinstance(mqa_q, torch.Tensor):
+                    torch.ops.vllm.nan_first_component(
+                        mqa_q, self._nan_flag,
+                        self._nan_flag_real, 21,
+                        self._nan_real_mask)  # ATTN_MQA_Q
+                else:
+                    for _q in mqa_q:
+                        torch.ops.vllm.nan_first_component(
+                            _q, self._nan_flag,
+                            self._nan_flag_real, 21,
+                            self._nan_real_mask)  # ATTN_MQA_Q
+
             # call decode attn
             if not is_sparse_impl:
                 assert attn_metadata.decode is not None
