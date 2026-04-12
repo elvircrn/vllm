@@ -634,6 +634,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 output=output[num_mqa_tokens:],
             )
 
+            if self._nan_flag is not None and nan_check_enabled(20):
+                torch.ops.vllm.nan_first_component(
+                    output[num_mqa_tokens:], self._nan_flag,
+                    self._nan_flag_real, 20,
+                    self._nan_real_mask)  # ATTN_MHA_OUT
+
         if num_mqa_tokens > 0:
             mqa_q = q[:num_mqa_tokens]
             mqa_output_slice = output[:num_mqa_tokens]
