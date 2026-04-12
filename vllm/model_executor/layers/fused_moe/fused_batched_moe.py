@@ -836,7 +836,7 @@ def batched_moe_kernel_quantize_input(
     elif qtype is None:
         return A, normalize_batched_scales_shape(A_scale, E)
     else:
-        A_q = torch.zeros_like(A, dtype=qtype)
+        A_q = torch.empty_like(A, dtype=qtype)
 
         if per_act_token_quant:
             assert block_shape is None
