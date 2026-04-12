@@ -564,6 +564,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 dtype=q.dtype,
                 device=output.device,
             )
+            if self._nan_flag is not None and nan_check_enabled(16):
+                torch.ops.vllm.nan_first_component(
+                    output, self._nan_flag,
+                    self._nan_flag_real, 16,
+                    self._nan_real_mask)  # ATTN_WORKSPACE
 
         if attn_metadata is None:
             # During the profile run try to simulate to worse case output size
@@ -684,6 +689,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 # Convert from (N, B, L) to (B, N, L)
                 mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
 
+            if self._nan_flag is not None and nan_check_enabled(17):
+                torch.ops.vllm.nan_first_component(
+                    mqa_ql_nope, self._nan_flag,
+                    self._nan_flag_real, 17,
+                    self._nan_real_mask)  # ATTN_Q_ABSORBED
+
             if fp8_attention and self.impl.supports_quant_query_input:
                 assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
                 assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
@@ -704,6 +715,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 assert attn_metadata.decode is not None
             attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, attn_metadata, self)
 
+            if self._nan_flag is not None and nan_check_enabled(18):
+                torch.ops.vllm.nan_first_component(
+                    attn_out, self._nan_flag,
+                    self._nan_flag_real, 18,
+                    self._nan_real_mask)  # ATTN_FA3_OUT
+
             # correct dcp attn_out with lse.
             if self.impl.dcp_world_size > 1:
                 if self.dcp_a2a:
@@ -723,6 +740,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
             # v_up projection
             self._v_up_proj(attn_out, out=mqa_output_slice)
+
+            if self._nan_flag is not None and nan_check_enabled(19):
+                torch.ops.vllm.nan_first_component(
+                    mqa_output_slice, self._nan_flag,
+                    self._nan_flag_real, 19,
+                    self._nan_real_mask)  # ATTN_V_UP_PROJ
 
         if use_quant:
             # Quantize the BF16 computation result into the quantized output
