@@ -846,7 +846,7 @@ class DeepSeekV2FusedQkvAProjLinear(MergedColumnParallelLinear):
         self,
         input_,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.nn.Parameter | None]:
-        if self._use_min_latency_gemm:
+        if False and self._use_min_latency_gemm:
             output = torch.ops.vllm.min_latency_fused_qkv_a_proj(input_, self.weight)
             if not self.return_bias:
                 return output
