@@ -782,7 +782,8 @@ def _min_latency_fused_qkv_a_proj_impl(
     does not support runtime dispatching on num_tokens.
     """
     num_tokens = input_.shape[0]
-    if 0 < num_tokens <= 16:
+    # TODO(elvicrn): Disabled.
+    if False and 0 < num_tokens <= 16:
         output = torch.empty(
             num_tokens,
             weight.shape[0],
