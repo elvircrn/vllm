@@ -668,6 +668,15 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 multiprocess_mode="mostrecent",
                 labelnames=labelnames + ["layer"],
             )
+            # Initialize per-layer gauges to 0 so they appear in
+            # Prometheus scrapes before the first audit runs.
+            num_layers = getattr(
+                vllm_config.model_config.hf_config,
+                "num_hidden_layers", 0)
+            for lv in per_engine_labelvalues.values():
+                for layer in range(num_layers):
+                    self._gauge_kv_nan_per_layer.labels(
+                        *lv, str(layer)).set(0)
 
         counter_prefix_cache_queries = self._counter_cls(
             name="vllm:prefix_cache_queries",

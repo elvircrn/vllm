@@ -5156,8 +5156,9 @@ class GPUModelRunner(
         We flatten all dims after dim-0 and check per first-dim entry.
         For MLA this gives per-block NaN detection.
         """
-        if kv.dtype.is_floating_point and kv.element_size() == 1:
-            # fp8 — torch.isnan doesn't work; check bit pattern.
+        if kv.element_size() == 1:
+            # fp8 stored as uint8 or float8 — torch.isnan doesn't work
+            # on either; check bit pattern directly.
             # E4M3FN NaN: S.1111.111 → (byte & 0x7F) == 0x7F
             raw = kv.reshape(kv.shape[0], -1).view(torch.uint8)
             return ((raw & 0x7F) == 0x7F).any(dim=1)

@@ -204,6 +204,11 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             k_pe,
             output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
         )
+        if self._nan_origin_flag is not None and nan_check_enabled(7):
+            torch.ops.vllm.nan_first_component(
+                attn_out, self._nan_origin_flag,
+                self._nan_origin_flag_real, 7,
+                self._nan_real_mask)  # ATTENTION
 
         output, _ = self.o_proj(attn_out)
         if self._nan_origin_flag is not None and nan_check_enabled(8):
