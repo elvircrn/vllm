@@ -86,8 +86,24 @@ _maybe_set_cuda_compatibility_path()
 
 import torch
 
-torch.empty = torch.zeros
-torch.empty_like = torch.zeros_like
+_real_empty = torch.empty
+_real_empty_like = torch.empty_like
+
+
+def _zeros_empty(*args, **kwargs):
+    t = _real_empty(*args, **kwargs)
+    t.zero_()
+    return t
+
+
+def _zeros_empty_like(*args, **kwargs):
+    t = _real_empty_like(*args, **kwargs)
+    t.zero_()
+    return t
+
+
+torch.empty = _zeros_empty
+torch.empty_like = _zeros_empty_like
 
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import is_torch_equal, is_torch_equal_or_newer
