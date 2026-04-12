@@ -497,6 +497,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     kv_c_normed, self._nan_flag,
                     self._nan_flag_real, 15,
                     self._nan_real_mask)  # KV_CACHE_IN
+            if self._nan_flag is not None and nan_check_enabled(22):
+                torch.ops.vllm.nan_first_component(
+                    k_pe, self._nan_flag,
+                    self._nan_flag_real, 22,
+                    self._nan_real_mask)  # KV_CACHE_IN_KPE
             self.impl.do_kv_cache_update(
                 kv_c_normed,
                 k_pe,
