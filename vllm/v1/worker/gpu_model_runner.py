@@ -4092,8 +4092,11 @@ class GPUModelRunner(
                 nan_check_enabled,
             )
             if nan_check_enabled(NAN_COMPONENT_KV_CACHE_PRE_FORWARD):
-                # Only scan if flag hasn't latched yet.
-                if self._nan_origin_flag.item() == -1:
+                # Scan if ANY flag is still unlatched (-1).
+                all_latched = (self._nan_origin_flag.item() != -1)
+                real_latched = (self._nan_origin_flag_real.item() != -1)
+                padded_latched = (self._nan_origin_flag_padded.item() != -1)
+                if not (all_latched and real_latched and padded_latched):
                     kv_has_nan = False
                     for kv in self.kv_caches:
                         if kv.numel() == 0:
@@ -4108,10 +4111,14 @@ class GPUModelRunner(
                                 kv_has_nan = True
                                 break
                     if kv_has_nan:
-                        self._nan_origin_flag.fill_(
-                            NAN_COMPONENT_KV_CACHE_PRE_FORWARD)
-                        self._nan_origin_flag_real.fill_(
-                            NAN_COMPONENT_KV_CACHE_PRE_FORWARD)
+                        cid = NAN_COMPONENT_KV_CACHE_PRE_FORWARD
+                        # Only set flags that haven't latched yet.
+                        if not all_latched:
+                            self._nan_origin_flag.fill_(cid)
+                        if not real_latched:
+                            self._nan_origin_flag_real.fill_(cid)
+                        if not padded_latched:
+                            self._nan_origin_flag_padded.fill_(cid)
 
         # Update DP padding mask: 1.0 for real tokens, 0.0 for padding.
         if self._dp_padding_mask is not None:
