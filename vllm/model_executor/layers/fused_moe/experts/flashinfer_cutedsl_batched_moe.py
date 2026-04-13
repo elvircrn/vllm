@@ -34,6 +34,7 @@ logger = init_logger(__name__)
 # Set by FusedMoE.forward_cuda() before calling forward_native().
 # The flag tensor is pre-allocated and persistent (same address for CUDA graphs).
 _nan_expert_flag: torch.Tensor | None = None
+_nan_flag_warn_logged: bool = False
 
 
 def set_nan_expert_flag(flag: torch.Tensor | None) -> None:
@@ -333,6 +334,12 @@ def flashinfer_cutedsl_moe_masked(
 
     # Expert-internal NaN/Inf checks — read module-level flag.
     _flag = _nan_expert_flag
+    if _flag is None:
+        global _nan_flag_warn_logged
+        if not _nan_flag_warn_logged:
+            logger.warning("NaN expert flag is None — expert-internal "
+                           "checks (36-51) will NOT fire")
+            _nan_flag_warn_logged = True
 
     # Check expert input for NaN/Inf before FP4 quantization.
     if _flag is not None and not isinstance(hidden_states, tuple):

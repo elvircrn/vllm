@@ -1537,7 +1537,15 @@ class FusedMoE(CustomOp):
         from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_batched_moe import (  # noqa: E501
             set_nan_expert_flag,
         )
-        set_nan_expert_flag(self._nan_flag)
+        nan_flag = self._nan_flag
+        if nan_flag is None and not getattr(self, '_nan_flag_none_warned', False):
+            from vllm.logger import init_logger as _init_logger
+            _logger = _init_logger(__name__)
+            _logger.warning(
+                "FusedMoE._nan_flag is None — expert-internal NaN "
+                "checks will not fire for %s", getattr(self, '_name', '?'))
+            self._nan_flag_none_warned = True
+        set_nan_expert_flag(nan_flag)
         result = self.runner.forward(
             hidden_states,
             router_logits,
