@@ -203,6 +203,8 @@ class SchedulerStats:
     nan_origin_name: str | None = None
     nan_origin_component_real: int = -1  # real tokens only
     nan_origin_name_real: str | None = None
+    nan_origin_component_padded: int = -1  # padded tokens only
+    nan_origin_name_padded: str | None = None
     nan_in_logits: bool = False
     nan_in_final_norm: bool = False
     nan_in_lm_head: bool = False

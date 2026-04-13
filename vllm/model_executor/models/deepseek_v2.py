@@ -1133,6 +1133,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         # NaN origin tracking — assigned by model runner.
         self._nan_origin_flag: torch.Tensor | None = None
         self._nan_origin_flag_real: torch.Tensor | None = None
+        self._nan_origin_flag_padded: torch.Tensor | None = None
         self._nan_real_mask: torch.Tensor | None = None
         # Per-layer NaN presence flags (written to flags[layer_idx]).
         self._nan_per_layer_hidden: torch.Tensor | None = None
@@ -1154,7 +1155,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         if self._nan_origin_flag is not None and nan_check_enabled(1):
             torch.ops.vllm.nan_first_component(
                 hidden_states, self._nan_origin_flag,
-                self._nan_origin_flag_real, 1,
+                self._nan_origin_flag_real,
+                self._nan_origin_flag_padded, 1,
                 self._nan_real_mask)  # INPUT_LN
 
         attn_kwargs = {
@@ -1183,13 +1185,15 @@ class DeepseekV2DecoderLayer(nn.Module):
         if self._nan_origin_flag is not None and nan_check_enabled(9):
             torch.ops.vllm.nan_first_component(
                 hidden_states, self._nan_origin_flag,
-                self._nan_origin_flag_real, 9,
+                self._nan_origin_flag_real,
+                self._nan_origin_flag_padded, 9,
                 self._nan_real_mask)  # POST_ATTN_LN
         hidden_states = self.mlp(hidden_states)
         if self._nan_origin_flag is not None and nan_check_enabled(14):
             torch.ops.vllm.nan_first_component(
                 hidden_states, self._nan_origin_flag,
-                self._nan_origin_flag_real, 14,
+                self._nan_origin_flag_real,
+                self._nan_origin_flag_padded, 14,
                 self._nan_real_mask)  # MLP_OUTPUT
 
         if isinstance(self.mlp, DeepseekV2MLP) and hidden_states.dtype == torch.float16:
@@ -1266,6 +1270,7 @@ class DeepseekV2Model(nn.Module):
         # NaN origin tracking — assigned by model runner.
         self._nan_origin_flag: torch.Tensor | None = None
         self._nan_origin_flag_real: torch.Tensor | None = None
+        self._nan_origin_flag_padded: torch.Tensor | None = None
         self._nan_real_mask: torch.Tensor | None = None
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -1291,7 +1296,8 @@ class DeepseekV2Model(nn.Module):
             if self._nan_origin_flag is not None and nan_check_enabled(0):
                 torch.ops.vllm.nan_first_component(
                     hidden_states, self._nan_origin_flag,
-                    self._nan_origin_flag_real, 0,
+                    self._nan_origin_flag_real,
+                    self._nan_origin_flag_padded, 0,
                     self._nan_real_mask)  # EMBEDDING
             residual = None
         else:
@@ -1333,12 +1339,14 @@ class DeepseekV2Model(nn.Module):
             if nan_check_enabled(11):
                 torch.ops.vllm.nan_first_component(
                     hidden_states, self._nan_origin_flag,
-                    self._nan_origin_flag_real, 11,
+                    self._nan_origin_flag_real,
+                    self._nan_origin_flag_padded, 11,
                     self._nan_real_mask)  # PRE_NORM_HIDDEN
             if nan_check_enabled(12):
                 torch.ops.vllm.nan_first_component(
                     residual, self._nan_origin_flag,
-                    self._nan_origin_flag_real, 12,
+                    self._nan_origin_flag_real,
+                    self._nan_origin_flag_padded, 12,
                     self._nan_real_mask)  # PRE_NORM_RESIDUAL
         hidden_states, _ = self.norm(hidden_states, residual)
         if len(aux_hidden_states) > 0:

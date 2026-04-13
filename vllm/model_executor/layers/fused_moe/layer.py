@@ -588,6 +588,7 @@ class FusedMoE(CustomOp):
         # nan_check custom op writes to this tensor during forward, and its
         # operations are captured by CUDA graphs.
         self._nan_flag: torch.Tensor | None = None
+        self._nan_flag_padded: torch.Tensor | None = None
 
     # TODO(bnell): This method is provided as a hook so vllm/lora/layers/fused_moe.py
     # can safely swap out the quant_method. We should figure out a less
@@ -1556,6 +1557,7 @@ class FusedMoE(CustomOp):
             output = result[0] if isinstance(result, tuple) else result
             torch.ops.vllm.nan_first_component(
                 output, self._nan_flag, self._nan_flag_real,
+                self._nan_flag_padded,
                 10, self._nan_real_mask)  # MOE
         return result
 

@@ -1312,6 +1312,7 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         nan_origin_component = model_runner_output.nan_origin_component
         nan_origin_component_real = model_runner_output.nan_origin_component_real
+        nan_origin_component_padded = model_runner_output.nan_origin_component_padded
         nan_in_hidden_states = model_runner_output.nan_in_hidden_states
         nan_first_layer_hidden = model_runner_output.nan_first_layer_hidden
         nan_first_layer_residual = model_runner_output.nan_first_layer_residual
@@ -1600,6 +1601,8 @@ class Scheduler(SchedulerInterface):
         nan_origin_name = NAN_COMPONENT_NAMES.get(nan_origin_component)
         nan_origin_name_real = NAN_COMPONENT_NAMES.get(
             nan_origin_component_real)
+        nan_origin_name_padded = NAN_COMPONENT_NAMES.get(
+            nan_origin_component_padded)
 
         if (
             stats := self.make_stats(
@@ -1607,6 +1610,7 @@ class Scheduler(SchedulerInterface):
                 perf_stats,
                 nan_origin_component, nan_origin_name,
                 nan_origin_component_real, nan_origin_name_real,
+                nan_origin_component_padded, nan_origin_name_padded,
                 nan_in_logits, nan_in_final_norm, nan_in_lm_head,
                 nan_first_layer_hidden, nan_first_layer_residual,
                 nan_real_output, nan_padded_output, nan_phase,
@@ -2008,6 +2012,8 @@ class Scheduler(SchedulerInterface):
         nan_origin_name: str | None = None,
         nan_origin_component_real: int = -1,
         nan_origin_name_real: str | None = None,
+        nan_origin_component_padded: int = -1,
+        nan_origin_name_padded: str | None = None,
         nan_in_logits: bool = False,
         nan_in_final_norm: bool = False,
         nan_in_lm_head: bool = False,
@@ -2057,6 +2063,8 @@ class Scheduler(SchedulerInterface):
             nan_origin_name=nan_origin_name,
             nan_origin_component_real=nan_origin_component_real,
             nan_origin_name_real=nan_origin_name_real,
+            nan_origin_component_padded=nan_origin_component_padded,
+            nan_origin_name_padded=nan_origin_name_padded,
             nan_in_logits=nan_in_logits,
             nan_in_final_norm=nan_in_final_norm,
             nan_in_lm_head=nan_in_lm_head,

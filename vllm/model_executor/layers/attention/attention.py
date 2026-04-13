@@ -399,6 +399,7 @@ class Attention(nn.Module, AttentionLayerBase):
         # nan_check custom op writes to this tensor during forward, and its
         # operations are captured by CUDA graphs.
         self._nan_flag: torch.Tensor | None = None
+        self._nan_flag_padded: torch.Tensor | None = None
 
     def forward(
         self,
@@ -493,6 +494,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 NAN_COMPONENT_ATTENTION):
             torch.ops.vllm.nan_first_component(
                 output, self._nan_flag, self._nan_flag_real,
+                self._nan_flag_padded,
                 NAN_COMPONENT_ATTENTION, self._nan_real_mask)
         return output.view(-1, hidden_size)
 
@@ -871,15 +873,17 @@ def nan_check_enabled(component_id: int) -> bool:
 
 
 def nan_first_component(tensor: torch.Tensor, flag_all: torch.Tensor,
-                        flag_real: torch.Tensor, component_id: int,
+                        flag_real: torch.Tensor, flag_padded: torch.Tensor,
+                        component_id: int,
                         real_mask: torch.Tensor) -> None:
     """Record the first component whose output contains NaN.
 
-    Writes to two flags:
-      flag_all  — first component with NaN in ANY token (real or padded)
-      flag_real — first component with NaN in REAL tokens only
+    Writes to three sticky flags (never reset — once latched, stays forever):
+      flag_all    — first component with NaN in ANY token (real or padded)
+      flag_real   — first component with NaN in REAL tokens only
+      flag_padded — first component with NaN in PADDED tokens only
 
-    Both are 1-element int32 tensors, reset to -1 each step.
+    All are 1-element int32 tensors initialized to -1.
     real_mask is a bool tensor [max_tokens]; True for real token positions.
 
     Only writes component_id if NaN is found AND the flag is still -1.
@@ -899,15 +903,23 @@ def nan_first_component(tensor: torch.Tensor, flag_all: torch.Tensor,
     flag_all[0] = flag_all[0] * (1 - write_all) + component_id * write_all
 
     # Real tokens only — mask is [N], has_nan_per_token is [N], cheap AND.
-    has_real_nan = torch.any(
-        has_nan_per_token & real_mask[:has_nan_per_token.shape[0]])
+    mask_slice = real_mask[:has_nan_per_token.shape[0]]
+    has_real_nan = torch.any(has_nan_per_token & mask_slice)
     not_yet_real = (flag_real[0] == -1)
     write_real = (has_real_nan & not_yet_real).to(torch.int32)
     flag_real[0] = flag_real[0] * (1 - write_real) + component_id * write_real
 
+    # Padded tokens only — NaN in non-real positions.
+    has_padded_nan = torch.any(has_nan_per_token & ~mask_slice)
+    not_yet_padded = (flag_padded[0] == -1)
+    write_padded = (has_padded_nan & not_yet_padded).to(torch.int32)
+    flag_padded[0] = (flag_padded[0] * (1 - write_padded)
+                      + component_id * write_padded)
+
 
 def nan_first_component_fake(tensor: torch.Tensor, flag_all: torch.Tensor,
-                             flag_real: torch.Tensor, component_id: int,
+                             flag_real: torch.Tensor,
+                             flag_padded: torch.Tensor, component_id: int,
                              real_mask: torch.Tensor) -> None:
     return
 
@@ -915,7 +927,7 @@ def nan_first_component_fake(tensor: torch.Tensor, flag_all: torch.Tensor,
 direct_register_custom_op(
     op_name="nan_first_component",
     op_func=nan_first_component,
-    mutates_args=["flag_all", "flag_real"],
+    mutates_args=["flag_all", "flag_real", "flag_padded"],
     fake_impl=nan_first_component_fake,
 )
 

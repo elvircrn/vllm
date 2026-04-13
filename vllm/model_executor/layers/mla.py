@@ -114,6 +114,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         # NaN origin tracking — assigned by model runner.
         self._nan_origin_flag: torch.Tensor | None = None
         self._nan_origin_flag_real: torch.Tensor | None = None
+        self._nan_origin_flag_padded: torch.Tensor | None = None
         self._nan_real_mask: torch.Tensor | None = None
 
     def forward(
@@ -140,7 +141,8 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             if self._nan_origin_flag is not None and nan_check_enabled(2):
                 torch.ops.vllm.nan_first_component(
                     qkv_lora, self._nan_origin_flag,
-                    self._nan_origin_flag_real, 2,
+                    self._nan_origin_flag_real,
+                    self._nan_origin_flag_padded, 2,
                     self._nan_real_mask)  # QKV_PROJ
             q_c, kv_lora = qkv_lora.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
@@ -150,13 +152,15 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             if self._nan_origin_flag is not None and nan_check_enabled(3):
                 torch.ops.vllm.nan_first_component(
                     q_c, self._nan_origin_flag,
-                    self._nan_origin_flag_real, 3,
+                    self._nan_origin_flag_real,
+                    self._nan_origin_flag_padded, 3,
                     self._nan_real_mask)  # Q_A_LN
             q = self.q_b_proj(q_c)[0]
             if self._nan_origin_flag is not None and nan_check_enabled(4):
                 torch.ops.vllm.nan_first_component(
                     q, self._nan_origin_flag,
-                    self._nan_origin_flag_real, 4,
+                    self._nan_origin_flag_real,
+                    self._nan_origin_flag_padded, 4,
                     self._nan_real_mask)  # Q_B_PROJ
         else:
             assert self.kv_a_proj_with_mqa is not None, (
@@ -173,7 +177,8 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         if self._nan_origin_flag is not None and nan_check_enabled(5):
             torch.ops.vllm.nan_first_component(
                 kv_c_normed, self._nan_origin_flag,
-                self._nan_origin_flag_real, 5,
+                self._nan_origin_flag_real,
+                self._nan_origin_flag_padded, 5,
                 self._nan_real_mask)  # KV_A_LN
 
         q = q.view(-1, self.num_heads, self.qk_head_dim)
@@ -187,7 +192,8 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             if self._nan_origin_flag is not None and nan_check_enabled(6):
                 torch.ops.vllm.nan_first_component(
                     q, self._nan_origin_flag,
-                    self._nan_origin_flag_real, 6,
+                    self._nan_origin_flag_real,
+                    self._nan_origin_flag_padded, 6,
                     self._nan_real_mask)  # ROTARY
 
         if self.indexer and self.is_sparse:
@@ -207,13 +213,15 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         if self._nan_origin_flag is not None and nan_check_enabled(7):
             torch.ops.vllm.nan_first_component(
                 attn_out, self._nan_origin_flag,
-                self._nan_origin_flag_real, 7,
+                self._nan_origin_flag_real,
+                self._nan_origin_flag_padded, 7,
                 self._nan_real_mask)  # ATTENTION
 
         output, _ = self.o_proj(attn_out)
         if self._nan_origin_flag is not None and nan_check_enabled(8):
             torch.ops.vllm.nan_first_component(
                 output, self._nan_origin_flag,
-                self._nan_origin_flag_real, 8,
+                self._nan_origin_flag_real,
+                self._nan_origin_flag_padded, 8,
                 self._nan_real_mask)  # O_PROJ
         return output

@@ -459,6 +459,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         # NaN origin tracking — assigned by model runner.
         self._nan_flag: torch.Tensor | None = None
         self._nan_flag_real: torch.Tensor | None = None
+        self._nan_flag_padded: torch.Tensor | None = None
         self._nan_real_mask: torch.Tensor | None = None
         self._nan_kv_write_ever: torch.Tensor | None = None
         self._nan_kv_post_write_ever: torch.Tensor | None = None
@@ -499,13 +500,13 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             if self._nan_flag is not None and nan_check_enabled(15):
                 torch.ops.vllm.nan_first_component(
                     kv_c_normed, self._nan_flag,
-                    self._nan_flag_real, 15,
-                    self._nan_real_mask)  # KV_CACHE_IN
+                    self._nan_flag_real, self._nan_flag_padded,
+                    15, self._nan_real_mask)  # KV_CACHE_IN
             if self._nan_flag is not None and nan_check_enabled(22):
                 torch.ops.vllm.nan_first_component(
                     k_pe, self._nan_flag,
-                    self._nan_flag_real, 22,
-                    self._nan_real_mask)  # KV_CACHE_IN_KPE
+                    self._nan_flag_real, self._nan_flag_padded,
+                    22, self._nan_real_mask)  # KV_CACHE_IN_KPE
             if self._nan_kv_write_ever is not None:
                 torch.ops.vllm.nan_sticky_check(
                     kv_c_normed, self._nan_kv_write_ever)
@@ -541,13 +542,13 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             if self._nan_flag is not None and nan_check_enabled(23):
                 torch.ops.vllm.nan_first_component(
                     kv_c_normed, self._nan_flag,
-                    self._nan_flag_real, 23,
-                    self._nan_real_mask)  # KV_CACHE_IN_COMPILED
+                    self._nan_flag_real, self._nan_flag_padded,
+                    23, self._nan_real_mask)  # KV_CACHE_IN_COMPILED
             if self._nan_flag is not None and nan_check_enabled(24):
                 torch.ops.vllm.nan_first_component(
                     k_pe, self._nan_flag,
-                    self._nan_flag_real, 24,
-                    self._nan_real_mask)  # KV_CACHE_IN_KPE_COMPILED
+                    self._nan_flag_real, self._nan_flag_padded,
+                    24, self._nan_real_mask)  # KV_CACHE_IN_KPE_COMPILED
             if self._nan_kv_write_ever is not None:
                 torch.ops.vllm.nan_sticky_check(
                     kv_c_normed, self._nan_kv_write_ever)
@@ -607,8 +608,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             if self._nan_flag is not None and nan_check_enabled(16):
                 torch.ops.vllm.nan_first_component(
                     output, self._nan_flag,
-                    self._nan_flag_real, 16,
-                    self._nan_real_mask)  # ATTN_WORKSPACE
+                    self._nan_flag_real, self._nan_flag_padded,
+                    16, self._nan_real_mask)  # ATTN_WORKSPACE
 
         if attn_metadata is None:
             # During the profile run try to simulate to worse case output size
@@ -677,8 +678,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             if self._nan_flag is not None and nan_check_enabled(20):
                 torch.ops.vllm.nan_first_component(
                     output[num_mqa_tokens:], self._nan_flag,
-                    self._nan_flag_real, 20,
-                    self._nan_real_mask)  # ATTN_MHA_OUT
+                    self._nan_flag_real, self._nan_flag_padded,
+                    20, self._nan_real_mask)  # ATTN_MHA_OUT
 
         if num_mqa_tokens > 0:
             mqa_q = q[:num_mqa_tokens]
@@ -738,8 +739,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             if self._nan_flag is not None and nan_check_enabled(17):
                 torch.ops.vllm.nan_first_component(
                     mqa_ql_nope, self._nan_flag,
-                    self._nan_flag_real, 17,
-                    self._nan_real_mask)  # ATTN_Q_ABSORBED
+                    self._nan_flag_real, self._nan_flag_padded,
+                    17, self._nan_real_mask)  # ATTN_Q_ABSORBED
 
             if fp8_attention and self.impl.supports_quant_query_input:
                 assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
@@ -760,14 +761,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 if isinstance(mqa_q, torch.Tensor):
                     torch.ops.vllm.nan_first_component(
                         mqa_q, self._nan_flag,
-                        self._nan_flag_real, 21,
-                        self._nan_real_mask)  # ATTN_MQA_Q
+                        self._nan_flag_real, self._nan_flag_padded,
+                        21, self._nan_real_mask)  # ATTN_MQA_Q
                 else:
                     for _q in mqa_q:
                         torch.ops.vllm.nan_first_component(
                             _q, self._nan_flag,
-                            self._nan_flag_real, 21,
-                            self._nan_real_mask)  # ATTN_MQA_Q
+                            self._nan_flag_real, self._nan_flag_padded,
+                            21, self._nan_real_mask)  # ATTN_MQA_Q
 
             # call decode attn
             if not is_sparse_impl:
@@ -777,8 +778,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             if self._nan_flag is not None and nan_check_enabled(18):
                 torch.ops.vllm.nan_first_component(
                     attn_out, self._nan_flag,
-                    self._nan_flag_real, 18,
-                    self._nan_real_mask)  # ATTN_FA3_OUT
+                    self._nan_flag_real, self._nan_flag_padded,
+                    18, self._nan_real_mask)  # ATTN_FA3_OUT
 
             # correct dcp attn_out with lse.
             if self.impl.dcp_world_size > 1:
@@ -803,8 +804,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             if self._nan_flag is not None and nan_check_enabled(19):
                 torch.ops.vllm.nan_first_component(
                     mqa_output_slice, self._nan_flag,
-                    self._nan_flag_real, 19,
-                    self._nan_real_mask)  # ATTN_V_UP_PROJ
+                    self._nan_flag_real, self._nan_flag_padded,
+                    19, self._nan_real_mask)  # ATTN_V_UP_PROJ
 
         if use_quant:
             # Quantize the BF16 computation result into the quantized output

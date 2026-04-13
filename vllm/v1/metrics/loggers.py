@@ -593,8 +593,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             gauge_nan_origin_real = self._gauge_cls(
                 name="vllm:nan_origin_component_real",
                 documentation=(
-                    "Component ID that first produced NaN in REAL tokens "
-                    "this step (-1 = no NaN in real tokens)."
+                    "Sticky component ID that first produced NaN in REAL "
+                    "tokens (-1 = no NaN ever in real tokens)."
                 ),
                 labelnames=labelnames,
             )
@@ -602,6 +602,20 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 gauge_nan_origin_real, per_engine_labelvalues
             )
             for g in self.gauge_nan_origin_real.values():
+                g.set(-1)
+
+            gauge_nan_origin_padded = self._gauge_cls(
+                name="vllm:nan_origin_component_padded",
+                documentation=(
+                    "Sticky component ID that first produced NaN in PADDED "
+                    "tokens (-1 = no NaN ever in padded tokens)."
+                ),
+                labelnames=labelnames,
+            )
+            self.gauge_nan_origin_padded = create_metric_per_engine(
+                gauge_nan_origin_padded, per_engine_labelvalues
+            )
+            for g in self.gauge_nan_origin_padded.values():
                 g.set(-1)
 
             gauge_nan_first_layer_hidden = self._gauge_cls(
@@ -1331,6 +1345,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     scheduler_stats.nan_origin_component)
                 self.gauge_nan_origin_real[engine_idx].set(
                     scheduler_stats.nan_origin_component_real)
+                self.gauge_nan_origin_padded[engine_idx].set(
+                    scheduler_stats.nan_origin_component_padded)
                 if scheduler_stats.nan_phase:
                     phase = scheduler_stats.nan_phase
                     # Record real-token origin as a counter (primary).

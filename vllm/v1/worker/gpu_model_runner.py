@@ -488,12 +488,14 @@ class GPUModelRunner(
         # NOTE(yongji): flag to temporarily disable EPLB during scaling up/down
         self.eep_eplb_suppressed = False
 
-        # NaN origin tracking. Two int32 flags reset to -1 each step.
+        # NaN origin tracking. Three sticky int32 flags (never reset).
         # _nan_origin_flag: first component with NaN in ANY token (real+pad)
         # _nan_origin_flag_real: first component with NaN in REAL tokens only
+        # _nan_origin_flag_padded: first component with NaN in PADDED tokens
         # _nan_real_mask: bool[max_tokens], True for real token positions
         self._nan_origin_flag: torch.Tensor | None = None
         self._nan_origin_flag_real: torch.Tensor | None = None
+        self._nan_origin_flag_padded: torch.Tensor | None = None
         self._nan_real_mask: torch.Tensor | None = None
         # Per-layer NaN presence tracking (for first-layer identification).
         self._nan_per_layer_hidden: torch.Tensor | None = None
@@ -3390,12 +3392,14 @@ class GPUModelRunner(
         list[int],
         int,   # nan_origin_component (all tokens)
         int,   # nan_origin_component_real (real tokens only)
+        int,   # nan_origin_component_padded (padded tokens only)
         int,   # nan_first_layer_hidden
         int,   # nan_first_layer_residual
     ]:
         num_nans_in_logits = {}
         nan_origin_component = -1
         nan_origin_component_real = -1
+        nan_origin_component_padded = -1
         nan_first_layer_hidden = -1
         nan_first_layer_residual = -1
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
@@ -3404,6 +3408,8 @@ class GPUModelRunner(
                 nan_origin_component = int(self._nan_origin_flag.item())
                 nan_origin_component_real = int(
                     self._nan_origin_flag_real.item())
+                nan_origin_component_padded = int(
+                    self._nan_origin_flag_padded.item())
                 # Find first layer with NaN in hidden/residual.
                 h_flags = self._nan_per_layer_hidden
                 r_flags = self._nan_per_layer_residual
@@ -3520,6 +3526,7 @@ class GPUModelRunner(
             invalid_req_indices,
             nan_origin_component,
             nan_origin_component_real,
+            nan_origin_component_padded,
             nan_first_layer_hidden,
             nan_first_layer_residual,
         )
@@ -4070,15 +4077,11 @@ class GPUModelRunner(
                  self._kv_audit_block_ids) = (
                     self._audit_kv_cache_nans())
 
-        # Reset NaN detection flags and update real-token mask.
+        # Update real-token mask (changes per step, but flags are sticky).
         if self._nan_origin_flag is not None:
-            self._nan_origin_flag.fill_(-1)
-            self._nan_origin_flag_real.fill_(-1)
             num_real = scheduler_output.total_num_scheduled_tokens
             self._nan_real_mask.fill_(False)
             self._nan_real_mask[:num_real] = True
-            self._nan_per_layer_hidden.fill_(False)
-            self._nan_per_layer_residual.fill_(False)
 
             # Pre-forward KV cache scan: check entire KV cache for NaN
             # BEFORE the model runs. If this fires, the KV cache was already
@@ -4089,26 +4092,26 @@ class GPUModelRunner(
                 nan_check_enabled,
             )
             if nan_check_enabled(NAN_COMPONENT_KV_CACHE_PRE_FORWARD):
-                kv_has_nan = False
-                for kv in self.kv_caches:
-                    if kv.numel() == 0:
-                        continue
-                    if kv.element_size() == 1:
-                        # FP8: check NaN bit pattern directly
-                        raw = kv.view(torch.uint8)
-                        if ((raw & 0x7F) == 0x7F).any().item():
-                            kv_has_nan = True
-                            break
-                    else:
-                        if torch.isnan(kv).any().item():
-                            kv_has_nan = True
-                            break
-                if kv_has_nan:
-                    # Record as the first NaN origin component (both flags)
-                    self._nan_origin_flag.fill_(
-                        NAN_COMPONENT_KV_CACHE_PRE_FORWARD)
-                    self._nan_origin_flag_real.fill_(
-                        NAN_COMPONENT_KV_CACHE_PRE_FORWARD)
+                # Only scan if flag hasn't latched yet.
+                if self._nan_origin_flag.item() == -1:
+                    kv_has_nan = False
+                    for kv in self.kv_caches:
+                        if kv.numel() == 0:
+                            continue
+                        if kv.element_size() == 1:
+                            raw = kv.view(torch.uint8)
+                            if ((raw & 0x7F) == 0x7F).any().item():
+                                kv_has_nan = True
+                                break
+                        else:
+                            if torch.isnan(kv).any().item():
+                                kv_has_nan = True
+                                break
+                    if kv_has_nan:
+                        self._nan_origin_flag.fill_(
+                            NAN_COMPONENT_KV_CACHE_PRE_FORWARD)
+                        self._nan_origin_flag_real.fill_(
+                            NAN_COMPONENT_KV_CACHE_PRE_FORWARD)
 
         # Update DP padding mask: 1.0 for real tokens, 0.0 for padding.
         if self._dp_padding_mask is not None:
@@ -4393,6 +4396,7 @@ class GPUModelRunner(
                 invalid_req_indices,
                 nan_origin_component,
                 nan_origin_component_real,
+                nan_origin_component_padded,
                 nan_first_layer_hidden,
                 nan_first_layer_residual,
             ) = self._bookkeeping_sync(
@@ -4442,10 +4446,12 @@ class GPUModelRunner(
                 ) if self._nan_real_mask is not None else -1
                 logger.warning(
                     "NaN detected: origin_all=%d origin_real=%d "
+                    "origin_padded=%d "
                     "real_output=%s padded_output=%s "
                     "num_real=%d num_total=%d (padding=%d) "
                     "mask_true_count=%d",
                     nan_origin_component, nan_origin_component_real,
+                    nan_origin_component_padded,
                     nan_real_output, nan_padded_output,
                     num_real, num_total, num_total - num_real,
                     mask_true)
@@ -4489,6 +4495,7 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 nan_origin_component=nan_origin_component,
                 nan_origin_component_real=nan_origin_component_real,
+                nan_origin_component_padded=nan_origin_component_padded,
                 nan_in_hidden_states=nan_in_hidden_states,
                 nan_first_layer_hidden=nan_first_layer_hidden,
                 nan_first_layer_residual=nan_first_layer_residual,
@@ -5096,12 +5103,13 @@ class GPUModelRunner(
             DeepseekV2Model,
         )
 
-        # Two int32 flags: -1 = no NaN yet, otherwise component ID.
-        # flag_all: any token (real + padded)
-        # flag_real: real tokens only (using mask)
+        # Three sticky int32 flags: -1 = no NaN yet, otherwise component ID.
+        # Once latched, never reset — captures the very first NaN event.
         self._nan_origin_flag = torch.full(
             (1,), -1, dtype=torch.int32, device=self.device)
         self._nan_origin_flag_real = torch.full(
+            (1,), -1, dtype=torch.int32, device=self.device)
+        self._nan_origin_flag_padded = torch.full(
             (1,), -1, dtype=torch.int32, device=self.device)
 
         # Bool mask: True for real token positions, False for padding.
@@ -5161,10 +5169,12 @@ class GPUModelRunner(
             if isinstance(module, Attention):
                 module._nan_flag = self._nan_origin_flag
                 module._nan_flag_real = self._nan_origin_flag_real
+                module._nan_flag_padded = self._nan_origin_flag_padded
                 module._nan_real_mask = self._nan_real_mask
             elif isinstance(module, MLAAttention):
                 module._nan_flag = self._nan_origin_flag
                 module._nan_flag_real = self._nan_origin_flag_real
+                module._nan_flag_padded = self._nan_origin_flag_padded
                 module._nan_real_mask = self._nan_real_mask
                 module._nan_kv_write_ever = self._nan_kv_write_ever
                 module._nan_kv_post_write_ever = self._nan_kv_post_write_ever
@@ -5180,20 +5190,24 @@ class GPUModelRunner(
             elif isinstance(module, FusedMoE):
                 module._nan_flag = self._nan_origin_flag
                 module._nan_flag_real = self._nan_origin_flag_real
+                module._nan_flag_padded = self._nan_origin_flag_padded
                 module._nan_real_mask = self._nan_real_mask
             elif isinstance(module, MultiHeadLatentAttentionWrapper):
                 module._nan_origin_flag = self._nan_origin_flag
                 module._nan_origin_flag_real = self._nan_origin_flag_real
+                module._nan_origin_flag_padded = self._nan_origin_flag_padded
                 module._nan_real_mask = self._nan_real_mask
             elif isinstance(module, DeepseekV2DecoderLayer):
                 module._nan_origin_flag = self._nan_origin_flag
                 module._nan_origin_flag_real = self._nan_origin_flag_real
+                module._nan_origin_flag_padded = self._nan_origin_flag_padded
                 module._nan_real_mask = self._nan_real_mask
                 module._nan_per_layer_hidden = self._nan_per_layer_hidden
                 module._nan_per_layer_residual = self._nan_per_layer_residual
             elif isinstance(module, DeepseekV2Model):
                 module._nan_origin_flag = self._nan_origin_flag
                 module._nan_origin_flag_real = self._nan_origin_flag_real
+                module._nan_origin_flag_padded = self._nan_origin_flag_padded
                 module._nan_real_mask = self._nan_real_mask
 
     def _setup_dp_padding_mask(self) -> None:

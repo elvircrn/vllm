@@ -198,10 +198,11 @@ class ModelRunnerOutput:
     # req_id -> num_nans_in_logits
     num_nans_in_logits: dict[str, int] | None = None
 
-    # NaN origin tracking: component ID that first produced NaN this step.
-    # -1 = no NaN. Uses NAN_COMPONENT_* IDs from attention.py.
+    # NaN origin tracking: sticky component ID (first-ever NaN, never reset).
+    # -1 = no NaN ever. Uses NAN_COMPONENT_* IDs from attention.py.
     nan_origin_component: int = -1       # all tokens (real + padded)
     nan_origin_component_real: int = -1  # real tokens only
+    nan_origin_component_padded: int = -1  # padded tokens only
     nan_in_hidden_states: bool = False  # NaN in hidden states before lm_head
     nan_first_layer_hidden: int = -1
     nan_first_layer_residual: int = -1
