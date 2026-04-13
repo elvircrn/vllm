@@ -1317,6 +1317,7 @@ class Scheduler(SchedulerInterface):
         nan_first_layer_residual = model_runner_output.nan_first_layer_residual
         nan_real_output = model_runner_output.nan_real_output
         nan_padded_output = model_runner_output.nan_padded_output
+        nan_kv_write_ever = model_runner_output.nan_kv_write_ever
         kv_cache_nan_total_blocks = model_runner_output.kv_cache_nan_total_blocks
         kv_cache_nan_affected_layers = (
             model_runner_output.kv_cache_nan_affected_layers)
@@ -1606,6 +1607,7 @@ class Scheduler(SchedulerInterface):
                 nan_in_logits, nan_in_final_norm, nan_in_lm_head,
                 nan_first_layer_hidden, nan_first_layer_residual,
                 nan_real_output, nan_padded_output, nan_phase,
+                nan_kv_write_ever,
                 kv_cache_nan_total_blocks, kv_cache_nan_affected_layers,
                 kv_cache_nan_per_layer, kv_cache_nan_block_ids,
             )
@@ -2010,6 +2012,7 @@ class Scheduler(SchedulerInterface):
         nan_real_output: bool = False,
         nan_padded_output: bool = False,
         nan_phase: str | None = None,
+        nan_kv_write_ever: bool = False,
         kv_cache_nan_total_blocks: int = 0,
         kv_cache_nan_affected_layers: int = 0,
         kv_cache_nan_per_layer: list[int] | None = None,
@@ -2056,6 +2059,7 @@ class Scheduler(SchedulerInterface):
             nan_real_output=nan_real_output,
             nan_padded_output=nan_padded_output,
             nan_phase=nan_phase,
+            nan_kv_write_ever=nan_kv_write_ever,
             kv_cache_nan_total_blocks=kv_cache_nan_total_blocks,
             kv_cache_nan_affected_layers=kv_cache_nan_affected_layers,
             kv_cache_nan_per_layer=kv_cache_nan_per_layer or [],

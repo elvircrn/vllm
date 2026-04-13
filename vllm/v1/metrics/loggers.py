@@ -631,6 +631,22 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             for g in self.gauge_nan_first_layer_residual.values():
                 g.set(-1)
 
+            gauge_nan_kv_write_ever = self._gauge_cls(
+                name="vllm:nan_kv_write_ever",
+                documentation=(
+                    "Sticky flag: 1 if NaN was ever detected in KV cache "
+                    "write inputs (kv_c_normed or k_pe) on this rank. "
+                    "Never resets to 0."
+                ),
+                multiprocess_mode="mostrecent",
+                labelnames=labelnames,
+            )
+            self.gauge_nan_kv_write_ever = create_metric_per_engine(
+                gauge_nan_kv_write_ever, per_engine_labelvalues
+            )
+            for g in self.gauge_nan_kv_write_ever.values():
+                g.set(0)
+
         if envs.VLLM_KV_CACHE_NAN_AUDIT > 0:
             gauge_kv_nan_total = self._gauge_cls(
                 name="vllm:kv_cache_nan_total_blocks",
@@ -1307,6 +1323,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     scheduler_stats.nan_first_layer_hidden)
                 self.gauge_nan_first_layer_residual[engine_idx].set(
                     scheduler_stats.nan_first_layer_residual)
+                if scheduler_stats.nan_kv_write_ever:
+                    self.gauge_nan_kv_write_ever[engine_idx].set(1)
 
             if envs.VLLM_KV_CACHE_NAN_AUDIT > 0:
                 self.gauge_kv_nan_total[engine_idx].set(

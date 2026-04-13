@@ -4379,6 +4379,8 @@ class GPUModelRunner(
         nan_in_hidden_states = False
         nan_real_output = False
         nan_padded_output = False
+        nan_kv_write_ever = bool(self._nan_kv_write_ever.item()) \
+            if self._nan_kv_write_ever is not None else False
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS and hidden_states is not None:
             num_real = scheduler_output.total_num_scheduled_tokens
             num_total = hidden_states.shape[0]
@@ -4454,6 +4456,7 @@ class GPUModelRunner(
                 nan_first_layer_residual=nan_first_layer_residual,
                 nan_real_output=nan_real_output,
                 nan_padded_output=nan_padded_output,
+                nan_kv_write_ever=nan_kv_write_ever,
                 kv_cache_nan_total_blocks=self._kv_audit_total_blocks,
                 kv_cache_nan_affected_layers=self._kv_audit_affected_layers,
                 kv_cache_nan_per_layer=self._kv_audit_per_layer,
@@ -5066,6 +5069,11 @@ class GPUModelRunner(
         self._nan_real_mask = torch.zeros(
             self.max_num_tokens, dtype=torch.bool, device=self.device)
 
+        # Sticky flag: 1 if NaN was ever written to KV cache inputs.
+        # Never reset — once set, stays set for the lifetime of the process.
+        self._nan_kv_write_ever = torch.zeros(
+            1, dtype=torch.int32, device=self.device)
+
         # Count decoder layers for per-layer tracking.
         num_layers = sum(
             1 for m in self.model.modules()
@@ -5107,6 +5115,7 @@ class GPUModelRunner(
                 module._nan_flag = self._nan_origin_flag
                 module._nan_flag_real = self._nan_origin_flag_real
                 module._nan_real_mask = self._nan_real_mask
+                module._nan_kv_write_ever = self._nan_kv_write_ever
             elif isinstance(module, FusedMoE):
                 module._nan_flag = self._nan_origin_flag
                 module._nan_flag_real = self._nan_origin_flag_real

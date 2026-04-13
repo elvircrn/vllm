@@ -912,3 +912,26 @@ direct_register_custom_op(
     mutates_args=["flag_all", "flag_real"],
     fake_impl=nan_first_component_fake,
 )
+
+
+def nan_sticky_check(tensor: torch.Tensor, flag: torch.Tensor) -> None:
+    """Set flag[0] = 1 if tensor contains any NaN. Never clears the flag.
+
+    CUDA-graph safe: pure GPU arithmetic, no CPU→GPU copies.
+    Once the flag is set to 1, it stays at 1 forever.
+    """
+    flat = tensor.reshape(tensor.shape[0], -1)
+    has_nan = torch.any(torch.isnan(flat)).to(torch.int32)
+    flag[0] = torch.maximum(flag[0], has_nan)
+
+
+def nan_sticky_check_fake(tensor: torch.Tensor, flag: torch.Tensor) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="nan_sticky_check",
+    op_func=nan_sticky_check,
+    mutates_args=["flag"],
+    fake_impl=nan_sticky_check_fake,
+)

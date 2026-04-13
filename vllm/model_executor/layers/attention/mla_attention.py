@@ -460,6 +460,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self._nan_flag: torch.Tensor | None = None
         self._nan_flag_real: torch.Tensor | None = None
         self._nan_real_mask: torch.Tensor | None = None
+        self._nan_kv_write_ever: torch.Tensor | None = None
 
     @property
     def chunked_prefill_workspace_size(self) -> int:
@@ -502,6 +503,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     k_pe, self._nan_flag,
                     self._nan_flag_real, 22,
                     self._nan_real_mask)  # KV_CACHE_IN_KPE
+            if self._nan_kv_write_ever is not None:
+                torch.ops.vllm.nan_sticky_check(
+                    kv_c_normed, self._nan_kv_write_ever)
+                torch.ops.vllm.nan_sticky_check(
+                    k_pe, self._nan_kv_write_ever)
             self.impl.do_kv_cache_update(
                 kv_c_normed,
                 k_pe,
@@ -531,6 +537,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     k_pe, self._nan_flag,
                     self._nan_flag_real, 24,
                     self._nan_real_mask)  # KV_CACHE_IN_KPE_COMPILED
+            if self._nan_kv_write_ever is not None:
+                torch.ops.vllm.nan_sticky_check(
+                    kv_c_normed, self._nan_kv_write_ever)
+                torch.ops.vllm.nan_sticky_check(
+                    k_pe, self._nan_kv_write_ever)
             kv_cache_dummy_dep = torch.ops.vllm.unified_mla_kv_cache_update(
                 kv_c_normed,
                 k_pe,
