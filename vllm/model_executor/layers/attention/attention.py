@@ -893,8 +893,8 @@ NAN_COMPONENT_NAMES = {
     NAN_COMPONENT_MOE_TOPK_WEIGHTS_INF: "moe_topk_weights_inf",
     NAN_COMPONENT_MOE_FINALIZE: "moe_finalize",
     NAN_COMPONENT_MOE_FINALIZE_INF: "moe_finalize_inf",
-    NAN_COMPONENT_MOE_PRE_COMBINE: "moe_pre_combine",
-    NAN_COMPONENT_MOE_PRE_COMBINE_INF: "moe_pre_combine_inf",
+    NAN_COMPONENT_MOE_PRE_COMBINE: "moe_input",
+    NAN_COMPONENT_MOE_PRE_COMBINE_INF: "moe_router_logits",
     NAN_COMPONENT_MOE_POST_COMBINE: "moe_post_combine",
     NAN_COMPONENT_MOE_POST_COMBINE_INF: "moe_post_combine_inf",
 }

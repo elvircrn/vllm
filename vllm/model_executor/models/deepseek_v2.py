@@ -381,6 +381,14 @@ class DeepseekV2MoE(nn.Module):
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
+        # Check MoE input for NaN/Inf before expert call.
+        if self._nan_origin_flag is not None and nan_check_enabled(48):
+            torch.ops.vllm.nan_first_component(
+                hidden_states, self._nan_origin_flag,
+                self._nan_origin_flag_real,
+                self._nan_origin_flag_padded, 48,
+                self._nan_real_mask)  # MOE_PRE_COMBINE (reused as MOE_INPUT)
+
         if self.experts.is_internal_router:
             # In this case, the gate/router runs inside the FusedMoE class
             fused_moe_out = self.experts(
@@ -389,6 +397,13 @@ class DeepseekV2MoE(nn.Module):
         else:
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
+            # Check router logits for NaN/Inf.
+            if self._nan_origin_flag is not None and nan_check_enabled(49):
+                torch.ops.vllm.nan_first_component(
+                    router_logits, self._nan_origin_flag,
+                    self._nan_origin_flag_real,
+                    self._nan_origin_flag_padded, 49,
+                    self._nan_real_mask)  # MOE_PRE_COMBINE_INF (reused as ROUTER)
             fused_moe_out = self.experts(
                 hidden_states=hidden_states, router_logits=router_logits
             )
