@@ -1164,19 +1164,6 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Log scale health for every NVFP4 linear layer.
-        input_has_nan = torch.any(torch.isnan(layer.input_scale)).item()
-        weight2_has_nan = torch.any(torch.isnan(layer.weight_scale_2)).item()
-        ws_nan_count = int(torch.isnan(layer.weight_scale.float()).sum().item())
-        ws_zero_count = int((layer.weight_scale == 0).sum().item())
-        logger.info(
-            "NVFP4 scale check: input_scale=%s (nan=%s), "
-            "weight_scale_2=%s (nan=%s), "
-            "weight_scale nan=%d zero=%d / %d",
-            layer.input_scale.data, input_has_nan,
-            layer.weight_scale_2.data, weight2_has_nan,
-            ws_nan_count, ws_zero_count, layer.weight_scale.numel())
-
         if (
             torch.unique(layer.input_scale).numel() != 1
             or torch.unique(layer.weight_scale_2).numel() != 1
@@ -1205,10 +1192,6 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         layer.input_global_scale_inv = Parameter(
             (1.0 / layer.input_global_scale).to(torch.float32), requires_grad=False
         )
-
-        logger.info(
-            "NVFP4 derived: alpha=%s, input_global_scale_inv=%s",
-            layer.alpha.data.item(), layer.input_global_scale_inv.data.item())
 
         # Convert layer to NVFP4 linear kernel format
         self.kernel.process_weights_after_loading(layer)
