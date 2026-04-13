@@ -945,11 +945,14 @@ def nan_kv_cache_post_write_check(
     kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
     flag: torch.Tensor,
+    per_layer_flag: torch.Tensor | None,
+    layer_idx: int,
 ) -> None:
     """Check for NaN in KV cache entries that were just written.
 
     Reads back written slots from kv_cache using slot_mapping,
     casts to float32, checks for NaN, and updates sticky flag.
+    Also sets per_layer_flag[layer_idx] if NaN is found.
     PAD_SLOT_ID (-1) entries in slot_mapping are ignored.
 
     FP8 E4M3fn DOES have a NaN representation: 0x7F / 0xFF
@@ -982,11 +985,18 @@ def nan_kv_cache_post_write_check(
     has_valid_nan = torch.any(has_nan_per_slot & valid_mask).to(torch.int32)
     flag[0] = torch.maximum(flag[0], has_valid_nan)
 
+    # Also set per-layer sticky flag
+    if per_layer_flag is not None and layer_idx >= 0:
+        per_layer_flag[layer_idx] = torch.maximum(
+            per_layer_flag[layer_idx], has_valid_nan)
+
 
 def nan_kv_cache_post_write_check_fake(
     kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
     flag: torch.Tensor,
+    per_layer_flag: torch.Tensor | None,
+    layer_idx: int,
 ) -> None:
     return
 
@@ -994,6 +1004,6 @@ def nan_kv_cache_post_write_check_fake(
 direct_register_custom_op(
     op_name="nan_kv_cache_post_write_check",
     op_func=nan_kv_cache_post_write_check,
-    mutates_args=["flag"],
+    mutates_args=["flag", "per_layer_flag"],
     fake_impl=nan_kv_cache_post_write_check_fake,
 )

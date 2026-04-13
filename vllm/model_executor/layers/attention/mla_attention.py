@@ -462,6 +462,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self._nan_real_mask: torch.Tensor | None = None
         self._nan_kv_write_ever: torch.Tensor | None = None
         self._nan_kv_post_write_ever: torch.Tensor | None = None
+        self._nan_kv_post_write_per_layer: torch.Tensor | None = None
+        self._nan_layer_idx: int = -1
 
     @property
     def chunked_prefill_workspace_size(self) -> int:
@@ -522,7 +524,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     and layer_slot_mapping is not None):
                 torch.ops.vllm.nan_kv_cache_post_write_check(
                     self_kv_cache, layer_slot_mapping,
-                    self._nan_kv_post_write_ever)
+                    self._nan_kv_post_write_ever,
+                    self._nan_kv_post_write_per_layer,
+                    self._nan_layer_idx)
             output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
             self.forward_impl(
                 q,
@@ -560,6 +564,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 torch.ops.vllm.nan_kv_cache_post_write_check_compiled(
                     self.layer_name,
                     self._nan_kv_post_write_ever,
+                    self._nan_kv_post_write_per_layer,
+                    self._nan_layer_idx,
                     kv_cache_dummy_dep,
                 )
             output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
@@ -1048,6 +1054,8 @@ direct_register_custom_op(
 def nan_kv_cache_post_write_check_compiled(
     layer_name: str,
     flag: torch.Tensor,
+    per_layer_flag: torch.Tensor | None,
+    layer_idx: int,
     dummy_dep: torch.Tensor,
 ) -> None:
     """Post-write KV cache NaN check for torch.compile path.
@@ -1069,12 +1077,16 @@ def nan_kv_cache_post_write_check_compiled(
     assert isinstance(slot_mapping, dict)
     layer_slot_mapping = slot_mapping.get(layer_name)
     if layer_slot_mapping is not None:
-        nan_kv_cache_post_write_check(kv_cache, layer_slot_mapping, flag)
+        nan_kv_cache_post_write_check(
+            kv_cache, layer_slot_mapping, flag,
+            per_layer_flag, layer_idx)
 
 
 def nan_kv_cache_post_write_check_compiled_fake(
     layer_name: str,
     flag: torch.Tensor,
+    per_layer_flag: torch.Tensor | None,
+    layer_idx: int,
     dummy_dep: torch.Tensor,
 ) -> None:
     return
@@ -1083,7 +1095,7 @@ def nan_kv_cache_post_write_check_compiled_fake(
 direct_register_custom_op(
     op_name="nan_kv_cache_post_write_check_compiled",
     op_func=nan_kv_cache_post_write_check_compiled,
-    mutates_args=["flag"],
+    mutates_args=["flag", "per_layer_flag"],
     fake_impl=nan_kv_cache_post_write_check_compiled_fake,
 )
 

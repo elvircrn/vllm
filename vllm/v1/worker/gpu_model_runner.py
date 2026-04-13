@@ -4383,6 +4383,12 @@ class GPUModelRunner(
             if self._nan_kv_write_ever is not None else False
         nan_kv_post_write_ever = bool(self._nan_kv_post_write_ever.item()) \
             if self._nan_kv_post_write_ever is not None else False
+        nan_kv_post_write_first_layer = -1
+        if (self._nan_kv_post_write_per_layer is not None
+                and self._nan_kv_post_write_per_layer.any()):
+            nan_kv_post_write_first_layer = int(
+                self._nan_kv_post_write_per_layer.nonzero(
+                    as_tuple=True)[0][0].item())
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS and hidden_states is not None:
             num_real = scheduler_output.total_num_scheduled_tokens
             num_total = hidden_states.shape[0]
@@ -4460,6 +4466,7 @@ class GPUModelRunner(
                 nan_padded_output=nan_padded_output,
                 nan_kv_write_ever=nan_kv_write_ever,
                 nan_kv_post_write_ever=nan_kv_post_write_ever,
+                nan_kv_post_write_first_layer=nan_kv_post_write_first_layer,
                 kv_cache_nan_total_blocks=self._kv_audit_total_blocks,
                 kv_cache_nan_affected_layers=self._kv_audit_affected_layers,
                 kv_cache_nan_per_layer=self._kv_audit_per_layer,
@@ -5082,6 +5089,10 @@ class GPUModelRunner(
         self._nan_kv_post_write_ever = torch.zeros(
             1, dtype=torch.int32, device=self.device)
 
+        # Per-layer sticky flag for KV cache post-write NaN.
+        # Stays set once NaN is detected at a layer — never reset.
+        self._nan_kv_post_write_per_layer: torch.Tensor | None = None
+
         # Count decoder layers for per-layer tracking.
         num_layers = sum(
             1 for m in self.model.modules()
@@ -5091,6 +5102,8 @@ class GPUModelRunner(
             num_layers, dtype=torch.bool, device=self.device)
         self._nan_per_layer_residual = torch.zeros(
             num_layers, dtype=torch.bool, device=self.device)
+        self._nan_kv_post_write_per_layer = torch.zeros(
+            num_layers, dtype=torch.int32, device=self.device)
 
         # One-time check: verify embedding weights are NaN-free.
         from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -5125,6 +5138,15 @@ class GPUModelRunner(
                 module._nan_real_mask = self._nan_real_mask
                 module._nan_kv_write_ever = self._nan_kv_write_ever
                 module._nan_kv_post_write_ever = self._nan_kv_post_write_ever
+                module._nan_kv_post_write_per_layer = (
+                    self._nan_kv_post_write_per_layer)
+                # Extract layer index from layer_name
+                # (e.g. "model.layers.13.attn" -> 13)
+                parts = module.layer_name.split('.')
+                for i, p in enumerate(parts):
+                    if p == 'layers' and i + 1 < len(parts):
+                        module._nan_layer_idx = int(parts[i + 1])
+                        break
             elif isinstance(module, FusedMoE):
                 module._nan_flag = self._nan_origin_flag
                 module._nan_flag_real = self._nan_origin_flag_real

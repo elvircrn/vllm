@@ -212,6 +212,7 @@ class SchedulerStats:
     nan_padded_output: bool = False
     nan_kv_write_ever: bool = False
     nan_kv_post_write_ever: bool = False
+    nan_kv_post_write_first_layer: int = -1
     nan_phase: str | None = None  # "prefill", "decode", or "mixed"
 
     # KV cache NaN audit results.

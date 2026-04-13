@@ -663,6 +663,25 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             for g in self.gauge_nan_kv_post_write_ever.values():
                 g.set(0)
 
+            gauge_nan_kv_post_write_first_layer = self._gauge_cls(
+                name="vllm:nan_kv_post_write_first_layer",
+                documentation=(
+                    "First decoder layer index where NaN was written "
+                    "to KV cache (post-quantization). -1 = none. "
+                    "Sticky: never resets."
+                ),
+                multiprocess_mode="mostrecent",
+                labelnames=labelnames,
+            )
+            self.gauge_nan_kv_post_write_first_layer = (
+                create_metric_per_engine(
+                    gauge_nan_kv_post_write_first_layer,
+                    per_engine_labelvalues
+                )
+            )
+            for g in self.gauge_nan_kv_post_write_first_layer.values():
+                g.set(-1)
+
         if envs.VLLM_KV_CACHE_NAN_AUDIT > 0:
             gauge_kv_nan_total = self._gauge_cls(
                 name="vllm:kv_cache_nan_total_blocks",
@@ -1343,6 +1362,10 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     self.gauge_nan_kv_write_ever[engine_idx].set(1)
                 if scheduler_stats.nan_kv_post_write_ever:
                     self.gauge_nan_kv_post_write_ever[engine_idx].set(1)
+                if scheduler_stats.nan_kv_post_write_first_layer >= 0:
+                    self.gauge_nan_kv_post_write_first_layer[
+                        engine_idx].set(
+                        scheduler_stats.nan_kv_post_write_first_layer)
 
             if envs.VLLM_KV_CACHE_NAN_AUDIT > 0:
                 self.gauge_kv_nan_total[engine_idx].set(
