@@ -4080,6 +4080,36 @@ class GPUModelRunner(
             self._nan_per_layer_hidden.fill_(False)
             self._nan_per_layer_residual.fill_(False)
 
+            # Pre-forward KV cache scan: check entire KV cache for NaN
+            # BEFORE the model runs. If this fires, the KV cache was already
+            # contaminated from a previous step. If it doesn't fire but
+            # ATTN_FA3_OUT (component 18) does, the kernel produced NaN.
+            from vllm.model_executor.layers.attention.attention import (
+                NAN_COMPONENT_KV_CACHE_PRE_FORWARD,
+                nan_check_enabled,
+            )
+            if nan_check_enabled(NAN_COMPONENT_KV_CACHE_PRE_FORWARD):
+                kv_has_nan = False
+                for kv in self.kv_caches:
+                    if kv.numel() == 0:
+                        continue
+                    if kv.element_size() == 1:
+                        # FP8: check NaN bit pattern directly
+                        raw = kv.view(torch.uint8)
+                        if ((raw & 0x7F) == 0x7F).any().item():
+                            kv_has_nan = True
+                            break
+                    else:
+                        if torch.isnan(kv).any().item():
+                            kv_has_nan = True
+                            break
+                if kv_has_nan:
+                    # Record as the first NaN origin component (both flags)
+                    self._nan_origin_flag.fill_(
+                        NAN_COMPONENT_KV_CACHE_PRE_FORWARD)
+                    self._nan_origin_flag_real.fill_(
+                        NAN_COMPONENT_KV_CACHE_PRE_FORWARD)
+
         # Update DP padding mask: 1.0 for real tokens, 0.0 for padding.
         if self._dp_padding_mask is not None:
             self._dp_padding_mask[:num_tokens_unpadded].fill_(1.0)
