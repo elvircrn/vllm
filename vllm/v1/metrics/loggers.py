@@ -650,9 +650,9 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             gauge_nan_kv_post_write_ever = self._gauge_cls(
                 name="vllm:nan_kv_post_write_ever",
                 documentation=(
-                    "Sticky flag: 1 if bad data detected in KV cache "
-                    "AFTER write. For FP8: saturated values (±448, "
-                    "laundered NaN). For BF16: actual NaN. Never resets."
+                    "Sticky flag: 1 if NaN detected in KV cache "
+                    "AFTER write (post-quantization). FP8 E4M3fn "
+                    "preserves NaN as 0x7F. Never resets."
                 ),
                 multiprocess_mode="mostrecent",
                 labelnames=labelnames,

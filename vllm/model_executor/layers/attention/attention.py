@@ -946,19 +946,16 @@ def nan_kv_cache_post_write_check(
     slot_mapping: torch.Tensor,
     flag: torch.Tensor,
 ) -> None:
-    """Check for NaN or saturated values in KV cache after write.
+    """Check for NaN in KV cache entries that were just written.
 
     Reads back written slots from kv_cache using slot_mapping,
-    casts to float32, and checks for problems.  PAD_SLOT_ID (-1)
-    entries in slot_mapping are ignored.
+    casts to float32, checks for NaN, and updates sticky flag.
+    PAD_SLOT_ID (-1) entries in slot_mapping are ignored.
 
-    For FP8 E4M3fn KV caches: NaN cannot exist (all 256 bit patterns
-    are valid finite numbers).  When a BF16 NaN is quantized to FP8
-    E4M3fn, the hardware "launders" it into a saturated value (±448).
-    So for FP8 we detect SATURATED values (abs == fp8_max) instead,
-    which is where laundered NaN ends up.
-
-    For BF16/FP16 KV caches: checks for actual NaN.
+    FP8 E4M3fn DOES have a NaN representation: 0x7F / 0xFF
+    (exp=1111, mantissa=111).  __NV_SATFINITE preserves NaN:
+    BF16 NaN → FP8 NaN (0x7F) → BF16 NaN on readback.
+    So isnan works for all dtypes.
     """
     if kv_cache.numel() == 0:
         return
@@ -973,28 +970,17 @@ def nan_kv_cache_post_write_check(
     # Gather written entries
     written = kv_flat[safe_slots]
 
-    is_fp8 = (written.dtype == torch.uint8)
+    # For FP8 data stored as uint8, view as float8_e4m3fn
+    if written.dtype == torch.uint8:
+        written = written.view(torch.float8_e4m3fn)
 
-    if is_fp8:
-        # FP8 E4M3fn: no NaN exists.  Detect saturated values instead.
-        # When NaN is quantized to E4M3fn, hardware saturates to ±max.
-        # Max positive = 0x7E (448.0), max negative = 0xFE (-448.0)
-        # in E4M3fn.  We check raw bytes for the max-exponent patterns:
-        # byte & 0x7F == 0x7E  (exponent=1111, mantissa=110) = ±448
-        # byte & 0x7F == 0x7F  (exponent=1111, mantissa=111) = ±480?
-        # Actually just cast and compare to finfo.max.
-        written_fp8 = written.view(torch.float8_e4m3fn)
-        written_f32 = written_fp8.to(torch.float32)
-        fp8_max = torch.finfo(torch.float8_e4m3fn).max  # 448.0
-        is_bad_per_elem = (torch.abs(written_f32) >= fp8_max)
-        is_bad_per_slot = torch.any(is_bad_per_elem, dim=-1)
-    else:
-        # BF16/FP16: check for actual NaN
-        written_f32 = written.to(torch.float32)
-        is_bad_per_slot = torch.any(torch.isnan(written_f32), dim=-1)
+    # Cast to float32 for NaN check
+    written_f32 = written.to(torch.float32)
 
-    has_valid_bad = torch.any(is_bad_per_slot & valid_mask).to(torch.int32)
-    flag[0] = torch.maximum(flag[0], has_valid_bad)
+    # Check NaN only in valid (non-pad) slots
+    has_nan_per_slot = torch.any(torch.isnan(written_f32), dim=-1)
+    has_valid_nan = torch.any(has_nan_per_slot & valid_mask).to(torch.int32)
+    flag[0] = torch.maximum(flag[0], has_valid_nan)
 
 
 def nan_kv_cache_post_write_check_fake(
