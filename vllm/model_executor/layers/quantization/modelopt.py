@@ -1136,26 +1136,22 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         layer.register_parameter("weight", weight)
 
         # Input Global Scale
-        # Use NaN sentinel instead of torch.empty() so unloaded scales
-        # produce deterministic NaN rather than random garbage.
         input_global_scale = PerTensorScaleParameter(
-            data=torch.full((len(output_partition_sizes),),
-                            float('nan'), dtype=torch.float32),
+            data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
             weight_loader=weight_loader,
         )
         layer.register_parameter("input_scale", input_global_scale)
 
         # Weight Global Scale
         weight_global_scale = PerTensorScaleParameter(
-            data=torch.full((len(output_partition_sizes),),
-                            float('nan'), dtype=torch.float32),
+            data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
             weight_loader=weight_loader,
         )
         layer.register_parameter("weight_scale_2", weight_global_scale)
 
         # Per Block Weight Scale
         weight_scale = ModelWeightParameter(
-            data=torch.zeros(
+            data=torch.empty(
                 output_size_per_partition,
                 input_size_per_partition // self.quant_config.group_size,
                 dtype=weight_dtype,
@@ -1168,26 +1164,6 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Validate that scales were actually loaded from checkpoint.
-        # Unloaded scales remain at NaN sentinel from create_weights.
-        if torch.any(torch.isnan(layer.input_scale)):
-            logger.error(
-                "NVFP4 input_scale contains NaN after weight loading! "
-                "Scale was not loaded from checkpoint. "
-                "input_scale=%s", layer.input_scale.data)
-        if torch.any(torch.isnan(layer.weight_scale_2)):
-            logger.error(
-                "NVFP4 weight_scale_2 contains NaN after weight loading! "
-                "Scale was not loaded from checkpoint. "
-                "weight_scale_2=%s", layer.weight_scale_2.data)
-        if torch.any(layer.weight_scale == 0):
-            logger.error(
-                "NVFP4 weight_scale contains zeros after weight loading! "
-                "Scale was not loaded from checkpoint. "
-                "zero_count=%d / %d",
-                (layer.weight_scale == 0).sum().item(),
-                layer.weight_scale.numel())
-
         if (
             torch.unique(layer.input_scale).numel() != 1
             or torch.unique(layer.weight_scale_2).numel() != 1
