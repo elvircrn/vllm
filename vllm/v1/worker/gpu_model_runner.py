@@ -5108,6 +5108,7 @@ class GPUModelRunner(
         from vllm.model_executor.models.deepseek_v2 import (
             DeepseekV2DecoderLayer,
             DeepseekV2MLP,
+            DeepseekV2MoE,
             DeepseekV2Model,
         )
 
@@ -5212,12 +5213,16 @@ class GPUModelRunner(
                 module._nan_real_mask = self._nan_real_mask
                 module._nan_per_layer_hidden = self._nan_per_layer_hidden
                 module._nan_per_layer_residual = self._nan_per_layer_residual
+            elif isinstance(module, DeepseekV2MoE):
+                module._nan_origin_flag = self._nan_origin_flag
+                module._nan_origin_flag_real = self._nan_origin_flag_real
+                module._nan_origin_flag_padded = self._nan_origin_flag_padded
+                module._nan_real_mask = self._nan_real_mask
             elif isinstance(module, DeepseekV2MLP):
                 module._nan_origin_flag = self._nan_origin_flag
                 module._nan_origin_flag_real = self._nan_origin_flag_real
                 module._nan_origin_flag_padded = self._nan_origin_flag_padded
                 module._nan_real_mask = self._nan_real_mask
-                logger.info("NaN flags wired to DeepseekV2MLP instance")
             elif isinstance(module, DeepseekV2Model):
                 module._nan_origin_flag = self._nan_origin_flag
                 module._nan_origin_flag_real = self._nan_origin_flag_real

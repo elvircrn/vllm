@@ -824,6 +824,10 @@ NAN_COMPONENT_MLP_INPUT = 28
 NAN_COMPONENT_MLP_GATE_UP = 29
 NAN_COMPONENT_MLP_ACT = 30
 NAN_COMPONENT_MLP_DOWN = 31
+NAN_COMPONENT_MOE_ROUTED_OUT = 32
+NAN_COMPONENT_MOE_SHARED_OUT = 33
+NAN_COMPONENT_MOE_AFTER_SCALE = 34
+NAN_COMPONENT_MOE_AFTER_SHARED_ADD = 35
 
 NAN_COMPONENT_NAMES = {
     NAN_COMPONENT_EMBEDDING: "embedding",
@@ -857,6 +861,10 @@ NAN_COMPONENT_NAMES = {
     NAN_COMPONENT_MLP_GATE_UP: "mlp_gate_up",
     NAN_COMPONENT_MLP_ACT: "mlp_act",
     NAN_COMPONENT_MLP_DOWN: "mlp_down",
+    NAN_COMPONENT_MOE_ROUTED_OUT: "moe_routed_out",
+    NAN_COMPONENT_MOE_SHARED_OUT: "moe_shared_out",
+    NAN_COMPONENT_MOE_AFTER_SCALE: "moe_after_scale",
+    NAN_COMPONENT_MOE_AFTER_SHARED_ADD: "moe_after_shared_add",
 }
 
 # Parsed once at import time from VLLM_NAN_CHECK_COMPONENTS.
@@ -871,7 +879,7 @@ def nan_check_enabled(component_id: int) -> bool:
         import vllm.envs as envs
         raw = envs.VLLM_NAN_CHECK_COMPONENTS
         if raw == "all":
-            _NAN_ENABLED_COMPONENTS = frozenset(range(32))
+            _NAN_ENABLED_COMPONENTS = frozenset(range(36))
         elif raw == "none":
             _NAN_ENABLED_COMPONENTS = frozenset()
         else:

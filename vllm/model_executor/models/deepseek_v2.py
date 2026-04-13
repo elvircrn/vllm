@@ -359,6 +359,12 @@ class DeepseekV2MoE(nn.Module):
         # updated each step (1.0 for real tokens, 0.0 for padding).
         self._dp_padding_mask: torch.Tensor | None = None
 
+        # NaN origin tracking — assigned by model runner.
+        self._nan_origin_flag: torch.Tensor | None = None
+        self._nan_origin_flag_real: torch.Tensor | None = None
+        self._nan_origin_flag_padded: torch.Tensor | None = None
+        self._nan_real_mask: torch.Tensor | None = None
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -391,6 +397,21 @@ class DeepseekV2MoE(nn.Module):
         if self.shared_experts is None:
             assert shared_output is None
 
+        if self._nan_origin_flag is not None and nan_check_enabled(32):
+            torch.ops.vllm.nan_first_component(
+                final_hidden_states, self._nan_origin_flag,
+                self._nan_origin_flag_real,
+                self._nan_origin_flag_padded, 32,
+                self._nan_real_mask)  # MOE_ROUTED_OUT
+        if (shared_output is not None
+                and self._nan_origin_flag is not None
+                and nan_check_enabled(33)):
+            torch.ops.vllm.nan_first_component(
+                shared_output, self._nan_origin_flag,
+                self._nan_origin_flag_real,
+                self._nan_origin_flag_padded, 33,
+                self._nan_real_mask)  # MOE_SHARED_OUT
+
         # Fix FP16 overflow
         # See DeepseekV2DecoderLayer for more details.
         if hidden_states.dtype != torch.float16:
@@ -400,9 +421,23 @@ class DeepseekV2MoE(nn.Module):
             assert shared_output is not None
             shared_output *= 1.0 / self.routed_scaling_factor
 
+        if self._nan_origin_flag is not None and nan_check_enabled(34):
+            torch.ops.vllm.nan_first_component(
+                final_hidden_states, self._nan_origin_flag,
+                self._nan_origin_flag_real,
+                self._nan_origin_flag_padded, 34,
+                self._nan_real_mask)  # MOE_AFTER_SCALE
+
         if self.shared_experts is not None:
             assert shared_output is not None
             final_hidden_states += shared_output
+
+        if self._nan_origin_flag is not None and nan_check_enabled(35):
+            torch.ops.vllm.nan_first_component(
+                final_hidden_states, self._nan_origin_flag,
+                self._nan_origin_flag_real,
+                self._nan_origin_flag_padded, 35,
+                self._nan_real_mask)  # MOE_AFTER_SHARED_ADD
 
         if self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
