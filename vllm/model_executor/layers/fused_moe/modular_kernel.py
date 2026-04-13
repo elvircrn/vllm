@@ -1394,7 +1394,18 @@ class FusedMoEKernelModularImpl:
             expert_tokens_meta=expert_tokens_meta,
         )
 
-        return self._finalize(
+        # NaN/Inf checks between expert computation and finalize.
+        from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_batched_moe import (  # noqa: E501
+            _nan_expert_flag,
+        )
+        _flag = _nan_expert_flag
+        if _flag is not None:
+            torch.ops.vllm.expert_nan_inf_latch(
+                fused_out, _flag, 42, 43)  # MOE_FUSED_OUT
+            torch.ops.vllm.expert_nan_inf_latch(
+                topk_weights, _flag, 44, 45)  # MOE_TOPK_WEIGHTS
+
+        result = self._finalize(
             output,
             fused_out,
             hidden_states,
@@ -1403,6 +1414,13 @@ class FusedMoEKernelModularImpl:
             apply_router_weight_on_input,
             shared_experts_input=shared_experts_input,
         )
+
+        if _flag is not None:
+            out_tensor = result[0] if isinstance(result, tuple) else result
+            torch.ops.vllm.expert_nan_inf_latch(
+                out_tensor, _flag, 46, 47)  # MOE_FINALIZE
+
+        return result
 
 
 @final

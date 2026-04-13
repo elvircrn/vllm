@@ -834,6 +834,12 @@ NAN_COMPONENT_MOE_EXPERT_GEMM1 = 38
 NAN_COMPONENT_MOE_EXPERT_GEMM1_INF = 39
 NAN_COMPONENT_MOE_EXPERT_GEMM2 = 40
 NAN_COMPONENT_MOE_EXPERT_GEMM2_INF = 41
+NAN_COMPONENT_MOE_FUSED_OUT = 42
+NAN_COMPONENT_MOE_FUSED_OUT_INF = 43
+NAN_COMPONENT_MOE_TOPK_WEIGHTS = 44
+NAN_COMPONENT_MOE_TOPK_WEIGHTS_INF = 45
+NAN_COMPONENT_MOE_FINALIZE = 46
+NAN_COMPONENT_MOE_FINALIZE_INF = 47
 
 NAN_COMPONENT_NAMES = {
     NAN_COMPONENT_EMBEDDING: "embedding",
@@ -877,6 +883,12 @@ NAN_COMPONENT_NAMES = {
     NAN_COMPONENT_MOE_EXPERT_GEMM1_INF: "moe_expert_gemm1_inf",
     NAN_COMPONENT_MOE_EXPERT_GEMM2: "moe_expert_gemm2",
     NAN_COMPONENT_MOE_EXPERT_GEMM2_INF: "moe_expert_gemm2_inf",
+    NAN_COMPONENT_MOE_FUSED_OUT: "moe_fused_out",
+    NAN_COMPONENT_MOE_FUSED_OUT_INF: "moe_fused_out_inf",
+    NAN_COMPONENT_MOE_TOPK_WEIGHTS: "moe_topk_weights",
+    NAN_COMPONENT_MOE_TOPK_WEIGHTS_INF: "moe_topk_weights_inf",
+    NAN_COMPONENT_MOE_FINALIZE: "moe_finalize",
+    NAN_COMPONENT_MOE_FINALIZE_INF: "moe_finalize_inf",
 }
 
 # Parsed once at import time from VLLM_NAN_CHECK_COMPONENTS.
@@ -891,7 +903,7 @@ def nan_check_enabled(component_id: int) -> bool:
         import vllm.envs as envs
         raw = envs.VLLM_NAN_CHECK_COMPONENTS
         if raw == "all":
-            _NAN_ENABLED_COMPONENTS = frozenset(range(42))
+            _NAN_ENABLED_COMPONENTS = frozenset(range(48))
         elif raw == "none":
             _NAN_ENABLED_COMPONENTS = frozenset()
         else:
