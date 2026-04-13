@@ -815,6 +815,8 @@ NAN_COMPONENT_ATTN_MQA_Q = 21
 NAN_COMPONENT_KV_CACHE_IN_KPE = 22
 NAN_COMPONENT_KV_CACHE_IN_COMPILED = 23
 NAN_COMPONENT_KV_CACHE_IN_KPE_COMPILED = 24
+NAN_COMPONENT_KV_CACHE_POST_WRITE = 25
+NAN_COMPONENT_KV_CACHE_POST_WRITE_COMPILED = 26
 
 NAN_COMPONENT_NAMES = {
     NAN_COMPONENT_EMBEDDING: "embedding",
@@ -841,6 +843,8 @@ NAN_COMPONENT_NAMES = {
     NAN_COMPONENT_KV_CACHE_IN_KPE: "kv_cache_in_kpe",
     NAN_COMPONENT_KV_CACHE_IN_COMPILED: "kv_cache_in_compiled",
     NAN_COMPONENT_KV_CACHE_IN_KPE_COMPILED: "kv_cache_in_kpe_compiled",
+    NAN_COMPONENT_KV_CACHE_POST_WRITE: "kv_cache_post_write",
+    NAN_COMPONENT_KV_CACHE_POST_WRITE_COMPILED: "kv_cache_post_write_compiled",
 }
 
 # Parsed once at import time from VLLM_NAN_CHECK_COMPONENTS.
@@ -855,7 +859,7 @@ def nan_check_enabled(component_id: int) -> bool:
         import vllm.envs as envs
         raw = envs.VLLM_NAN_CHECK_COMPONENTS
         if raw == "all":
-            _NAN_ENABLED_COMPONENTS = frozenset(range(25))
+            _NAN_ENABLED_COMPONENTS = frozenset(range(27))
         elif raw == "none":
             _NAN_ENABLED_COMPONENTS = frozenset()
         else:
@@ -934,4 +938,76 @@ direct_register_custom_op(
     op_func=nan_sticky_check,
     mutates_args=["flag"],
     fake_impl=nan_sticky_check_fake,
+)
+
+
+def nan_kv_cache_post_write_check(
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    flag: torch.Tensor,
+) -> None:
+    """Check for NaN or saturated values in KV cache after write.
+
+    Reads back written slots from kv_cache using slot_mapping,
+    casts to float32, and checks for problems.  PAD_SLOT_ID (-1)
+    entries in slot_mapping are ignored.
+
+    For FP8 E4M3fn KV caches: NaN cannot exist (all 256 bit patterns
+    are valid finite numbers).  When a BF16 NaN is quantized to FP8
+    E4M3fn, the hardware "launders" it into a saturated value (±448).
+    So for FP8 we detect SATURATED values (abs == fp8_max) instead,
+    which is where laundered NaN ends up.
+
+    For BF16/FP16 KV caches: checks for actual NaN.
+    """
+    if kv_cache.numel() == 0:
+        return
+    flat_slots = slot_mapping.flatten()
+    # Clamp negative slots (PAD_SLOT_ID = -1) to 0 for safe indexing
+    safe_slots = torch.clamp(flat_slots, min=0)
+    valid_mask = (flat_slots >= 0)
+
+    # Reshape kv_cache from [num_blocks, block_size, D] to [num_slots, D]
+    kv_flat = kv_cache.reshape(-1, kv_cache.shape[-1])
+
+    # Gather written entries
+    written = kv_flat[safe_slots]
+
+    is_fp8 = (written.dtype == torch.uint8)
+
+    if is_fp8:
+        # FP8 E4M3fn: no NaN exists.  Detect saturated values instead.
+        # When NaN is quantized to E4M3fn, hardware saturates to ±max.
+        # Max positive = 0x7E (448.0), max negative = 0xFE (-448.0)
+        # in E4M3fn.  We check raw bytes for the max-exponent patterns:
+        # byte & 0x7F == 0x7E  (exponent=1111, mantissa=110) = ±448
+        # byte & 0x7F == 0x7F  (exponent=1111, mantissa=111) = ±480?
+        # Actually just cast and compare to finfo.max.
+        written_fp8 = written.view(torch.float8_e4m3fn)
+        written_f32 = written_fp8.to(torch.float32)
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max  # 448.0
+        is_bad_per_elem = (torch.abs(written_f32) >= fp8_max)
+        is_bad_per_slot = torch.any(is_bad_per_elem, dim=-1)
+    else:
+        # BF16/FP16: check for actual NaN
+        written_f32 = written.to(torch.float32)
+        is_bad_per_slot = torch.any(torch.isnan(written_f32), dim=-1)
+
+    has_valid_bad = torch.any(is_bad_per_slot & valid_mask).to(torch.int32)
+    flag[0] = torch.maximum(flag[0], has_valid_bad)
+
+
+def nan_kv_cache_post_write_check_fake(
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    flag: torch.Tensor,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="nan_kv_cache_post_write_check",
+    op_func=nan_kv_cache_post_write_check,
+    mutates_args=["flag"],
+    fake_impl=nan_kv_cache_post_write_check_fake,
 )

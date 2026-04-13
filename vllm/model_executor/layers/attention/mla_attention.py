@@ -461,6 +461,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self._nan_flag_real: torch.Tensor | None = None
         self._nan_real_mask: torch.Tensor | None = None
         self._nan_kv_write_ever: torch.Tensor | None = None
+        self._nan_kv_post_write_ever: torch.Tensor | None = None
 
     @property
     def chunked_prefill_workspace_size(self) -> int:
@@ -508,14 +509,20 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     kv_c_normed, self._nan_kv_write_ever)
                 torch.ops.vllm.nan_sticky_check(
                     k_pe, self._nan_kv_write_ever)
+            layer_slot_mapping = slot_mapping.get(self.layer_name)
             self.impl.do_kv_cache_update(
                 kv_c_normed,
                 k_pe,
                 self_kv_cache,
-                slot_mapping.get(self.layer_name),
+                layer_slot_mapping,
                 self.kv_cache_dtype,
                 self._k_scale,
             )
+            if (self._nan_kv_post_write_ever is not None
+                    and layer_slot_mapping is not None):
+                torch.ops.vllm.nan_kv_cache_post_write_check(
+                    self_kv_cache, layer_slot_mapping,
+                    self._nan_kv_post_write_ever)
             output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
             self.forward_impl(
                 q,
@@ -549,6 +556,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 self.kv_cache_dtype,
                 self._k_scale,
             )
+            if self._nan_kv_post_write_ever is not None:
+                torch.ops.vllm.nan_kv_cache_post_write_check_compiled(
+                    self.layer_name,
+                    self._nan_kv_post_write_ever,
+                    kv_cache_dummy_dep,
+                )
             output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
             torch.ops.vllm.unified_mla_attention_with_output(
                 q,
@@ -1029,6 +1042,49 @@ direct_register_custom_op(
     op_name="unified_mla_kv_cache_update",
     op_func=unified_mla_kv_cache_update,
     fake_impl=unified_mla_kv_cache_update_fake,
+)
+
+
+def nan_kv_cache_post_write_check_compiled(
+    layer_name: str,
+    flag: torch.Tensor,
+    dummy_dep: torch.Tensor,
+) -> None:
+    """Post-write KV cache NaN check for torch.compile path.
+
+    Reads kv_cache and slot_mapping from forward_context,
+    delegates to nan_kv_cache_post_write_check.
+    dummy_dep establishes data dependency on the kv_cache write.
+    """
+    from vllm.model_executor.layers.attention.attention import (
+        nan_kv_cache_post_write_check,
+    )
+
+    forward_context = get_forward_context()
+    attn_layer = forward_context.no_compile_layers[layer_name]
+    kv_cache = attn_layer.kv_cache
+    if kv_cache.numel() == 0:
+        return
+    slot_mapping = forward_context.slot_mapping
+    assert isinstance(slot_mapping, dict)
+    layer_slot_mapping = slot_mapping.get(layer_name)
+    if layer_slot_mapping is not None:
+        nan_kv_cache_post_write_check(kv_cache, layer_slot_mapping, flag)
+
+
+def nan_kv_cache_post_write_check_compiled_fake(
+    layer_name: str,
+    flag: torch.Tensor,
+    dummy_dep: torch.Tensor,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="nan_kv_cache_post_write_check_compiled",
+    op_func=nan_kv_cache_post_write_check_compiled,
+    mutates_args=["flag"],
+    fake_impl=nan_kv_cache_post_write_check_compiled_fake,
 )
 
 

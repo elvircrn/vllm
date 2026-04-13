@@ -647,6 +647,22 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             for g in self.gauge_nan_kv_write_ever.values():
                 g.set(0)
 
+            gauge_nan_kv_post_write_ever = self._gauge_cls(
+                name="vllm:nan_kv_post_write_ever",
+                documentation=(
+                    "Sticky flag: 1 if bad data detected in KV cache "
+                    "AFTER write. For FP8: saturated values (±448, "
+                    "laundered NaN). For BF16: actual NaN. Never resets."
+                ),
+                multiprocess_mode="mostrecent",
+                labelnames=labelnames,
+            )
+            self.gauge_nan_kv_post_write_ever = create_metric_per_engine(
+                gauge_nan_kv_post_write_ever, per_engine_labelvalues
+            )
+            for g in self.gauge_nan_kv_post_write_ever.values():
+                g.set(0)
+
         if envs.VLLM_KV_CACHE_NAN_AUDIT > 0:
             gauge_kv_nan_total = self._gauge_cls(
                 name="vllm:kv_cache_nan_total_blocks",
@@ -1325,6 +1341,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     scheduler_stats.nan_first_layer_residual)
                 if scheduler_stats.nan_kv_write_ever:
                     self.gauge_nan_kv_write_ever[engine_idx].set(1)
+                if scheduler_stats.nan_kv_post_write_ever:
+                    self.gauge_nan_kv_post_write_ever[engine_idx].set(1)
 
             if envs.VLLM_KV_CACHE_NAN_AUDIT > 0:
                 self.gauge_kv_nan_total[engine_idx].set(

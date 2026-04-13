@@ -208,6 +208,7 @@ class ModelRunnerOutput:
     nan_real_output: bool = False
     nan_padded_output: bool = False
     nan_kv_write_ever: bool = False
+    nan_kv_post_write_ever: bool = False
 
     # KV cache NaN audit results (populated when VLLM_KV_CACHE_NAN_AUDIT > 0).
     kv_cache_nan_total_blocks: int = 0
