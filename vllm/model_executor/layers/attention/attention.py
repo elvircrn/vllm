@@ -840,6 +840,10 @@ NAN_COMPONENT_MOE_TOPK_WEIGHTS = 44
 NAN_COMPONENT_MOE_TOPK_WEIGHTS_INF = 45
 NAN_COMPONENT_MOE_FINALIZE = 46
 NAN_COMPONENT_MOE_FINALIZE_INF = 47
+NAN_COMPONENT_MOE_PRE_COMBINE = 48
+NAN_COMPONENT_MOE_PRE_COMBINE_INF = 49
+NAN_COMPONENT_MOE_POST_COMBINE = 50
+NAN_COMPONENT_MOE_POST_COMBINE_INF = 51
 
 NAN_COMPONENT_NAMES = {
     NAN_COMPONENT_EMBEDDING: "embedding",
@@ -889,6 +893,10 @@ NAN_COMPONENT_NAMES = {
     NAN_COMPONENT_MOE_TOPK_WEIGHTS_INF: "moe_topk_weights_inf",
     NAN_COMPONENT_MOE_FINALIZE: "moe_finalize",
     NAN_COMPONENT_MOE_FINALIZE_INF: "moe_finalize_inf",
+    NAN_COMPONENT_MOE_PRE_COMBINE: "moe_pre_combine",
+    NAN_COMPONENT_MOE_PRE_COMBINE_INF: "moe_pre_combine_inf",
+    NAN_COMPONENT_MOE_POST_COMBINE: "moe_post_combine",
+    NAN_COMPONENT_MOE_POST_COMBINE_INF: "moe_post_combine_inf",
 }
 
 # Parsed once at import time from VLLM_NAN_CHECK_COMPONENTS.
@@ -903,7 +911,7 @@ def nan_check_enabled(component_id: int) -> bool:
         import vllm.envs as envs
         raw = envs.VLLM_NAN_CHECK_COMPONENTS
         if raw == "all":
-            _NAN_ENABLED_COMPONENTS = frozenset(range(48))
+            _NAN_ENABLED_COMPONENTS = frozenset(range(52))
         elif raw == "none":
             _NAN_ENABLED_COMPONENTS = frozenset()
         else:

@@ -124,7 +124,25 @@ class DefaultMoERunner(MoERunnerBase):
             shared_experts_input=shared_experts_input,
         )
 
-        return self._maybe_combine(
+        # NaN/Inf check before EP combine.
+        from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_batched_moe import (  # noqa: E501
+            _nan_expert_flag,
+        )
+        _flag = _nan_expert_flag
+        if _flag is not None:
+            torch.ops.vllm.expert_nan_inf_latch(
+                hidden_states, _flag, 48, 49)  # MOE_PRE_COMBINE
+
+        result = self._maybe_combine(
             shared_output,
             hidden_states,
         )
+
+        # NaN/Inf check after EP combine.
+        # For SharedFusedMoE result is (shared_out, routed_out) — check routed.
+        if _flag is not None:
+            out = result[1] if isinstance(result, tuple) else result
+            torch.ops.vllm.expert_nan_inf_latch(
+                out, _flag, 50, 51)  # MOE_POST_COMBINE
+
+        return result
