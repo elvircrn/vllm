@@ -5217,6 +5217,7 @@ class GPUModelRunner(
                 module._nan_origin_flag_real = self._nan_origin_flag_real
                 module._nan_origin_flag_padded = self._nan_origin_flag_padded
                 module._nan_real_mask = self._nan_real_mask
+                logger.info("NaN flags wired to DeepseekV2MLP instance")
             elif isinstance(module, DeepseekV2Model):
                 module._nan_origin_flag = self._nan_origin_flag
                 module._nan_origin_flag_real = self._nan_origin_flag_real

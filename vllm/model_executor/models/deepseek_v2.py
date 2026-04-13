@@ -234,10 +234,21 @@ class DeepseekV2MLP(nn.Module):
         self._nan_origin_flag_padded: torch.Tensor | None = None
         self._nan_real_mask: torch.Tensor | None = None
 
+    _mlp_nan_flag_logged = False
+
     def forward(self, x):
         from vllm.model_executor.layers.attention.attention import (
             nan_check_enabled,
         )
+        if not DeepseekV2MLP._mlp_nan_flag_logged:
+            DeepseekV2MLP._mlp_nan_flag_logged = True
+            logger.info(
+                "DeepseekV2MLP NaN flag state: "
+                "flag=%s, flag_real=%s, flag_padded=%s, mask=%s",
+                self._nan_origin_flag is not None,
+                self._nan_origin_flag_real is not None,
+                self._nan_origin_flag_padded is not None,
+                self._nan_real_mask is not None)
         if self._nan_origin_flag is not None and nan_check_enabled(28):
             torch.ops.vllm.nan_first_component(
                 x, self._nan_origin_flag,
