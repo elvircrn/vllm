@@ -18,6 +18,7 @@ from vllm.model_executor.layers.attention.mla_attention import (
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import is_quantized_kv_cache
+from vllm.v1.attention.backends.mla.utils import zero_out_decode_padding
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
     AttentionLayer,
@@ -281,5 +282,8 @@ class CutlassMLAImpl(MLACommonImpl[MLACommonMetadata]):
             self.scale,
             self._num_kv_splits,
         )
+
+        # Zero out padded rows (seq_lens=0) to prevent NaN propagation.
+        zero_out_decode_padding(o, attn_metadata.decode.seq_lens)
 
         return o, (lse if self.need_to_return_lse_for_decode else None)

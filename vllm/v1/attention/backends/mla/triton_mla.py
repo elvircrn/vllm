@@ -22,6 +22,7 @@ from vllm.v1.attention.backend import (
     AttentionType,
     MultipleOf,
 )
+from vllm.v1.attention.backends.mla.utils import zero_out_decode_padding
 from vllm.v1.attention.ops.triton_decode_attention import decode_attention_fwd
 
 logger = init_logger(__name__)
@@ -209,5 +210,10 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
             v_scale=layer._k_scale,
             is_mla=True,
         )
+
+        # Triton MLA decode kernel produces NaN for padded rows
+        # (seq_lens=0) because softmax over empty sequence → 0/0.
+        # Zero them out to prevent NaN propagation.
+        zero_out_decode_padding(o, attn_metadata.decode.seq_lens)
 
         return o, lse

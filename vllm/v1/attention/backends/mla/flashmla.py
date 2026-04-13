@@ -21,6 +21,7 @@ from vllm.model_executor.layers.attention.mla_attention import (
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import is_quantized_kv_cache
+from vllm.v1.attention.backends.mla.utils import zero_out_decode_padding
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
     AttentionLayer,
@@ -328,6 +329,9 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
                 causal=True,
                 is_fp8_kvcache=False,
             )
+
+        # Zero out padded rows (seq_lens=0) to prevent NaN propagation.
+        zero_out_decode_padding(o, attn_metadata.decode.seq_lens)
 
         o = reshape_attn_output_for_spec_decode(o)
 

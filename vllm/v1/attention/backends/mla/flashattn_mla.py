@@ -27,6 +27,7 @@ from vllm.v1.attention.backend import (
     AttentionType,
     MultipleOf,
 )
+from vllm.v1.attention.backends.mla.utils import zero_out_decode_padding
 from vllm.v1.attention.backends.fa_utils import (
     flash_attn_supports_mla,
     get_flash_attn_version,
@@ -354,7 +355,9 @@ class FlashAttnMLAImpl(MLACommonImpl[FlashAttnMLAMetadata]):
         if self.need_to_return_lse_for_decode:
             o, lse = attn_out
             # FA returns LSE in shape [ H, B ] but DCP wants [ B, H ]
+            zero_out_decode_padding(o, attn_metadata.decode.seq_lens)
             return o, lse.transpose(0, 1)  # [ H, B ] -> [ B, H ]
         else:
             o = attn_out
+            zero_out_decode_padding(o, attn_metadata.decode.seq_lens)
             return o, None
