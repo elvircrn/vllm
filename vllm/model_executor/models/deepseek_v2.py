@@ -235,36 +235,9 @@ class DeepseekV2MLP(nn.Module):
         self._nan_real_mask: torch.Tensor | None = None
 
     def forward(self, x):
-        from vllm.model_executor.layers.attention.attention import (
-            nan_check_enabled,
-        )
-        if self._nan_origin_flag is not None and nan_check_enabled(28):
-            torch.ops.vllm.nan_first_component(
-                x, self._nan_origin_flag,
-                self._nan_origin_flag_real,
-                self._nan_origin_flag_padded, 28,
-                self._nan_real_mask)  # MLP_INPUT
         gate_up, _ = self.gate_up_proj(x)
-        if self._nan_origin_flag is not None and nan_check_enabled(29):
-            torch.ops.vllm.nan_first_component(
-                gate_up, self._nan_origin_flag,
-                self._nan_origin_flag_real,
-                self._nan_origin_flag_padded, 29,
-                self._nan_real_mask)  # MLP_GATE_UP
         x = self.act_fn(gate_up)
-        if self._nan_origin_flag is not None and nan_check_enabled(30):
-            torch.ops.vllm.nan_first_component(
-                x, self._nan_origin_flag,
-                self._nan_origin_flag_real,
-                self._nan_origin_flag_padded, 30,
-                self._nan_real_mask)  # MLP_ACT
         x, _ = self.down_proj(x)
-        if self._nan_origin_flag is not None and nan_check_enabled(31):
-            torch.ops.vllm.nan_first_component(
-                x, self._nan_origin_flag,
-                self._nan_origin_flag_real,
-                self._nan_origin_flag_padded, 31,
-                self._nan_real_mask)  # MLP_DOWN
         return x
 
 
@@ -1221,7 +1194,39 @@ class DeepseekV2DecoderLayer(nn.Module):
                 self._nan_origin_flag_real,
                 self._nan_origin_flag_padded, 9,
                 self._nan_real_mask)  # POST_ATTN_LN
-        hidden_states = self.mlp(hidden_states)
+        if isinstance(self.mlp, DeepseekV2MLP):
+            # Inline dense MLP with sub-component NaN checks so they
+            # live in the same torch.compile graph as component 14.
+            mlp = self.mlp
+            if self._nan_origin_flag is not None and nan_check_enabled(28):
+                torch.ops.vllm.nan_first_component(
+                    hidden_states, self._nan_origin_flag,
+                    self._nan_origin_flag_real,
+                    self._nan_origin_flag_padded, 28,
+                    self._nan_real_mask)  # MLP_INPUT
+            gate_up, _ = mlp.gate_up_proj(hidden_states)
+            if self._nan_origin_flag is not None and nan_check_enabled(29):
+                torch.ops.vllm.nan_first_component(
+                    gate_up, self._nan_origin_flag,
+                    self._nan_origin_flag_real,
+                    self._nan_origin_flag_padded, 29,
+                    self._nan_real_mask)  # MLP_GATE_UP
+            hidden_states = mlp.act_fn(gate_up)
+            if self._nan_origin_flag is not None and nan_check_enabled(30):
+                torch.ops.vllm.nan_first_component(
+                    hidden_states, self._nan_origin_flag,
+                    self._nan_origin_flag_real,
+                    self._nan_origin_flag_padded, 30,
+                    self._nan_real_mask)  # MLP_ACT
+            hidden_states, _ = mlp.down_proj(hidden_states)
+            if self._nan_origin_flag is not None and nan_check_enabled(31):
+                torch.ops.vllm.nan_first_component(
+                    hidden_states, self._nan_origin_flag,
+                    self._nan_origin_flag_real,
+                    self._nan_origin_flag_padded, 31,
+                    self._nan_real_mask)  # MLP_DOWN
+        else:
+            hidden_states = self.mlp(hidden_states)
         if self._nan_origin_flag is not None and nan_check_enabled(14):
             torch.ops.vllm.nan_first_component(
                 hidden_states, self._nan_origin_flag,
