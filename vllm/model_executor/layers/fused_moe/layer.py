@@ -1547,7 +1547,14 @@ class FusedMoE(CustomOp):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # Set expert-internal NaN flag so flashinfer_cutedsl_moe_masked
+        # can check intermediate tensors (GEMM1, GEMM2).
+        from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_batched_moe import (  # noqa: E501
+            set_nan_expert_flag,
+        )
+        set_nan_expert_flag(self._nan_flag)
         result = self.forward_native(hidden_states, router_logits)
+        set_nan_expert_flag(None)
         if self._nan_flag is not None:
             from vllm.model_executor.layers.attention.attention import (
                 nan_check_enabled,

@@ -828,6 +828,12 @@ NAN_COMPONENT_MOE_ROUTED_OUT = 32
 NAN_COMPONENT_MOE_SHARED_OUT = 33
 NAN_COMPONENT_MOE_AFTER_SCALE = 34
 NAN_COMPONENT_MOE_AFTER_SHARED_ADD = 35
+NAN_COMPONENT_MOE_EXPERT_INPUT = 36
+NAN_COMPONENT_MOE_EXPERT_INPUT_INF = 37
+NAN_COMPONENT_MOE_EXPERT_GEMM1 = 38
+NAN_COMPONENT_MOE_EXPERT_GEMM1_INF = 39
+NAN_COMPONENT_MOE_EXPERT_GEMM2 = 40
+NAN_COMPONENT_MOE_EXPERT_GEMM2_INF = 41
 
 NAN_COMPONENT_NAMES = {
     NAN_COMPONENT_EMBEDDING: "embedding",
@@ -865,6 +871,12 @@ NAN_COMPONENT_NAMES = {
     NAN_COMPONENT_MOE_SHARED_OUT: "moe_shared_out",
     NAN_COMPONENT_MOE_AFTER_SCALE: "moe_after_scale",
     NAN_COMPONENT_MOE_AFTER_SHARED_ADD: "moe_after_shared_add",
+    NAN_COMPONENT_MOE_EXPERT_INPUT: "moe_expert_input",
+    NAN_COMPONENT_MOE_EXPERT_INPUT_INF: "moe_expert_input_inf",
+    NAN_COMPONENT_MOE_EXPERT_GEMM1: "moe_expert_gemm1",
+    NAN_COMPONENT_MOE_EXPERT_GEMM1_INF: "moe_expert_gemm1_inf",
+    NAN_COMPONENT_MOE_EXPERT_GEMM2: "moe_expert_gemm2",
+    NAN_COMPONENT_MOE_EXPERT_GEMM2_INF: "moe_expert_gemm2_inf",
 }
 
 # Parsed once at import time from VLLM_NAN_CHECK_COMPONENTS.
@@ -879,7 +891,7 @@ def nan_check_enabled(component_id: int) -> bool:
         import vllm.envs as envs
         raw = envs.VLLM_NAN_CHECK_COMPONENTS
         if raw == "all":
-            _NAN_ENABLED_COMPONENTS = frozenset(range(36))
+            _NAN_ENABLED_COMPONENTS = frozenset(range(42))
         elif raw == "none":
             _NAN_ENABLED_COMPONENTS = frozenset()
         else:
@@ -968,6 +980,40 @@ direct_register_custom_op(
     op_func=nan_sticky_check,
     mutates_args=["flag"],
     fake_impl=nan_sticky_check_fake,
+)
+
+
+def expert_nan_inf_latch(tensor: torch.Tensor, flag: torch.Tensor,
+                         nan_component_id: int,
+                         inf_component_id: int) -> None:
+    """Check tensor for NaN and Inf, latch the first detection to flag[0].
+
+    NaN takes priority over Inf. Only writes if flag is still -1 (unlatched).
+    Designed for expert-internal checks where per-token real/padded
+    distinction is not available (tokens are already dispatched to experts).
+    """
+    has_nan = torch.any(torch.isnan(tensor))
+    not_yet = (flag[0] == -1)
+    write_nan = (has_nan & not_yet).to(torch.int32)
+    flag[0] = flag[0] * (1 - write_nan) + nan_component_id * write_nan
+
+    has_inf = torch.any(torch.isinf(tensor))
+    not_yet2 = (flag[0] == -1)
+    write_inf = (has_inf & not_yet2).to(torch.int32)
+    flag[0] = flag[0] * (1 - write_inf) + inf_component_id * write_inf
+
+
+def expert_nan_inf_latch_fake(tensor: torch.Tensor, flag: torch.Tensor,
+                              nan_component_id: int,
+                              inf_component_id: int) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="expert_nan_inf_latch",
+    op_func=expert_nan_inf_latch,
+    mutates_args=["flag"],
+    fake_impl=expert_nan_inf_latch_fake,
 )
 
 

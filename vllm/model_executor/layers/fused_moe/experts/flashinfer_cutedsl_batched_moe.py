@@ -30,6 +30,16 @@ from vllm.utils.flashinfer import (
 
 logger = init_logger(__name__)
 
+# Module-level NaN flag for expert-internal checks.
+# Set by FusedMoE.forward_cuda() before calling forward_native().
+# The flag tensor is pre-allocated and persistent (same address for CUDA graphs).
+_nan_expert_flag: torch.Tensor | None = None
+
+
+def set_nan_expert_flag(flag: torch.Tensor | None) -> None:
+    global _nan_expert_flag
+    _nan_expert_flag = flag
+
 
 class FlashInferCuteDSLBatchedExperts(mk.FusedMoEExpertsModular):
     def __init__(
@@ -315,6 +325,13 @@ def flashinfer_cutedsl_moe_masked(
     else:
         c_dtype = get_cute_dtype(hidden_states)
 
+    # Expert-internal NaN/Inf checks — read module-level flag.
+    _flag = _nan_expert_flag
+
+    # Check expert input for NaN/Inf before FP4 quantization.
+    if _flag is not None and not isinstance(hidden_states, tuple):
+        torch.ops.vllm.expert_nan_inf_latch(hidden_states, _flag, 36, 37)
+
     # Gemm1
     flashinfer_cutedsl_grouped_gemm_nt_masked(
         (aq, aq_sf),
@@ -328,6 +345,12 @@ def flashinfer_cutedsl_moe_masked(
         alpha=w1_alpha.view(1, 1, num_experts),
         alpha_dtype=get_cute_dtype(w1_alpha),
     )  # in logical [m, n, l]
+
+    # Check GEMM1 (gate_up) output for NaN/Inf.
+    # Inf here → SiLU will produce NaN (Inf * 0 = NaN).
+    if _flag is not None:
+        torch.ops.vllm.expert_nan_inf_latch(
+            workspace, _flag, 38, 39)
 
     # SILU and quantization
     diq, diq_sf = silu_and_mul_scaled_nvfp4_experts_quantize(
@@ -351,3 +374,7 @@ def flashinfer_cutedsl_moe_masked(
         alpha_dtype=get_cute_dtype(w2_alpha),
     )  # in logical [m, k, l]
     out = out.permute(2, 0, 1)
+
+    # Check GEMM2 (down_proj) output for NaN/Inf.
+    if _flag is not None:
+        torch.ops.vllm.expert_nan_inf_latch(out, _flag, 40, 41)
