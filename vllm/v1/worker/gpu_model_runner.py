@@ -5186,9 +5186,12 @@ class GPUModelRunner(
                 module._nan_flag_padded = self._nan_origin_flag_padded
                 module._nan_real_mask = self._nan_real_mask
                 module._nan_kv_write_ever = self._nan_kv_write_ever
-                module._nan_kv_post_write_ever = self._nan_kv_post_write_ever
-                module._nan_kv_post_write_per_layer = (
-                    self._nan_kv_post_write_per_layer)
+                if envs.VLLM_NAN_KV_POST_WRITE_CHECK:
+                    module._nan_kv_post_write_ever = (
+                        self._nan_kv_post_write_ever)
+                    module._nan_kv_post_write_per_layer = (
+                        self._nan_kv_post_write_per_layer)
+                # else: leave as None → checks skipped
                 # Extract layer index from layer_name
                 # (e.g. "model.layers.13.attn" -> 13)
                 parts = module.layer_name.split('.')
