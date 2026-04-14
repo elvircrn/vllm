@@ -1531,27 +1531,10 @@ class FusedMoE(CustomOp):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        # Set expert-internal NaN flag so flashinfer_cutedsl_moe_masked
-        # can check intermediate tensors. Must be here (not forward_cuda)
-        # because CustomOp dispatch may bypass forward_cuda entirely.
-        from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_batched_moe import (  # noqa: E501
-            set_nan_expert_flag,
-        )
-        nan_flag = self._nan_flag
-        if nan_flag is None and not getattr(self, '_nan_flag_none_warned', False):
-            from vllm.logger import init_logger as _init_logger
-            _logger = _init_logger(__name__)
-            _logger.warning(
-                "FusedMoE._nan_flag is None — expert-internal NaN "
-                "checks will not fire for %s", getattr(self, '_name', '?'))
-            self._nan_flag_none_warned = True
-        set_nan_expert_flag(nan_flag)
-        result = self.runner.forward(
+        return self.runner.forward(
             hidden_states,
             router_logits,
         )
-        set_nan_expert_flag(None)
-        return result
 
     @property
     def expert_map(self) -> torch.Tensor | None:

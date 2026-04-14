@@ -1395,10 +1395,9 @@ class FusedMoEKernelModularImpl:
         )
 
         # NaN/Inf checks between expert computation and finalize.
-        from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_batched_moe import (  # noqa: E501
-            _nan_expert_flag,
-        )
-        _flag = _nan_expert_flag
+        # Read flag from instance attribute (set by _setup_nan_detection_flags)
+        # rather than the module-level global which is fragile with CUDA graphs.
+        _flag = getattr(self, '_nan_flag', None)
         if _flag is not None:
             torch.ops.vllm.expert_nan_inf_latch(
                 fused_out, _flag, 42, 43)  # MOE_FUSED_OUT

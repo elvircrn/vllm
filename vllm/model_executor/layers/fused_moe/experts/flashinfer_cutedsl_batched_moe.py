@@ -30,16 +30,12 @@ from vllm.utils.flashinfer import (
 
 logger = init_logger(__name__)
 
-# Module-level NaN flag for expert-internal checks.
-# Set by FusedMoE.forward_cuda() before calling forward_native().
-# The flag tensor is pre-allocated and persistent (same address for CUDA graphs).
-_nan_expert_flag: torch.Tensor | None = None
-_nan_flag_warn_logged: bool = False
 
-
-def set_nan_expert_flag(flag: torch.Tensor | None) -> None:
-    global _nan_expert_flag
-    _nan_expert_flag = flag
+# NOTE: Expert-internal NaN checks now use an instance attribute
+# (_nan_flag) set on FlashInferCuteDSLBatchedExperts by
+# _setup_nan_detection_flags in gpu_model_runner.py, instead of a
+# module-level global. This avoids fragility with CUDA graph
+# capture/replay where the global could be None.
 
 
 class FlashInferCuteDSLBatchedExperts(mk.FusedMoEExpertsModular):
@@ -182,6 +178,9 @@ class FlashInferCuteDSLBatchedExperts(mk.FusedMoEExpertsModular):
             if envs.VLLM_DEEPEPLL_NVFP4_DISPATCH
             else hidden_states
         )
+        # Read flag from instance attribute (set by _setup_nan_detection_flags)
+        # rather than the module-level global which is fragile with CUDA graphs.
+        nan_flag = getattr(self, '_nan_flag', None)
         flashinfer_cutedsl_moe_masked(
             hidden_states=flashinfer_hidden_states,
             input_global_scale=input_global_scale,
@@ -195,6 +194,7 @@ class FlashInferCuteDSLBatchedExperts(mk.FusedMoEExpertsModular):
             masked_m=expert_num_tokens,
             workspace=workspace2,
             out=output,
+            nan_flag=nan_flag,
         )
 
 
@@ -222,6 +222,7 @@ def flashinfer_cutedsl_moe_masked(
     masked_m: torch.Tensor,
     workspace: torch.Tensor,
     out: torch.Tensor,
+    nan_flag: torch.Tensor | None = None,
 ):
     """
     Perform masked Mixture-of-Experts computation with FlashInfer's CuteDSL
@@ -332,14 +333,11 @@ def flashinfer_cutedsl_moe_masked(
     else:
         c_dtype = get_cute_dtype(hidden_states)
 
-    # Expert-internal NaN/Inf checks — read module-level flag.
-    _flag = _nan_expert_flag
-    if _flag is None:
-        global _nan_flag_warn_logged
-        if not _nan_flag_warn_logged:
-            logger.warning("NaN expert flag is None — expert-internal "
-                           "checks (36-51) will NOT fire")
-            _nan_flag_warn_logged = True
+    # Expert-internal NaN/Inf checks — use nan_flag parameter (set on
+    # the FlashInferCuteDSLBatchedExperts instance by
+    # _setup_nan_detection_flags) rather than the module-level global
+    # which is fragile with CUDA graph capture/replay.
+    _flag = nan_flag
 
     # Check expert input for NaN/Inf before FP4 quantization.
     if _flag is not None and not isinstance(hidden_states, tuple):
