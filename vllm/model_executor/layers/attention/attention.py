@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
+import triton
+import triton.language as tl
 
 import vllm.envs as envs
 from vllm.config import CacheConfig, get_current_vllm_config
@@ -920,49 +922,125 @@ def nan_check_enabled(component_id: int) -> bool:
     return component_id in _NAN_ENABLED_COMPONENTS
 
 
+# ---------------------------------------------------------------------------
+# Zero-copy NaN/Inf detection Triton kernels
+#
+# These replace torch.isnan / torch.isinf based checks which allocate
+# full-size boolean intermediates.  During CUDA graph capture those
+# intermediates persist in the graph memory pool — with ~34 calls per
+# decoder layer × 58 MoE layers this causes OOM.
+#
+# The Triton kernels read the input tensor in-place, check x != x
+# (IEEE 754 NaN) in registers, and atomic-CAS write directly to
+# pre-allocated scalar flag tensors.  Zero intermediate allocation.
+# ---------------------------------------------------------------------------
+
+_NAN_CHECK_BLOCK_SIZE = 8192
+
+
+@triton.jit
+def _nan_first_component_kernel(
+    input_ptr,
+    real_mask_ptr,  # uint8 view of bool mask
+    flag_all_ptr,
+    flag_real_ptr,
+    flag_padded_ptr,
+    component_id,
+    D,  # elements per row (token)
+    numel,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < numel
+    x = tl.load(input_ptr + offsets, mask=mask, other=0.0)
+
+    is_nan = (x != x)  # IEEE 754: NaN != NaN
+    any_nan = tl.sum(is_nan.to(tl.int32))
+
+    if any_nan > 0:
+        tl.atomic_cas(flag_all_ptr, -1, component_id)
+
+        # Determine which rows (tokens) the NaN elements belong to
+        rows = offsets // D
+        is_real = tl.load(real_mask_ptr + rows, mask=mask, other=0) != 0
+
+        any_real_nan = tl.sum((is_nan & is_real).to(tl.int32))
+        any_padded_nan = tl.sum((is_nan & ~is_real).to(tl.int32))
+
+        if any_real_nan > 0:
+            tl.atomic_cas(flag_real_ptr, -1, component_id)
+        if any_padded_nan > 0:
+            tl.atomic_cas(flag_padded_ptr, -1, component_id)
+
+
+@triton.jit
+def _nan_sticky_check_kernel(
+    input_ptr,
+    flag_ptr,
+    numel,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < numel
+    x = tl.load(input_ptr + offsets, mask=mask, other=0.0)
+
+    any_nan = tl.sum((x != x).to(tl.int32))
+    if any_nan > 0:
+        tl.atomic_max(flag_ptr, 1)
+
+
+@triton.jit
+def _expert_nan_inf_latch_kernel(
+    input_ptr,
+    flag_ptr,
+    nan_component_id,
+    inf_component_id,
+    numel,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < numel
+    x = tl.load(input_ptr + offsets, mask=mask, other=0.0)
+
+    # NaN: x != x (IEEE 754).  CAS fires first → NaN takes priority.
+    any_nan = tl.sum((x != x).to(tl.int32))
+    if any_nan > 0:
+        tl.atomic_cas(flag_ptr, -1, nan_component_id)
+
+    # Inf: |x| == inf.  CAS only succeeds if flag is still -1 (no NaN).
+    any_inf = tl.sum((tl.abs(x) == float('inf')).to(tl.int32))
+    if any_inf > 0:
+        tl.atomic_cas(flag_ptr, -1, inf_component_id)
+
+
 def nan_first_component(tensor: torch.Tensor, flag_all: torch.Tensor,
                         flag_real: torch.Tensor, flag_padded: torch.Tensor,
                         component_id: int,
                         real_mask: torch.Tensor) -> None:
     """Record the first component whose output contains NaN.
 
-    Writes to three sticky flags (never reset — once latched, stays forever):
-      flag_all    — first component with NaN in ANY token (real or padded)
-      flag_real   — first component with NaN in REAL tokens only
-      flag_padded — first component with NaN in PADDED tokens only
-
-    All are 1-element int32 tensors initialized to -1.
-    real_mask is a bool tensor [max_tokens]; True for real token positions.
-
-    Only writes component_id if NaN is found AND the flag is still -1.
-    All operations are pure GPU arithmetic — no torch.tensor() calls,
-    no CPU→GPU copies — so this is safe for CUDA graph capture/replay.
+    Uses a Triton kernel that reads elements in-place and atomic-CAS
+    writes to pre-allocated scalar flags.  Zero intermediate allocation
+    (no torch.isnan bool tensor), safe for CUDA graph capture.
     """
-    # Flatten to 2D [N, D] then reduce per-token → [N] bool vector.
-    # This avoids materializing a full [N, D] broadcast with the mask.
-    flat = tensor.reshape(tensor.shape[0], -1)
-    has_nan_per_token = torch.any(torch.isnan(flat), dim=-1)  # [N]
-
-    # All tokens (real + padded).
-    has_any_nan = torch.any(has_nan_per_token)
-    not_yet_all = (flag_all[0] == -1)
-    write_all = (has_any_nan & not_yet_all).to(torch.int32)
-    # flag = flag * (1 - w) + id * w  →  keeps flag when w=0, sets id when w=1
-    flag_all[0] = flag_all[0] * (1 - write_all) + component_id * write_all
-
-    # Real tokens only — mask is [N], has_nan_per_token is [N], cheap AND.
-    mask_slice = real_mask[:has_nan_per_token.shape[0]]
-    has_real_nan = torch.any(has_nan_per_token & mask_slice)
-    not_yet_real = (flag_real[0] == -1)
-    write_real = (has_real_nan & not_yet_real).to(torch.int32)
-    flag_real[0] = flag_real[0] * (1 - write_real) + component_id * write_real
-
-    # Padded tokens only — NaN in non-real positions.
-    has_padded_nan = torch.any(has_nan_per_token & ~mask_slice)
-    not_yet_padded = (flag_padded[0] == -1)
-    write_padded = (has_padded_nan & not_yet_padded).to(torch.int32)
-    flag_padded[0] = (flag_padded[0] * (1 - write_padded)
-                      + component_id * write_padded)
+    flat = tensor.reshape(-1)
+    D = tensor.numel() // tensor.shape[0]
+    numel = flat.numel()
+    grid = (triton.cdiv(numel, _NAN_CHECK_BLOCK_SIZE),)
+    _nan_first_component_kernel[grid](
+        flat,
+        real_mask.view(torch.uint8),
+        flag_all,
+        flag_real,
+        flag_padded,
+        component_id,
+        D,
+        numel,
+        BLOCK_SIZE=_NAN_CHECK_BLOCK_SIZE,
+    )
 
 
 def nan_first_component_fake(tensor: torch.Tensor, flag_all: torch.Tensor,
@@ -983,12 +1061,15 @@ direct_register_custom_op(
 def nan_sticky_check(tensor: torch.Tensor, flag: torch.Tensor) -> None:
     """Set flag[0] = 1 if tensor contains any NaN. Never clears the flag.
 
-    CUDA-graph safe: pure GPU arithmetic, no CPU→GPU copies.
-    Once the flag is set to 1, it stays at 1 forever.
+    Uses a Triton kernel — zero intermediate allocation, CUDA-graph safe.
     """
-    flat = tensor.reshape(tensor.shape[0], -1)
-    has_nan = torch.any(torch.isnan(flat)).to(torch.int32)
-    flag[0] = torch.maximum(flag[0], has_nan)
+    flat = tensor.reshape(-1)
+    numel = flat.numel()
+    grid = (triton.cdiv(numel, _NAN_CHECK_BLOCK_SIZE),)
+    _nan_sticky_check_kernel[grid](
+        flat, flag, numel,
+        BLOCK_SIZE=_NAN_CHECK_BLOCK_SIZE,
+    )
 
 
 def nan_sticky_check_fake(tensor: torch.Tensor, flag: torch.Tensor) -> None:
@@ -1008,19 +1089,16 @@ def expert_nan_inf_latch(tensor: torch.Tensor, flag: torch.Tensor,
                          inf_component_id: int) -> None:
     """Check tensor for NaN and Inf, latch the first detection to flag[0].
 
-    NaN takes priority over Inf. Only writes if flag is still -1 (unlatched).
-    Designed for expert-internal checks where per-token real/padded
-    distinction is not available (tokens are already dispatched to experts).
+    Uses a Triton kernel — zero intermediate allocation, CUDA-graph safe.
+    NaN takes priority (CAS fires first); cross-block races are benign.
     """
-    has_nan = torch.any(torch.isnan(tensor))
-    not_yet = (flag[0] == -1)
-    write_nan = (has_nan & not_yet).to(torch.int32)
-    flag[0] = flag[0] * (1 - write_nan) + nan_component_id * write_nan
-
-    has_inf = torch.any(torch.isinf(tensor))
-    not_yet2 = (flag[0] == -1)
-    write_inf = (has_inf & not_yet2).to(torch.int32)
-    flag[0] = flag[0] * (1 - write_inf) + inf_component_id * write_inf
+    flat = tensor.reshape(-1)
+    numel = flat.numel()
+    grid = (triton.cdiv(numel, _NAN_CHECK_BLOCK_SIZE),)
+    _expert_nan_inf_latch_kernel[grid](
+        flat, flag, nan_component_id, inf_component_id, numel,
+        BLOCK_SIZE=_NAN_CHECK_BLOCK_SIZE,
+    )
 
 
 def expert_nan_inf_latch_fake(tensor: torch.Tensor, flag: torch.Tensor,
