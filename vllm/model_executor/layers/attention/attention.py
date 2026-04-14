@@ -932,6 +932,9 @@ def nan_first_component(tensor: torch.Tensor, flag_all: torch.Tensor,
     sum runs in CUDA registers — only the [N] output is allocated.
     Memory: [N] float + [N] bool ≈ 40 KB (vs 56 MB).  CUDA-graph safe.
     """
+    # float8 types: sum_cuda not implemented, and e4m3fn can't represent NaN.
+    if not tensor.is_floating_point() or tensor.element_size() == 1:
+        return
     flat = tensor.reshape(tensor.shape[0], -1)
     # Per-row sum: NaN propagates → sum is NaN iff any element is NaN.
     token_sums = flat.sum(dim=-1)                    # [N] float
@@ -979,6 +982,8 @@ def nan_sticky_check(tensor: torch.Tensor, flag: torch.Tensor) -> None:
 
     Uses sum-based detection — O(1) allocation (one scalar).
     """
+    if not tensor.is_floating_point() or tensor.element_size() == 1:
+        return
     s = tensor.sum()
     has_nan = (s != s).to(torch.int32)
     flag[0] = torch.maximum(flag[0], has_nan)
@@ -1004,6 +1009,8 @@ def expert_nan_inf_latch(tensor: torch.Tensor, flag: torch.Tensor,
     Uses sum-based detection — O(1) allocation (one scalar).
     NaN takes priority over Inf.
     """
+    if not tensor.is_floating_point() or tensor.element_size() == 1:
+        return
     s = tensor.sum()
     # NaN: sum is NaN iff any element is NaN (IEEE 754).
     _nan_latch_flag(flag, s != s, nan_component_id)
