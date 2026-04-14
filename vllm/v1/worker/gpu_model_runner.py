@@ -5185,7 +5185,8 @@ class GPUModelRunner(
                 module._nan_flag_real = self._nan_origin_flag_real
                 module._nan_flag_padded = self._nan_origin_flag_padded
                 module._nan_real_mask = self._nan_real_mask
-                module._nan_kv_write_ever = self._nan_kv_write_ever
+                if envs.VLLM_NAN_KV_WRITE_CHECK:
+                    module._nan_kv_write_ever = self._nan_kv_write_ever
                 if envs.VLLM_NAN_KV_POST_WRITE_CHECK:
                     module._nan_kv_post_write_ever = (
                         self._nan_kv_post_write_ever)

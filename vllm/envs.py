@@ -192,6 +192,7 @@ if TYPE_CHECKING:
     VLLM_SSM_CONV_STATE_LAYOUT: Literal["SD", "DS"] | None = None
     VLLM_COMPUTE_NANS_IN_LOGITS: bool = False
     VLLM_NAN_CHECK_COMPONENTS: str = "all"
+    VLLM_NAN_KV_WRITE_CHECK: bool = True
     VLLM_NAN_KV_POST_WRITE_CHECK: bool = True
     VLLM_KV_CACHE_NAN_AUDIT: int = 0
     VLLM_USE_NVFP4_CT_EMULATIONS: bool = False
@@ -1423,6 +1424,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #      14=MLP_OUTPUT 15=KV_CACHE_IN
     "VLLM_NAN_CHECK_COMPONENTS": lambda: os.getenv(
         "VLLM_NAN_CHECK_COMPONENTS", "all"
+    ),
+    # Enable pre-write KV cache NaN checks (nan_sticky_check on kv inputs).
+    "VLLM_NAN_KV_WRITE_CHECK": lambda: bool(
+        int(os.getenv("VLLM_NAN_KV_WRITE_CHECK", "1"))
     ),
     # Enable post-write KV cache NaN checks (reads back written slots).
     # Disable with VLLM_NAN_KV_POST_WRITE_CHECK=0 to save ~550 MB CUDA
