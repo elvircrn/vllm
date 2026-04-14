@@ -3,6 +3,7 @@
 
 import torch
 
+from vllm import envs
 from vllm.distributed import (
     get_ep_group,
     get_pcp_group,
@@ -128,7 +129,7 @@ class DefaultMoERunner(MoERunnerBase):
         # Read flag from layer instance (set by _setup_nan_detection_flags)
         # rather than the module-level global which is fragile with CUDA graphs.
         _flag = getattr(layer, '_nan_flag', None)
-        if _flag is not None:
+        if _flag is not None and envs.VLLM_NAN_MOE_COMBINE_CHECK:
             torch.ops.vllm.expert_nan_inf_latch(
                 hidden_states, _flag, 48, 49)  # MOE_PRE_COMBINE
 
@@ -139,7 +140,7 @@ class DefaultMoERunner(MoERunnerBase):
 
         # NaN/Inf check after EP combine.
         # For SharedFusedMoE result is (shared_out, routed_out) — check routed.
-        if _flag is not None:
+        if _flag is not None and envs.VLLM_NAN_MOE_COMBINE_CHECK:
             out = result[1] if isinstance(result, tuple) else result
             torch.ops.vllm.expert_nan_inf_latch(
                 out, _flag, 50, 51)  # MOE_POST_COMBINE

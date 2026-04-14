@@ -194,6 +194,7 @@ if TYPE_CHECKING:
     VLLM_NAN_CHECK_COMPONENTS: str = "all"
     VLLM_NAN_KV_WRITE_CHECK: bool = True
     VLLM_NAN_KV_POST_WRITE_CHECK: bool = True
+    VLLM_NAN_MOE_COMBINE_CHECK: bool = True
     VLLM_KV_CACHE_NAN_AUDIT: int = 0
     VLLM_USE_NVFP4_CT_EMULATIONS: bool = False
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: Literal[
@@ -1434,6 +1435,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # graph memory (fancy-index + bitwise intermediates × 61 layers).
     "VLLM_NAN_KV_POST_WRITE_CHECK": lambda: bool(
         int(os.getenv("VLLM_NAN_KV_POST_WRITE_CHECK", "1"))
+    ),
+    # Enable expert_nan_inf_latch checks around EP combine in MoE runner.
+    "VLLM_NAN_MOE_COMBINE_CHECK": lambda: bool(
+        int(os.getenv("VLLM_NAN_MOE_COMBINE_CHECK", "1"))
     ),
     # Audit KV cache for NaN before every N-th model call.
     # 0 = disabled (default), N > 0 = check every N steps.
