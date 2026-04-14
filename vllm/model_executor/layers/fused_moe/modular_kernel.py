@@ -1394,15 +1394,10 @@ class FusedMoEKernelModularImpl:
             expert_tokens_meta=expert_tokens_meta,
         )
 
-        # NaN/Inf checks between expert computation and finalize.
-        # Read flag from instance attribute (set by _setup_nan_detection_flags)
-        # rather than the module-level global which is fragile with CUDA graphs.
-        _flag = getattr(self, '_nan_flag', None)
-        if _flag is not None:
-            torch.ops.vllm.expert_nan_inf_latch(
-                fused_out, _flag, 42, 43)  # MOE_FUSED_OUT
-            torch.ops.vllm.expert_nan_inf_latch(
-                topk_weights, _flag, 44, 45)  # MOE_TOPK_WEIGHTS
+        # NOTE: Kernel-level NaN checks (components 42-47) were removed
+        # because expert_nan_inf_latch allocates full-size isnan/isinf
+        # intermediates that persist in CUDA graph memory and cause OOM.
+        # NaN is detected at the MoE boundary (48-51 in the runner).
 
         result = self._finalize(
             output,
@@ -1413,11 +1408,6 @@ class FusedMoEKernelModularImpl:
             apply_router_weight_on_input,
             shared_experts_input=shared_experts_input,
         )
-
-        if _flag is not None:
-            out_tensor = result[0] if isinstance(result, tuple) else result
-            torch.ops.vllm.expert_nan_inf_latch(
-                out_tensor, _flag, 46, 47)  # MOE_FINALIZE
 
         return result
 

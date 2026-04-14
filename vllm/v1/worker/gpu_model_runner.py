@@ -5201,18 +5201,14 @@ class GPUModelRunner(
                 module._nan_flag_real = self._nan_origin_flag_real
                 module._nan_flag_padded = self._nan_origin_flag_padded
                 module._nan_real_mask = self._nan_real_mask
-                # Also propagate the flag to the MoE kernel and experts
-                # instances so they can access it directly without relying
-                # on a module-level global (which is fragile with CUDA
-                # graph capture/replay).
-                qm = getattr(module, 'quant_method', None)
-                kernel = getattr(qm, 'moe_kernel', None)
-                impl = getattr(kernel, 'impl', None)
-                if impl is not None:
-                    impl._nan_flag = self._nan_origin_flag
-                    experts = getattr(impl, 'fused_experts', None)
-                    if experts is not None:
-                        experts._nan_flag = self._nan_origin_flag
+                # NOTE: We intentionally do NOT propagate _nan_flag to
+                # the MoE kernel impl or experts instances. Those checks
+                # (components 36-47) run on large [num_experts, m, k]
+                # tensors — each expert_nan_inf_latch call allocates
+                # full-size isnan/isinf intermediates that persist in the
+                # CUDA graph memory pool, causing OOM.  The runner-level
+                # checks (48-51) on layer._nan_flag are sufficient to
+                # narrow down NaN to pre/post EP combine.
             elif isinstance(module, MultiHeadLatentAttentionWrapper):
                 module._nan_origin_flag = self._nan_origin_flag
                 module._nan_origin_flag_real = self._nan_origin_flag_real

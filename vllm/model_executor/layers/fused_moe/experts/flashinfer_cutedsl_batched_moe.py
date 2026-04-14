@@ -31,11 +31,6 @@ from vllm.utils.flashinfer import (
 logger = init_logger(__name__)
 
 
-# NOTE: Expert-internal NaN checks now use an instance attribute
-# (_nan_flag) set on FlashInferCuteDSLBatchedExperts by
-# _setup_nan_detection_flags in gpu_model_runner.py, instead of a
-# module-level global. This avoids fragility with CUDA graph
-# capture/replay where the global could be None.
 
 
 class FlashInferCuteDSLBatchedExperts(mk.FusedMoEExpertsModular):
@@ -178,9 +173,6 @@ class FlashInferCuteDSLBatchedExperts(mk.FusedMoEExpertsModular):
             if envs.VLLM_DEEPEPLL_NVFP4_DISPATCH
             else hidden_states
         )
-        # Read flag from instance attribute (set by _setup_nan_detection_flags)
-        # rather than the module-level global which is fragile with CUDA graphs.
-        nan_flag = getattr(self, '_nan_flag', None)
         flashinfer_cutedsl_moe_masked(
             hidden_states=flashinfer_hidden_states,
             input_global_scale=input_global_scale,
@@ -194,7 +186,6 @@ class FlashInferCuteDSLBatchedExperts(mk.FusedMoEExpertsModular):
             masked_m=expert_num_tokens,
             workspace=workspace2,
             out=output,
-            nan_flag=nan_flag,
         )
 
 
@@ -222,7 +213,6 @@ def flashinfer_cutedsl_moe_masked(
     masked_m: torch.Tensor,
     workspace: torch.Tensor,
     out: torch.Tensor,
-    nan_flag: torch.Tensor | None = None,
 ):
     """
     Perform masked Mixture-of-Experts computation with FlashInfer's CuteDSL
@@ -333,15 +323,11 @@ def flashinfer_cutedsl_moe_masked(
     else:
         c_dtype = get_cute_dtype(hidden_states)
 
-    # Expert-internal NaN/Inf checks — use nan_flag parameter (set on
-    # the FlashInferCuteDSLBatchedExperts instance by
-    # _setup_nan_detection_flags) rather than the module-level global
-    # which is fragile with CUDA graph capture/replay.
-    _flag = nan_flag
-
-    # Check expert input for NaN/Inf before FP4 quantization.
-    if _flag is not None and not isinstance(hidden_states, tuple):
-        torch.ops.vllm.expert_nan_inf_latch(hidden_states, _flag, 36, 37)
+    # NOTE: Expert-internal NaN checks (components 36-41) were removed
+    # because each expert_nan_inf_latch call allocates full-size
+    # isnan/isinf intermediates on [num_experts, m, k] tensors.  During
+    # CUDA graph capture these persist and cause OOM.  NaN is still
+    # detected at the MoE boundary (components 48-51 in the runner).
 
     # Gemm1
     flashinfer_cutedsl_grouped_gemm_nt_masked(
@@ -356,12 +342,6 @@ def flashinfer_cutedsl_moe_masked(
         alpha=w1_alpha.view(1, 1, num_experts),
         alpha_dtype=get_cute_dtype(w1_alpha),
     )  # in logical [m, n, l]
-
-    # Check GEMM1 (gate_up) output for NaN/Inf.
-    # Inf here → SiLU will produce NaN (Inf * 0 = NaN).
-    if _flag is not None:
-        torch.ops.vllm.expert_nan_inf_latch(
-            workspace, _flag, 38, 39)
 
     # Zero padding rows before SiLU+quant to prevent cross-row scale
     # corruption in the FlashInfer kernel (NaN/garbage in padding rows
@@ -393,7 +373,3 @@ def flashinfer_cutedsl_moe_masked(
         alpha_dtype=get_cute_dtype(w2_alpha),
     )  # in logical [m, k, l]
     out = out.permute(2, 0, 1)
-
-    # Check GEMM2 (down_proj) output for NaN/Inf.
-    if _flag is not None:
-        torch.ops.vllm.expert_nan_inf_latch(out, _flag, 40, 41)
