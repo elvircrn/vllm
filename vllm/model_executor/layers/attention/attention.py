@@ -1045,16 +1045,12 @@ def nan_kv_cache_post_write_check(
 ) -> None:
     """Check for NaN in KV cache entries that were just written.
 
-    Reads back written slots from kv_cache using slot_mapping,
-    then uses sum-based NaN detection (IEEE 754: NaN propagates
-    through sum).  PAD_SLOT_ID (-1) entries are masked out via
-    torch.where so their NaN status does not affect the result.
+    Reads back written slots from kv_cache using slot_mapping.
+    PAD_SLOT_ID (-1) entries are masked out.
 
-    Uses sum-based detection to avoid materializing [N, D] bool
-    from torch.isnan.  For float8 data, casts to bfloat16 (2 bytes)
-    instead of float32 (4 bytes) before summing.
-    CUDA-graph safe: allocates [N, D] (fancy index) + [N] (sums)
-    vs the old approach's [N, D] + [N, D] float32 + [N, D] bool.
+    For float8 (uint8): bitwise NaN check — (byte & 0x7F) == 0x7F.
+    For bf16/fp16/fp32: sum-based detection (IEEE 754 NaN propagation).
+    No torch.isnan or dtype casts — CUDA-graph safe.
     """
     if kv_cache.numel() == 0:
         return
@@ -1069,19 +1065,17 @@ def nan_kv_cache_post_write_check(
     # Gather written entries — unavoidable copy from fancy indexing
     written = kv_flat[safe_slots]
 
-    # For FP8 data stored as uint8, view as float8_e4m3fn then cast
-    # to bfloat16 (sum_cuda not implemented for float8 dtypes).
     if written.dtype == torch.uint8:
-        written = written.view(torch.float8_e4m3fn)
-    if written.element_size() == 1:
-        written = written.to(torch.bfloat16)
-
-    # Sum-based NaN detection: sum(row) is NaN iff any element is NaN.
-    # torch.where masks out pad slots (0.0 replaces NaN correctly).
-    slot_sums = written.sum(dim=-1)                        # [N]
-    valid_sums = torch.where(valid_mask, slot_sums, 0.0)   # [N]
-    s = valid_sums.sum()
-    has_nan = (s != s).to(torch.int32)
+        # float8_e4m3fn NaN: exponent + mantissa all 1s → (byte & 0x7F) == 0x7F
+        # Catches both 0x7F (+NaN) and 0xFF (-NaN). No dtype cast needed.
+        has_nan_per_slot = ((written & 0x7F) == 0x7F).any(dim=-1)
+        has_nan = (has_nan_per_slot & valid_mask).any().to(torch.int32)
+    else:
+        # bf16/fp16/fp32: sum-based NaN detection (IEEE 754 propagation).
+        slot_sums = written.sum(dim=-1)                        # [N]
+        valid_sums = torch.where(valid_mask, slot_sums, 0.0)   # [N]
+        s = valid_sums.sum()
+        has_nan = (s != s).to(torch.int32)
     flag[0] = torch.maximum(flag[0], has_nan)
 
     # Also set per-layer sticky flag
