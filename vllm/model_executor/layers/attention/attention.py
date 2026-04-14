@@ -932,7 +932,9 @@ def nan_first_component(tensor: torch.Tensor, flag_all: torch.Tensor,
     sum runs in CUDA registers — only the [N] output is allocated.
     Memory: [N] float + [N] bool ≈ 40 KB (vs 56 MB).  CUDA-graph safe.
     """
-    # float8 types: sum_cuda not implemented, and e4m3fn can't represent NaN.
+    # float8 types: sum_cuda not implemented. Skip — any float8 NaN (e.g.
+    # 0x7F in e4m3fn) will propagate to bf16 at the next dequant and be
+    # caught by a subsequent check on the wider-type tensor.
     if not tensor.is_floating_point() or tensor.element_size() == 1:
         return
     flat = tensor.reshape(tensor.shape[0], -1)
