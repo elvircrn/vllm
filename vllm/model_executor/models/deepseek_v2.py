@@ -371,8 +371,12 @@ class DeepseekV2MoE(nn.Module):
 
         # Zero out DP padding tokens so they don't contaminate real
         # tokens through expert routing / EP all-to-all dispatch.
+        # Use torch.where instead of multiplication because NaN * 0 = NaN
+        # (IEEE 754), so padding tokens with NaN from attention would
+        # propagate into expert kernels and corrupt FP4 block scales.
         if self._dp_padding_mask is not None:
-            hidden_states = hidden_states * self._dp_padding_mask[:num_tokens]
+            mask = self._dp_padding_mask[:num_tokens].bool()
+            hidden_states = torch.where(mask, hidden_states, 0.0)
 
         # Chunk the hidden states so they aren't replicated across TP ranks.
         # This avoids duplicate computation in self.experts.
