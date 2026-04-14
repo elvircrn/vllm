@@ -926,27 +926,36 @@ def nan_first_component(tensor: torch.Tensor, flag_all: torch.Tensor,
                         real_mask: torch.Tensor) -> None:
     """Record the first component whose output contains NaN.
 
-    Uses scalar sum for NaN detection — O(1) allocation.  IEEE 754:
-    NaN propagates through sum, so sum(tensor) is NaN iff any element
-    is NaN.  CUDA-graph safe.
+    Uses per-row sum + torch.where masking for NaN detection with
+    real/padded distinction.  IEEE 754: NaN propagates through sum,
+    so sum(row) is NaN iff any element in that row is NaN.
 
-    Per-token real/padded distinction is sacrificed to avoid allocating
-    [N]-sized intermediates that persist in the CUDA graph memory pool.
-    The component ID is still recorded, which is the key info for
-    narrowing down NaN origin.
+    Allocates 3 × [N] tensors per call (~48 KB for N=8192 bf16) vs
+    the original torch.isnan approach which allocated [N, D] bool
+    (~56 MB).  CUDA-graph safe.
     """
     # float8 types: sum_cuda not implemented. Skip — any float8 NaN (e.g.
     # 0x7F in e4m3fn) will propagate to bf16 at the next dequant and be
     # caught by a subsequent check on the wider-type tensor.
     if not tensor.is_floating_point() or tensor.element_size() == 1:
         return
-    s = tensor.sum()
-    has_nan = (s != s)
-    _nan_latch_flag(flag_all, has_nan, component_id)
-    # Without per-token reduction we can't distinguish real vs padded,
-    # so latch both with the same detection result.
-    _nan_latch_flag(flag_real, has_nan, component_id)
-    _nan_latch_flag(flag_padded, has_nan, component_id)
+    flat = tensor.reshape(tensor.shape[0], -1)
+    token_sums = flat.sum(dim=-1)                     # [N]
+    mask_n = real_mask[:token_sums.shape[0]]
+
+    # flag_all: any NaN in any token
+    s_all = token_sums.sum()
+    _nan_latch_flag(flag_all, s_all != s_all, component_id)
+
+    # flag_real: zero out padded rows before summing → only real NaN
+    real_sums = torch.where(mask_n, token_sums, 0.0)  # [N]
+    s_real = real_sums.sum()
+    _nan_latch_flag(flag_real, s_real != s_real, component_id)
+
+    # flag_padded: zero out real rows before summing → only padded NaN
+    padded_sums = torch.where(mask_n, 0.0, token_sums) # [N]
+    s_padded = padded_sums.sum()
+    _nan_latch_flag(flag_padded, s_padded != s_padded, component_id)
 
 
 def _nan_latch_flag(flag: torch.Tensor, detected: torch.Tensor,
