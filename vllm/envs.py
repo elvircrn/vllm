@@ -230,6 +230,7 @@ if TYPE_CHECKING:
     VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE: bool = False
     VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL: bool = False
     VLLM_DBO_COMM_SMS: int = 20
+    VLLM_DP_PADDING_NAN_MASK: bool = False
     VLLM_DEEPEP_COMBINE_V2: bool = False
     VLLM_DEEPEP_COMBINE_GEMM2_OVERLAP: bool = False
     VLLM_DEEPEP_COMBINE_GEMM2_OVERLAP_COMM_SMS: int = 32
@@ -1593,6 +1594,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The number of SMs to allocate for communication kernels when running DBO
     # the rest of the SMs on the device will be allocated to compute
     "VLLM_DBO_COMM_SMS": lambda: int(os.getenv("VLLM_DBO_COMM_SMS", "20")),
+    # Zero out DP padding tokens before MoE to prevent NaN propagation
+    # from attention into expert routing / EP dispatch.
+    "VLLM_DP_PADDING_NAN_MASK": lambda: bool(
+        int(os.getenv("VLLM_DP_PADDING_NAN_MASK", "0"))
+    ),
     # Use DeepEP combine_v2 kernel instead of combine for low-latency decode.
     # combine_v2 uses per-expert completion signals from GEMM2.
     "VLLM_DEEPEP_COMBINE_V2": lambda: bool(
