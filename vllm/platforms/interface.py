@@ -141,6 +141,10 @@ class Platform:
 
     _global_graph_pool: Any | None = None
 
+    def __call__(self) -> "Platform":
+        # Backward compat: nixl 0.8.0 calls current_platform() with parens.
+        return self
+
     @property
     def pass_key(self) -> str:
         """Inductor config key for the PassManager custom pass"""
