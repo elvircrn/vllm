@@ -105,14 +105,13 @@ __global__ void __launch_bounds__((N_COMPUTE + 1) * 32)
         for (int w = 0; w < N_COMPUTE; w++) {
           int sb = static_cast<int>(blockIdx.x) * N_COMPUTE + w;
           if (sb < G) {
-            cp_async_f32(&smem_scales[sOff + t * N_COMPUTE * 2 + w * 2],
-                         &input_scales[tok + scale_stride * sb]);
-            cp_async_f32(&smem_scales[sOff + t * N_COMPUTE * 2 + w * 2 + 1],
-                         &input_scales[tok + scale_stride * (sb + G)]);
+            smem_scales[sOff + t * N_COMPUTE * 2 + w * 2] =
+                __ldg(&input_scales[tok + scale_stride * sb]);
+            smem_scales[sOff + t * N_COMPUTE * 2 + w * 2 + 1] =
+                __ldg(&input_scales[tok + scale_stride * (sb + G)]);
           }
         }
       }
-      cp_async_commit();
 
       char* dst = stage_ptr(fillStage);
       for (int t = 0; t < actual_load; t++) {
@@ -122,8 +121,6 @@ __global__ void __launch_bounds__((N_COMPUTE + 1) * 32)
                     batchStart + t, &full_mbar[fillStage]);
       }
 
-      cp_async_wait_all();
-      __threadfence_block();
       uint32_t load_bytes =
           static_cast<uint32_t>(actual_load * 2 * validSliceBytes);
       mbarrier_arrive_expect_tx(&full_mbar[fillStage], load_bytes);
