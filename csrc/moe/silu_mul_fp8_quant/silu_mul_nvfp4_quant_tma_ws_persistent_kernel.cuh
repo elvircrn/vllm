@@ -24,8 +24,7 @@ __global__ void __launch_bounds__((N_COMPUTE + 1) * 32)
         const __nv_bfloat16* __restrict__ input, uint32_t* __restrict__ output,
         uint32_t* __restrict__ output_sf,
         const float* __restrict__ global_scale_ptr, int32_t n_tokens, int64_t H,
-        int32_t* __restrict__ work_counter,
-        const __grid_constant__ CUtensorMap tensorMap) {
+        int32_t totalWorkItems, const __grid_constant__ CUtensorMap tensorMap) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   static constexpr int ELTS_PER_THREAD = 16;
   static constexpr int WARP_ELTS = 32 * ELTS_PER_THREAD;  // 512
@@ -47,8 +46,6 @@ __global__ void __launch_bounds__((N_COMPUTE + 1) * 32)
   int const validGroups =
       min(N_COMPUTE, numGroups - (int)blockIdx.x * N_COMPUTE);
   int const validSliceBytes = validGroups * WARP_ELTS * 2;
-
-  int const totalWorkItems = (totalN + BATCH_SIZE - 1) / BATCH_SIZE;
 
   extern __shared__ char smem_raw[];
   uint64_t* full_mbar = reinterpret_cast<uint64_t*>(smem_raw);
@@ -80,8 +77,6 @@ __global__ void __launch_bounds__((N_COMPUTE + 1) * 32)
     return smem_raw + MBAR_REGION + stage * STAGE_BYTES;
   };
 
-  int32_t* my_counter = &work_counter[blockIdx.x];
-
   if (isProducer) {
     // ===== PRODUCER WARP =====
     if (laneId != 0) return;
@@ -89,17 +84,15 @@ __global__ void __launch_bounds__((N_COMPUTE + 1) * 32)
     int fillStage = 0;
     int phase_empty[NUM_STAGES] = {};
 
-    while (true) {
+    int chunk = (totalWorkItems + static_cast<int>(gridDim.y) - 1) /
+                static_cast<int>(gridDim.y);
+    int myStart = static_cast<int>(blockIdx.y) * chunk;
+    int myEnd = myStart + chunk;
+    if (myEnd > totalWorkItems) myEnd = totalWorkItems;
+
+    for (int workItem = myStart; workItem < myEnd; workItem++) {
       mbarrier_wait(&empty_mbar[fillStage], phase_empty[fillStage]);
       phase_empty[fillStage] ^= 1;
-
-      int workItem = atomicAdd(my_counter, 1);
-      if (workItem >= totalWorkItems) {
-        batch_token_start[fillStage] = -1;
-        mbarrier_arrive_expect_tx(&full_mbar[fillStage], 0);
-        fillStage = (fillStage + 1) % NUM_STAGES;
-        break;
-      }
 
       int batchStart = workItem * BATCH_SIZE;
       int actual_load = min(BATCH_SIZE, totalN - batchStart);
@@ -122,7 +115,7 @@ __global__ void __launch_bounds__((N_COMPUTE + 1) * 32)
       fillStage = (fillStage + 1) % NUM_STAGES;
     }
 
-    for (int remaining = 0; remaining < NUM_STAGES - 1; remaining++) {
+    for (int s = 0; s < NUM_STAGES; s++) {
       mbarrier_wait(&empty_mbar[fillStage], phase_empty[fillStage]);
       phase_empty[fillStage] ^= 1;
       batch_token_start[fillStage] = -1;

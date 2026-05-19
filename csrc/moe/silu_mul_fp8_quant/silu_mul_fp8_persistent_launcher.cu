@@ -15,10 +15,6 @@ namespace vllm {
 
 static constexpr int FP8_PERSISTENT_STAGES = 2;
 
-namespace {
-__device__ int32_t g_fp8_persistent_counters[64];
-}
-
 template <int N_COMPUTE, int BATCH_SIZE>
 void launch_tma_ws_fp8_persistent_dispatch(void* input, void* input_scales,
                                            void* output, void* output_scales,
@@ -46,7 +42,6 @@ void launch_tma_ws_fp8_persistent_dispatch(void* input, void* input_scales,
   struct StaticState {
     int numSms;
     int smemPerSM;
-    int32_t* d_counters;
   };
   static StaticState state = []() {
     StaticState s{};
@@ -55,7 +50,6 @@ void launch_tma_ws_fp8_persistent_dispatch(void* input, void* input_scales,
     cudaDeviceGetAttribute(&s.numSms, cudaDevAttrMultiProcessorCount, device);
     cudaDeviceGetAttribute(&s.smemPerSM,
                            cudaDevAttrMaxSharedMemoryPerMultiprocessor, device);
-    cudaGetSymbolAddress((void**)&s.d_counters, g_fp8_persistent_counters);
     cudaFuncSetAttribute(
         tma_v5::silu_mul_fp8_quant_tma_ws_persistent_kernel<
             N_COMPUTE, FP8_PERSISTENT_STAGES, BATCH_SIZE, false>,
@@ -82,7 +76,7 @@ void launch_tma_ws_fp8_persistent_dispatch(void* input, void* input_scales,
   int gridY = (totalDesiredCTAs + gridX - 1) / gridX;
   if (gridY < state.numSms) gridY = state.numSms;
 
-  cudaMemsetAsync(state.d_counters, 0, gridX * sizeof(int32_t), stream);
+  int32_t totalWorkItems = (n_tokens + BATCH_SIZE - 1) / BATCH_SIZE;
 
   CUtensorMap tensorMap;
   cuuint64_t globalDim[3] = {128, static_cast<cuuint64_t>(2 * H / 128),
@@ -104,7 +98,7 @@ void launch_tma_ws_fp8_persistent_dispatch(void* input, void* input_scales,
       reinterpret_cast<float*>(input_scales),
       reinterpret_cast<__nv_fp8_e4m3*>(output),
       reinterpret_cast<float*>(output_scales), n_tokens, H, scale_stride,
-      state.d_counters, tensorMap);
+      totalWorkItems, tensorMap);
 }
 
 template <int N_COMPUTE>
