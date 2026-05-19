@@ -30,10 +30,7 @@ void launch_tma_ws_fp8_persistent_dispatch(void* input, void* input_scales,
       ((2 * FP8_PERSISTENT_STAGES * 8 + sizeof(int32_t)) + 127) & ~127;
   constexpr int TOKEN_BYTES = 2 * N_COMPUTE * 128;
   constexpr int STAGE_DATA = BATCH_SIZE * TOKEN_BYTES;
-  constexpr int SCALE_SMEM =
-      FP8_PERSISTENT_STAGES * BATCH_SIZE * N_COMPUTE * 2 * sizeof(float);
-  constexpr int smem =
-      MBAR_REGION + FP8_PERSISTENT_STAGES * STAGE_DATA + SCALE_SMEM;
+  constexpr int smem = MBAR_REGION + FP8_PERSISTENT_STAGES * STAGE_DATA;
   constexpr int blockThreads = (N_COMPUTE + 1) * 32;
 
   // Static one-time init — these CUDA runtime calls are not safe during
