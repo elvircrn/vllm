@@ -4,7 +4,6 @@ from collections.abc import Callable
 
 import deep_ep
 import torch
-import torch.nn.functional as F
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
@@ -17,44 +16,6 @@ from vllm.utils.math_utils import round_up
 from vllm.v1.worker.ubatching import (
     dbo_current_ubatch_id,
 )
-
-
-# DeepEP v2 nvfp4 dispatch scale packing:
-#   scales: int32 [M, H/64] — four fp8_e4m3fn bytes packed per int32
-#           int32 = s0 | (s1<<8) | (s2<<16) | (s3<<24)
-
-
-def _pack_fp8_scales(scales: torch.Tensor) -> torch.Tensor:
-    m, num_scales = scales.shape
-    if scales.dtype != torch.uint8:
-        if scales.dtype != torch.float8_e4m3fn:
-            scales = scales.to(torch.float8_e4m3fn)
-        scales = scales.view(torch.uint8)
-    aligned_num = round_up(num_scales, 4)
-    if aligned_num > num_scales:
-        scales = F.pad(scales, (0, aligned_num - num_scales),
-                       mode='constant', value=0)
-    scales_i32 = scales.to(torch.int32).view(m, -1, 4)
-    result = (scales_i32[:, :, 0]
-              | (scales_i32[:, :, 1] << 8)
-              | (scales_i32[:, :, 2] << 16)
-              | (scales_i32[:, :, 3] << 24))
-    if num_scales < aligned_num:
-        return result[:, :num_scales // 4].contiguous()
-    return result
-
-
-def _unpack_fp8_scales(
-    packed: torch.Tensor, num_scales: int,
-) -> torch.Tensor:
-    m = packed.shape[0]
-    b0 = packed & 0xFF
-    b1 = (packed >> 8) & 0xFF
-    b2 = (packed >> 16) & 0xFF
-    b3 = (packed >> 24) & 0xFF
-    unpacked = torch.stack([b0, b1, b2, b3], dim=-1).view(m, -1)
-    unpacked = unpacked[:, :num_scales]
-    return unpacked.to(torch.uint8).view(torch.float8_e4m3fn)
 
 
 class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
@@ -155,9 +116,10 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 quant_dtype=quant_config.quant_dtype,
                 per_act_token_quant=False,
                 block_shape=quant_config.block_shape,
-                is_scale_swizzled=False,
+                is_fp4_scale_swizzled=False,
             )
-            token_scales = _pack_fp8_scales(token_scales)
+            # uint8 [M, H/16] → int32 [M, H/64] for DeepEP fp8_sf transport
+            token_scales = token_scales.view(torch.int32)
 
         has_scales = token_scales is not None
 
@@ -269,9 +231,9 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         )
 
         if self.use_nvfp4_dispatch and expert_x_scale is not None:
-            num_scales = expert_x.shape[1] // 8  # H/2 packed → H/16 groups
-            expert_x_scale = _unpack_fp8_scales(
-                expert_x_scale, num_scales)
+            # int32 [M, H/64] → fp8 [M, H/16]
+            expert_x_scale = expert_x_scale.view(torch.uint8).view(
+                torch.float8_e4m3fn)
 
         if (not quant_config.is_block_quantized
                 and not defer_input_quant
