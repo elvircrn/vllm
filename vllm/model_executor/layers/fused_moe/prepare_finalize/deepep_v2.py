@@ -111,12 +111,8 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     ) -> Callable:
         if self.use_nvfp4_dispatch and token_scales is None:
             tokens, token_scales = moe_kernel_quantize_input(
-                tokens,
-                a1_scale,
-                quant_dtype=quant_config.quant_dtype,
-                per_act_token_quant=False,
-                block_shape=quant_config.block_shape,
-                is_fp4_scale_swizzled=False,
+                tokens, a1_scale, quant_config.quant_dtype,
+                False, quant_config.block_shape, False,
             )
             # uint8 [M, H/16] → int32 [M, H/64] for DeepEP fp8_sf transport
             token_scales = token_scales.view(torch.int32)
@@ -241,12 +237,8 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             expert_x_scale = None
             if expert_x.numel() != 0:
                 expert_x, expert_x_scale = moe_kernel_quantize_input(
-                    expert_x,
-                    a1_scale,
-                    quant_dtype=quant_config.quant_dtype,
-                    per_act_token_quant=False,
-                    block_shape=quant_config.block_shape,
-                    is_fp4_scale_swizzled=quant_config.is_nvfp4_scale_swizzled,
+                    expert_x, a1_scale, quant_config.quant_dtype,
+                    False, quant_config.block_shape,
                 )
 
         return (
