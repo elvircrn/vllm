@@ -4,6 +4,7 @@ from collections.abc import Callable
 
 import deep_ep
 import torch
+import torch.nn.functional as F
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
@@ -16,6 +17,79 @@ from vllm.utils.math_utils import round_up
 from vllm.v1.worker.ubatching import (
     dbo_current_ubatch_id,
 )
+
+
+# per_token_cast_to_nvfp4 output layout:
+#   data:   uint8  [M, H/2]   — two e2m1 nibbles packed per byte
+#   scales: int32  [M, H/64]  — four fp8_e4m3fn scales packed per int32
+#                                int32 = s0 | (s1<<8) | (s2<<16) | (s3<<24)
+
+
+def _float_to_e2m1_packed(x: torch.Tensor) -> torch.Tensor:
+    assert x.dim() == 2 and x.shape[1] % 2 == 0
+    m, n = x.shape
+    abs_x = x.abs()
+    sign = (x < 0).to(torch.uint8)
+    abs_x_log2 = torch.log2(abs_x.clamp(min=2**-10))
+    exp = torch.floor(abs_x_log2 + 1).clamp(0, 3).to(torch.uint8)
+    mant = ((abs_x_log2 + 1 - exp.float()) > 0.5).to(torch.uint8)
+    nibbles = (sign << 3) | (exp << 1) | mant
+    even = nibbles[:, 0::2]
+    odd = nibbles[:, 1::2]
+    return (even | (odd << 4)).to(torch.uint8)
+
+
+def _pack_fp8_scales(scales: torch.Tensor) -> torch.Tensor:
+    m, num_scales = scales.shape
+    aligned_num = round_up(num_scales, 4)
+    if aligned_num > num_scales:
+        scales = F.pad(scales, (0, aligned_num - num_scales),
+                       mode='constant', value=0)
+    scales_fp8 = scales.to(torch.float8_e4m3fn)
+    scales_u8 = scales_fp8.view(torch.uint8).to(torch.int32)
+    scales_packed = scales_u8.view(m, -1, 4)
+    result = (scales_packed[:, :, 0]
+              | (scales_packed[:, :, 1] << 8)
+              | (scales_packed[:, :, 2] << 16)
+              | (scales_packed[:, :, 3] << 24))
+    if num_scales < aligned_num:
+        return result[:, :num_scales // 4].contiguous()
+    return result
+
+
+def _unpack_fp8_scales(
+    packed: torch.Tensor, num_scales: int,
+) -> torch.Tensor:
+    m = packed.shape[0]
+    b0 = packed & 0xFF
+    b1 = (packed >> 8) & 0xFF
+    b2 = (packed >> 16) & 0xFF
+    b3 = (packed >> 24) & 0xFF
+    unpacked = torch.stack([b0, b1, b2, b3], dim=-1).view(m, -1)
+    unpacked = unpacked[:, :num_scales]
+    return unpacked.to(torch.uint8).view(torch.float8_e4m3fn)
+
+
+@torch.compile(dynamic=True)
+def per_token_cast_to_nvfp4(
+    x: torch.Tensor,
+    global_scale: torch.Tensor | None = None,
+    use_fp8_sf: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert x.dim() == 2
+    m, n = x.shape
+    if global_scale is not None:
+        x = x / global_scale
+    aligned_n = round_up(n, 16)
+    x_padded = F.pad(x, (0, aligned_n - n), mode='constant', value=0)
+    x_padded_view = x_padded.view(m, -1, 16)
+    x_amax = x_padded_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
+    x_scaled = (x_padded_view * (6.0 / x_amax.unsqueeze(2))).float()
+    x_e2m1 = _float_to_e2m1_packed(x_scaled.view(m, aligned_n))[:, :n // 2]
+    scales = (x_amax / 6.0).view(m, -1)
+    if use_fp8_sf:
+        scales = _pack_fp8_scales(scales)
+    return x_e2m1.contiguous(), scales
 
 
 class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
@@ -110,8 +184,8 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         defer_input_quant: bool,
     ) -> Callable:
         if self.use_nvfp4_dispatch and token_scales is None:
-            tokens, token_scales = deep_ep.per_token_cast_to_nvfp4(
-                tokens, use_fp8_sf=True)
+            tokens, token_scales = per_token_cast_to_nvfp4(
+                tokens, global_scale=a1_scale, use_fp8_sf=True)
 
         has_scales = token_scales is not None
 
@@ -221,6 +295,11 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         expert_tokens_meta = mk.ExpertTokensMetadata.make_from_list(
             recv_expert_num_tokens, device=expert_x.device,
         )
+
+        if self.use_nvfp4_dispatch and expert_x_scale is not None:
+            num_scales = expert_x.shape[1] // 8  # H/2 packed → H/16 groups
+            expert_x_scale = _unpack_fp8_scales(
+                expert_x_scale, num_scales)
 
         if (not quant_config.is_block_quantized
                 and not defer_input_quant
