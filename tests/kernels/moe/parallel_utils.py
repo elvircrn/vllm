@@ -214,6 +214,7 @@ class DeepEPV2Args:
     hidden_size: int
     max_tokens_per_rank: int
     use_fp8_dispatch: bool
+    use_nvfp4_dispatch: bool = False
 
 
 def make_deepep_v2_a2a(
@@ -231,6 +232,8 @@ def make_deepep_v2_a2a(
         hidden=v2_args.hidden_size,
         num_topk=v2_args.num_topk,
         use_fp8_dispatch=v2_args.use_fp8_dispatch,
+        use_nvfp4_dispatch=v2_args.use_nvfp4_dispatch,
+        use_fp8_sf=v2_args.use_nvfp4_dispatch,
         explicitly_destroy=True,
     )
     return DeepEPV2PrepareAndFinalize(
@@ -241,5 +244,6 @@ def make_deepep_v2_a2a(
         num_experts=v2_args.num_experts,
         num_topk=v2_args.num_topk,
         use_fp8_dispatch=v2_args.use_fp8_dispatch,
+        use_nvfp4_dispatch=v2_args.use_nvfp4_dispatch,
         use_cudagraph=use_cudagraph,
     )
