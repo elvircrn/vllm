@@ -181,8 +181,6 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         defer_input_quant: bool,
     ) -> Callable:
         if self.use_nvfp4_dispatch and token_scales is None:
-            if a1_scale is not None:
-                tokens = tokens / a1_scale
             tokens, token_scales = per_token_cast_to_nvfp4(
                 tokens, use_fp8_sf=True)
 
