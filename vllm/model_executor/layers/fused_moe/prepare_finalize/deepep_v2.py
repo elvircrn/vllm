@@ -73,13 +73,10 @@ def _unpack_fp8_scales(
 @torch.compile(dynamic=True)
 def per_token_cast_to_nvfp4(
     x: torch.Tensor,
-    global_scale: torch.Tensor | None = None,
     use_fp8_sf: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2
     m, n = x.shape
-    if global_scale is not None:
-        x = x / global_scale
     aligned_n = round_up(n, 16)
     x_padded = F.pad(x, (0, aligned_n - n), mode='constant', value=0)
     x_padded_view = x_padded.view(m, -1, 16)
@@ -184,8 +181,10 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         defer_input_quant: bool,
     ) -> Callable:
         if self.use_nvfp4_dispatch and token_scales is None:
+            if a1_scale is not None:
+                tokens = tokens / a1_scale
             tokens, token_scales = per_token_cast_to_nvfp4(
-                tokens, global_scale=a1_scale, use_fp8_sf=True)
+                tokens, use_fp8_sf=True)
 
         has_scales = token_scales is not None
 
