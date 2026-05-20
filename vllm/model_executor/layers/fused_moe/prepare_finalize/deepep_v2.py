@@ -155,7 +155,6 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 quant_dtype=quant_config.quant_dtype,
                 per_act_token_quant=False,
                 block_shape=quant_config.block_shape,
-                is_scale_swizzled=quant_config.is_scale_swizzled,
             )
             token_scales = _pack_fp8_scales(token_scales)
 
