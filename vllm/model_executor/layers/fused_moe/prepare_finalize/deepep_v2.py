@@ -19,39 +19,26 @@ from vllm.v1.worker.ubatching import (
 )
 
 
-# per_token_cast_to_nvfp4 output layout:
-#   data:   uint8  [M, H/2]   — two e2m1 nibbles packed per byte
-#   scales: int32  [M, H/64]  — four fp8_e4m3fn scales packed per int32
-#                                int32 = s0 | (s1<<8) | (s2<<16) | (s3<<24)
-
-
-def _float_to_e2m1_packed(x: torch.Tensor) -> torch.Tensor:
-    assert x.dim() == 2 and x.shape[1] % 2 == 0
-    m, n = x.shape
-    abs_x = x.abs()
-    sign = (x < 0).to(torch.uint8)
-    abs_x_log2 = torch.log2(abs_x.clamp(min=2**-10))
-    exp = torch.floor(abs_x_log2 + 1).clamp(0, 3).to(torch.uint8)
-    mant = ((abs_x_log2 + 1 - exp.float()) > 0.5).to(torch.uint8)
-    nibbles = (sign << 3) | (exp << 1) | mant
-    even = nibbles[:, 0::2]
-    odd = nibbles[:, 1::2]
-    return (even | (odd << 4)).to(torch.uint8)
+# DeepEP v2 nvfp4 dispatch scale packing:
+#   scales: int32 [M, H/64] — four fp8_e4m3fn bytes packed per int32
+#           int32 = s0 | (s1<<8) | (s2<<16) | (s3<<24)
 
 
 def _pack_fp8_scales(scales: torch.Tensor) -> torch.Tensor:
     m, num_scales = scales.shape
+    if scales.dtype != torch.uint8:
+        if scales.dtype != torch.float8_e4m3fn:
+            scales = scales.to(torch.float8_e4m3fn)
+        scales = scales.view(torch.uint8)
     aligned_num = round_up(num_scales, 4)
     if aligned_num > num_scales:
         scales = F.pad(scales, (0, aligned_num - num_scales),
                        mode='constant', value=0)
-    scales_fp8 = scales.to(torch.float8_e4m3fn)
-    scales_u8 = scales_fp8.view(torch.uint8).to(torch.int32)
-    scales_packed = scales_u8.view(m, -1, 4)
-    result = (scales_packed[:, :, 0]
-              | (scales_packed[:, :, 1] << 8)
-              | (scales_packed[:, :, 2] << 16)
-              | (scales_packed[:, :, 3] << 24))
+    scales_i32 = scales.to(torch.int32).view(m, -1, 4)
+    result = (scales_i32[:, :, 0]
+              | (scales_i32[:, :, 1] << 8)
+              | (scales_i32[:, :, 2] << 16)
+              | (scales_i32[:, :, 3] << 24))
     if num_scales < aligned_num:
         return result[:, :num_scales // 4].contiguous()
     return result
@@ -68,25 +55,6 @@ def _unpack_fp8_scales(
     unpacked = torch.stack([b0, b1, b2, b3], dim=-1).view(m, -1)
     unpacked = unpacked[:, :num_scales]
     return unpacked.to(torch.uint8).view(torch.float8_e4m3fn)
-
-
-@torch.compile(dynamic=True)
-def per_token_cast_to_nvfp4(
-    x: torch.Tensor,
-    use_fp8_sf: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    assert x.dim() == 2
-    m, n = x.shape
-    aligned_n = round_up(n, 16)
-    x_padded = F.pad(x, (0, aligned_n - n), mode='constant', value=0)
-    x_padded_view = x_padded.view(m, -1, 16)
-    x_amax = x_padded_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
-    x_scaled = (x_padded_view * (6.0 / x_amax.unsqueeze(2))).float()
-    x_e2m1 = _float_to_e2m1_packed(x_scaled.view(m, aligned_n))[:, :n // 2]
-    scales = (x_amax / 6.0).view(m, -1)
-    if use_fp8_sf:
-        scales = _pack_fp8_scales(scales)
-    return x_e2m1.contiguous(), scales
 
 
 class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
@@ -181,8 +149,15 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         defer_input_quant: bool,
     ) -> Callable:
         if self.use_nvfp4_dispatch and token_scales is None:
-            tokens, token_scales = per_token_cast_to_nvfp4(
-                tokens, use_fp8_sf=True)
+            tokens, token_scales = moe_kernel_quantize_input(
+                tokens,
+                a1_scale,
+                quant_dtype=quant_config.quant_dtype,
+                per_act_token_quant=False,
+                block_shape=quant_config.block_shape,
+                is_scale_swizzled=quant_config.is_scale_swizzled,
+            )
+            token_scales = _pack_fp8_scales(token_scales)
 
         has_scales = token_scales is not None
 
