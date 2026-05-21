@@ -8,6 +8,7 @@ from vllm.config import CacheConfig
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.models.nan_check_helper import mark_attn as _nan_mark_attn
 
 
 @dataclass
@@ -115,6 +116,10 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         )
 
         self.prefix = prefix
+        try:
+            self._nan_layer_idx = int(prefix.split(".")[-2])
+        except (ValueError, IndexError):
+            self._nan_layer_idx = -1
 
     def forward(
         self,
@@ -137,11 +142,13 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             )
 
             qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+            _nan_mark_attn(qkv_lora, 0, self._nan_layer_idx)
             q_c, kv_lora = qkv_lora.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 dim=-1,
             )
             q_c = self.q_a_layernorm(q_c)
+            _nan_mark_attn(q_c, 1, self._nan_layer_idx)
             q = self.q_b_proj(q_c)[0]
         else:
             assert self.kv_a_proj_with_mqa is not None, (
@@ -152,11 +159,16 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             )
             kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
             q = self.q_proj(hidden_states)[0]
+            _nan_mark_attn(q, 0, self._nan_layer_idx)
+            _nan_mark_attn(q, 1, self._nan_layer_idx)
 
         kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        _nan_mark_attn(kv_c, 21, self._nan_layer_idx)
         kv_c_normed = self.kv_a_layernorm(kv_c)
+        _nan_mark_attn(kv_c_normed, 2, self._nan_layer_idx)
 
         q = q.view(-1, self.num_heads, self.qk_head_dim)
+        _nan_mark_attn(k_pe, 22, self._nan_layer_idx)
         # Add head dim of 1 to k_pe
         k_pe = k_pe.unsqueeze(1)
 
@@ -164,6 +176,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
                 positions, q[..., self.qk_nope_head_dim :], k_pe
             )
+        _nan_mark_attn(q, 3, self._nan_layer_idx)
 
         if self.indexer and self.is_sparse and not self.skip_topk:
             self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
@@ -177,5 +190,8 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             k_pe,
             output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
         )
+        _nan_mark_attn(attn_out, 4, self._nan_layer_idx)
 
-        return self.o_proj(attn_out)[0]
+        out = self.o_proj(attn_out)[0]
+        _nan_mark_attn(out, 5, self._nan_layer_idx)
+        return out
