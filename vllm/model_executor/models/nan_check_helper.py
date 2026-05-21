@@ -6,14 +6,23 @@ Per-layer checks write NaN and Inf counts to GPU tensors
 (no .item(), no sync, no graph break).
 compute_logits runs outside torch.compile and reads the counts.
 Only tracks REAL token NaN (non-padded). Padding NaN is ignored entirely.
-Writes to stderr + Lustre file.
+Writes to stderr + log file (VLLM_NAN_LOG_DIR or system temp dir).
 """
 
 import datetime
 import os
 import sys
+import tempfile
 
 import torch
+
+def _nan_log_dir() -> str:
+    d = os.environ.get("VLLM_NAN_LOG_DIR") or os.path.join(
+        tempfile.gettempdir(), "vllm_nan_check"
+    )
+    os.makedirs(d, exist_ok=True)
+    return d
+
 
 _nan_reported = False
 _inf_reported = False
@@ -451,8 +460,7 @@ def _emit_scales(tag: str) -> None:
 def _get_log():
     global _log_fh
     if _log_fh is None:
-        log_dir = "/mnt/lustre/vllm-vlm-elvircrn/logs/nan_check"
-        os.makedirs(log_dir, exist_ok=True)
+        log_dir = _nan_log_dir()
         hostname = os.environ.get("HOSTNAME", "unknown")
         gpu = os.environ.get("CUDA_VISIBLE_DEVICES", "x")
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -469,8 +477,7 @@ _pad_log_fh = None
 def _get_pad_log():
     global _pad_log_fh
     if _pad_log_fh is None:
-        log_dir = "/mnt/lustre/vllm-vlm-elvircrn/logs/nan_check"
-        os.makedirs(log_dir, exist_ok=True)
+        log_dir = _nan_log_dir()
         hostname = os.environ.get("HOSTNAME", "unknown")
         gpu = os.environ.get("CUDA_VISIBLE_DEVICES", "x")
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -734,7 +741,7 @@ def _dump_repro(
     stash_layer = _stash_layer_idx[B].item()
     meta = _stashed_metadata.get(B, {})
 
-    log_dir = "/mnt/lustre/vllm-vlm-elvircrn/logs/nan_check"
+    log_dir = _nan_log_dir()
     hostname = os.environ.get("HOSTNAME", "unknown")
     gpu = os.environ.get("CUDA_VISIBLE_DEVICES", "x")
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
