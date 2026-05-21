@@ -28,11 +28,6 @@ SRC_DIR = "/opt/vllm-source/csrc"
 BUILD_DIR = "/tmp/jit_build/cache_nan"
 os.makedirs(BUILD_DIR, exist_ok=True)
 
-# Normalize arch list — torch JIT doesn't understand "10.0f" (cmake-only syntax)
-arch = os.environ.get("TORCH_CUDA_ARCH_LIST", "")
-if arch:
-    os.environ["TORCH_CUDA_ARCH_LIST"] = "10.0a"
-
 BINDING_SRC = textwrap.dedent("""\
     #include <torch/extension.h>
     #include <c10/util/Optional.h>
