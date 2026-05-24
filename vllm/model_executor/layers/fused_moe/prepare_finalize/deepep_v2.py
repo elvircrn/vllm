@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Callable
 
 import deep_ep
@@ -125,7 +126,11 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
         # Decode: do_expand=False + do_cpu_sync=False (cudagraph-safe)
         # Prefill: do_expand=True + do_cpu_sync=True (memory-efficient)
-        do_expand = not self.use_cudagraph
+        force_expand = os.environ.get("VLLM_DEEPEP_V2_FORCE_EXPAND")
+        if force_expand is not None:
+            do_expand = force_expand == "1"
+        else:
+            do_expand = not self.use_cudagraph
         do_cpu_sync = not self.use_cudagraph
 
         (
