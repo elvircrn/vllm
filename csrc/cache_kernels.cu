@@ -402,7 +402,8 @@ __global__ void concat_and_cache_mla_kernel(
     const int kv_lora_rank,                    //
     const int pe_dim,                          //
     const int block_size,                      //
-    const float* scale                         //
+    const float* scale,                        //
+    const int32_t* __restrict__ debug_meta     // [8] optional, nullptr if unused
 ) {
   const int64_t token_idx = blockIdx.x;
   const int64_t slot_idx = slot_mapping[token_idx];
@@ -810,7 +811,8 @@ void reshape_and_cache_flash(
           reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),              \
           slot_mapping.data_ptr<int64_t>(), block_stride, entry_stride, \
           kv_c_stride, k_pe_stride, kv_lora_rank, pe_dim, block_size,   \
-          reinterpret_cast<const float*>(scale.data_ptr()));
+          reinterpret_cast<const float*>(scale.data_ptr()),              \
+          debug_ptr);
 
 // KV_T is the data type of key and value tensors.
 // CACHE_T is the stored data type of kv-cache.
@@ -830,7 +832,12 @@ void concat_and_cache_mla(
     torch::Tensor& kv_cache,      // [num_blocks, block_size, (kv_lora_rank +
                                   // pe_dim)]
     torch::Tensor& slot_mapping,  // [num_tokens] or [num_actual_tokens]
-    const std::string& kv_cache_dtype, torch::Tensor& scale) {
+    const std::string& kv_cache_dtype, torch::Tensor& scale,
+    const std::optional<torch::Tensor>& debug_meta) {
+  const int32_t* debug_ptr = debug_meta.has_value()
+      ? debug_meta.value().data_ptr<int32_t>()
+      : nullptr;
+
   // NOTE(woosuk): In vLLM V1, key.size(0) can be different from
   // slot_mapping.size(0) because of padding for CUDA graphs.
   // In vLLM V0, key.size(0) is always equal to slot_mapping.size(0) because
