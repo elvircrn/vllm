@@ -635,7 +635,8 @@ class FusedMoE(PluggableLayer):
         # DeepEP all2all backend.
         routing_tables = self._maybe_init_expert_routing_tables()
         prepare_finalize = self.base_quant_method.maybe_make_prepare_finalize(
-            routing_tables=routing_tables
+            routing_tables=routing_tables,
+            layer_name=self.layer_name,
         )
         if prepare_finalize is not None:
             logger.debug(

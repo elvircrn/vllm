@@ -106,6 +106,7 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
             not moe_parallel_config.use_all2all_kernels
             or moe_parallel_config.use_ag_rs_all2all_kernels
             or moe_parallel_config.use_deepep_v2_kernels
+            or moe_parallel_config.use_hybrid_v2_kernels
         ) and not moe_parallel_config.enable_eplb
 
     @staticmethod

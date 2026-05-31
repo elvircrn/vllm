@@ -144,6 +144,19 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     self.cpu_group, tcp_store_group,
                     device_group=self.device_group,
                 )
+            elif self.all2all_backend == "hybrid_v2":
+                from .all2all import (
+                    DeepEPLLAll2AllManager,
+                    DeepEPV2All2AllManager,
+                )
+
+                self.all2all_manager = DeepEPV2All2AllManager(
+                    self.cpu_group, tcp_store_group,
+                    device_group=self.device_group,
+                )
+                self.all2all_manager_ll = DeepEPLLAll2AllManager(
+                    self.cpu_group, tcp_store_group
+                )
             elif self.all2all_backend == "nixl_ep":
                 from .all2all import NixlEPAll2AllManager
 

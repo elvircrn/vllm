@@ -1071,6 +1071,10 @@ class FusedMoEParallelConfig:
     def use_deepep_v2_kernels(self):
         return self.use_all2all_kernels and self.all2all_backend == "deepep_v2"
 
+    @property
+    def use_hybrid_v2_kernels(self):
+        return self.use_all2all_kernels and self.all2all_backend == "hybrid_v2"
+
     @staticmethod
     def flatten_tp_across_dp_and_pcp(
         tp_size: int, dp_size: int, dp_rank: int, pcp_size: int, pcp_rank: int
@@ -1361,6 +1365,10 @@ class FusedMoEConfig:
     @property
     def use_deepep_v2_kernels(self):
         return self.moe_parallel_config.use_deepep_v2_kernels
+
+    @property
+    def use_hybrid_v2_kernels(self):
+        return self.moe_parallel_config.use_hybrid_v2_kernels
 
     @property
     def needs_round_robin_routing_tables(self):

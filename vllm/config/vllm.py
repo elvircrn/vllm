@@ -1232,6 +1232,7 @@ class VllmConfig:
                 "deepep_low_latency",
                 "deepep_high_throughput",
                 "deepep_v2",
+                "hybrid_v2",
             ], (
                 "Microbatching currently only supports the deepep_low_latency, "
                 "deepep_high_throughput, and deepep_v2 all2all backends. "

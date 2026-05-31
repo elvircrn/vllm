@@ -99,11 +99,13 @@ class FusedMoEMethodBase(QuantizeMethodBase):
     def maybe_make_prepare_finalize(
         self,
         routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        layer_name: str | None = None,
     ) -> FusedMoEPrepareAndFinalizeModular | None:
         from .all2all_utils import maybe_make_prepare_finalize
 
         pf = maybe_make_prepare_finalize(
-            self.moe, self.moe_quant_config, routing_tables
+            self.moe, self.moe_quant_config, routing_tables,
+            layer_name=layer_name,
         )
         assert pf is None or isinstance(pf, FusedMoEPrepareAndFinalizeModular)
         return pf

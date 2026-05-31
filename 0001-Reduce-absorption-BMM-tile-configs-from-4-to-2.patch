@@ -1,0 +1,126 @@
+From e9a563397d4a7fb8b77a68de4515dcfcb835634b Mon Sep 17 00:00:00 2001
+From: Elvir Crncevic <ecrncevi@nvidia.com>
+Date: Thu, 23 Apr 2026 11:37:32 +0000
+Subject: [PATCH] Reduce absorption BMM tile configs from 4 to 2
+
+Benchmarking on GB200 shows M<=512 is launch-latency dominated
+(~15-18us regardless of tile config). The M16 and M256 configs
+provide no measurable benefit over M64 and Default.
+
+Drop from 4 tile configs to 2 per variant (M<=64 and M>64),
+cutting CUTLASS template instantiations from 8 to 4.
+
+Co-Authored-By: Claude Sonnet 4 <noreply@anthropic.com>
+---
+ csrc/mla/cutlass_absorption_bmm_bf16_sm100.cu | 22 ++-----------------
+ csrc/mla/cutlass_absorption_bmm_sm100.cu      | 22 ++-----------------
+ 2 files changed, 4 insertions(+), 40 deletions(-)
+
+diff --git a/csrc/mla/cutlass_absorption_bmm_bf16_sm100.cu b/csrc/mla/cutlass_absorption_bmm_bf16_sm100.cu
+index c08b69dbd..85b868931 100644
+--- a/csrc/mla/cutlass_absorption_bmm_bf16_sm100.cu
++++ b/csrc/mla/cutlass_absorption_bmm_bf16_sm100.cu
+@@ -166,29 +166,17 @@ using OutType = cutlass::float_e4m3_t;
+ using KS = cutlass::gemm::collective::KernelScheduleAuto;
+ using ES = cutlass::epilogue::collective::EpilogueScheduleAuto;
+ 
+-// M > 256
++// M > 64
+ using BmmGemm_BF16_Default =
+     cutlass_3x_bmm_sm100_bf16<InType, OutType, c3x::ScaledEpilogue,
+                               Shape<_256, _128, _128>, Shape<_2, _2, _1>, KS,
+                               ES>;
+ 
+-// 64 < M <= 256
+-using BmmGemm_BF16_M256 =
+-    cutlass_3x_bmm_sm100_bf16<InType, OutType, c3x::ScaledEpilogue,
+-                              Shape<_128, _128, _128>, Shape<_2, _1, _1>, KS,
+-                              ES>;
+-
+ // M <= 64
+ using BmmGemm_BF16_M64 =
+     cutlass_3x_bmm_sm100_bf16<InType, OutType, c3x::ScaledEpilogue,
+                               Shape<_64, _64, _128>, Shape<_1, _1, _1>, KS, ES>;
+ 
+-// M <= 16
+-using BmmGemm_BF16_M16 =
+-    cutlass_3x_bmm_sm100_bf16<InType, OutType, c3x::ScaledEpilogue,
+-                              Shape<_128, _32, _128>, Shape<_1, _1, _1>, KS,
+-                              ES>;
+-
+ }  // namespace vllm
+ 
+ // ============================================================
+@@ -223,15 +211,9 @@ void mla_absorption_bmm_bf16(torch::Tensor& out, torch::Tensor const& a,
+ 
+   uint32_t M = a.size(1);
+ 
+-  if (M <= 16) {
+-    return vllm::cutlass_bmm_caller_sm100_bf16<vllm::BmmGemm_BF16_M16>(
+-        out, a, b, scale_a, scale_b);
+-  } else if (M <= 64) {
++  if (M <= 64) {
+     return vllm::cutlass_bmm_caller_sm100_bf16<vllm::BmmGemm_BF16_M64>(
+         out, a, b, scale_a, scale_b);
+-  } else if (M <= 256) {
+-    return vllm::cutlass_bmm_caller_sm100_bf16<vllm::BmmGemm_BF16_M256>(
+-        out, a, b, scale_a, scale_b);
+   } else {
+     return vllm::cutlass_bmm_caller_sm100_bf16<vllm::BmmGemm_BF16_Default>(
+         out, a, b, scale_a, scale_b);
+diff --git a/csrc/mla/cutlass_absorption_bmm_sm100.cu b/csrc/mla/cutlass_absorption_bmm_sm100.cu
+index 9d4f90673..be0e46108 100644
+--- a/csrc/mla/cutlass_absorption_bmm_sm100.cu
++++ b/csrc/mla/cutlass_absorption_bmm_sm100.cu
+@@ -111,30 +111,18 @@ using OutType = cutlass::float_e4m3_t;
+ using KS = cutlass::gemm::collective::KernelScheduleAuto;
+ using ES = cutlass::epilogue::collective::EpilogueScheduleAuto;
+ 
+-// M > 256
++// M > 64
+ using BmmGemm_Default =
+     cutlass_3x_gemm_sm100_fp8<InType, OutType, c3x::ScaledEpilogue,
+                               Shape<_256, _128, _128>, Shape<_2, _2, _1>, KS,
+                               ES, false>;
+ 
+-// 64 < M <= 256
+-using BmmGemm_M256 =
+-    cutlass_3x_gemm_sm100_fp8<InType, OutType, c3x::ScaledEpilogue,
+-                              Shape<_128, _128, _128>, Shape<_2, _1, _1>, KS,
+-                              ES, false>;
+-
+ // M <= 64
+ using BmmGemm_M64 =
+     cutlass_3x_gemm_sm100_fp8<InType, OutType, c3x::ScaledEpilogue,
+                               Shape<_64, _64, _128>, Shape<_1, _1, _1>, KS, ES,
+                               false>;
+ 
+-// M <= 16
+-using BmmGemm_M16 =
+-    cutlass_3x_gemm_sm100_fp8<InType, OutType, c3x::ScaledEpilogue,
+-                              Shape<_128, _32, _128>, Shape<_1, _1, _1>, KS, ES,
+-                              false>;
+-
+ }  // namespace vllm
+ 
+ // ============================================================
+@@ -169,15 +157,9 @@ void mla_absorption_bmm(torch::Tensor& out, torch::Tensor const& a,
+ 
+   uint32_t M = a.size(1);
+ 
+-  if (M <= 16) {
+-    return vllm::cutlass_bmm_caller_sm100_fp8<vllm::BmmGemm_M16>(
+-        out, a, b, scale_a, scale_b);
+-  } else if (M <= 64) {
++  if (M <= 64) {
+     return vllm::cutlass_bmm_caller_sm100_fp8<vllm::BmmGemm_M64>(
+         out, a, b, scale_a, scale_b);
+-  } else if (M <= 256) {
+-    return vllm::cutlass_bmm_caller_sm100_fp8<vllm::BmmGemm_M256>(
+-        out, a, b, scale_a, scale_b);
+   } else {
+     return vllm::cutlass_bmm_caller_sm100_fp8<vllm::BmmGemm_Default>(
+         out, a, b, scale_a, scale_b);
+-- 
+2.43.0
+

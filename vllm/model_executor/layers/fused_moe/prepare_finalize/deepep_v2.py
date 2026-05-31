@@ -6,6 +6,7 @@ from collections.abc import Callable
 import deep_ep
 import torch
 
+from vllm import envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
@@ -147,6 +148,7 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             do_expand=do_expand,
             do_cpu_sync=do_cpu_sync,
             async_with_compute_stream=False,
+            skip_prologue_barrier=envs.VLLM_DEEPEP_V2_SKIP_PROLOGUE_BARRIER,
         )
 
         a2a_idx = dbo_current_ubatch_id()

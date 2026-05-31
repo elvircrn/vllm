@@ -90,6 +90,16 @@ def maybe_roundup_layer_hidden_size(
             hidden_size, act_dtype
         )
 
+    if moe_parallel_config.use_hybrid_v2_kernels:
+        hidden_size = max(
+            DeepEPLLPrepareAndFinalize.maybe_roundup_layer_hidden_size(
+                hidden_size
+            ),
+            DeepEPV2PrepareAndFinalize.maybe_roundup_layer_hidden_size(
+                hidden_size, act_dtype
+            ),
+        )
+
     if moe_parallel_config.use_nixl_ep_kernels:
         hidden_size = NixlEPPrepareAndFinalize.maybe_roundup_layer_hidden_size(
             hidden_size
@@ -98,12 +108,16 @@ def maybe_roundup_layer_hidden_size(
     return hidden_size
 
 
+_hybrid_v2_ll_assigned: bool = False
+
+
 def maybe_make_prepare_finalize(
     moe: FusedMoEConfig,
     quant_config: FusedMoEQuantConfig | None,
     routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     allow_new_interface: bool = False,
     use_monolithic: bool = False,
+    layer_name: str | None = None,
 ) -> FusedMoEPrepareAndFinalize | None:
     # NOTE(rob): we are migrating each quant_method to hold the MK
     # in all cases. The allow_new_interface=False flag allow us to fall
@@ -228,6 +242,76 @@ def maybe_make_prepare_finalize(
             use_nvfp4_dispatch=use_nvfp4_dispatch,
             use_cudagraph=use_cudagraph,
         )
+
+    elif moe.use_hybrid_v2_kernels:
+        global _hybrid_v2_ll_assigned
+
+        use_ll = not _hybrid_v2_ll_assigned
+
+        if use_ll:
+            _hybrid_v2_ll_assigned = True
+            all2all_manager_ll = device_communicator.all2all_manager_ll
+            assert all2all_manager_ll is not None
+            assert quant_config is not None
+            all_to_all_args = dict(
+                max_num_tokens_per_dp_rank=moe.max_num_tokens,
+                token_hidden_size=moe.hidden_dim,
+                num_ep_ranks=all2all_manager_ll.world_size,
+                num_global_experts=moe.num_experts,
+                num_local_experts=moe.num_experts // all2all_manager_ll.world_size,
+            )
+            handle = all2all_manager_ll.get_handle(all_to_all_args)
+            use_fp8_dispatch = (
+                quant_config.quant_dtype == current_platform.fp8_dtype()
+                and quant_config.block_shape == DEEPEP_QUANT_BLOCK_SHAPE
+            )
+            prepare_finalize = DeepEPLLPrepareAndFinalize(
+                handle,
+                max_tokens_per_rank=moe.max_num_tokens,
+                num_dispatchers=all2all_manager_ll.world_size,
+                use_fp8_dispatch=use_fp8_dispatch,
+            )
+            logger.info(
+                "hybrid_v2: first MoE layer using DeepEP LL (%s)",
+                layer_name,
+            )
+        else:
+            assert moe.dp_size == all2all_manager.dp_world_size
+            use_fp8_dispatch = (
+                quant_config is not None
+                and quant_config.quant_dtype == current_platform.fp8_dtype()
+                and quant_config.is_block_quantized
+            )
+            use_nvfp4_dispatch = (
+                quant_config is not None
+                and quant_config.quant_dtype == "nvfp4"
+            )
+            all_to_all_args = dict(
+                num_max_tokens_per_rank=moe.max_num_tokens,
+                hidden=moe.hidden_dim,
+                num_topk=moe.experts_per_token,
+                num_experts=moe.num_experts,
+                use_fp8_dispatch=use_fp8_dispatch,
+                use_nvfp4_dispatch=use_nvfp4_dispatch,
+            )
+            handle = all2all_manager.get_handle(all_to_all_args)
+            vllm_config = get_current_vllm_config()
+            use_cudagraph = not vllm_config.model_config.enforce_eager
+            prepare_finalize = DeepEPV2PrepareAndFinalize(
+                buffer=handle,
+                num_dispatchers=all2all_manager.world_size,
+                dp_size=all2all_manager.dp_world_size,
+                rank_expert_offset=all2all_manager.rank * moe.num_local_experts,
+                num_experts=moe.num_experts,
+                num_topk=moe.experts_per_token,
+                use_fp8_dispatch=use_fp8_dispatch,
+                use_nvfp4_dispatch=use_nvfp4_dispatch,
+                use_cudagraph=use_cudagraph,
+            )
+            logger.info(
+                "hybrid_v2: layer using DeepEP V2 (%s)",
+                layer_name,
+            )
 
     elif moe.use_mori_kernels:
         assert quant_config is not None

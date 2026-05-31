@@ -93,7 +93,8 @@ def _get_priority_backends(
     if (
         current_platform.is_cuda()
         and current_platform.is_device_capability_family(100)
-        and moe_config.moe_parallel_config.use_deepep_v2_kernels
+        and (moe_config.moe_parallel_config.use_deepep_v2_kernels
+             or moe_config.moe_parallel_config.use_hybrid_v2_kernels)
         and activation_key == kFp8Dynamic128Sym
         and weight_key == kFp8Static128BlockSym
     ):
