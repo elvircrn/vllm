@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
 from collections.abc import Callable
+from typing import Any
 
 import deep_ep
 import torch
@@ -134,13 +135,7 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             do_expand = not self.use_cudagraph
         do_cpu_sync = not self.use_cudagraph
 
-        (
-            recv_x,
-            recv_topk_idx,
-            recv_topk_weights,
-            handle,
-            event,
-        ) = self.buffer.dispatch(
+        dispatch_kwargs: dict[str, Any] = dict(
             x=token_data,
             topk_idx=rank_topk_ids,
             topk_weights=rank_topk_weights,
@@ -148,8 +143,17 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             do_expand=do_expand,
             do_cpu_sync=do_cpu_sync,
             async_with_compute_stream=False,
-            skip_prologue_barrier=envs.VLLM_DEEPEP_V2_SKIP_PROLOGUE_BARRIER,
         )
+        if envs.VLLM_DEEPEP_V2_SKIP_PROLOGUE_BARRIER:
+            dispatch_kwargs["skip_prologue_barrier"] = True
+
+        (
+            recv_x,
+            recv_topk_idx,
+            recv_topk_weights,
+            handle,
+            event,
+        ) = self.buffer.dispatch(**dispatch_kwargs)
 
         a2a_idx = dbo_current_ubatch_id()
         self.handles[a2a_idx] = handle
