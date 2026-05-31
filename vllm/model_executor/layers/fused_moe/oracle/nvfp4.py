@@ -494,9 +494,12 @@ def make_nvfp4_moe_kernel(
 
     # Create Experts.
     if prepare_finalize.activation_format == mk.FusedMoEActivationFormat.BatchedExperts:
+        from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_batched_moe import (  # noqa: E501
+            FlashInferCuteDSLBatchedExperts,
+        )
         max_num_tokens = prepare_finalize.max_num_tokens_per_rank()
         assert max_num_tokens is not None
-        experts = experts_cls(
+        experts = FlashInferCuteDSLBatchedExperts(
             moe_config=moe_config,
             quant_config=moe_quant_config,
             max_num_tokens=max_num_tokens,
