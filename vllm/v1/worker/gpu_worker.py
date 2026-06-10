@@ -45,6 +45,7 @@ from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.tracing import instrument
+from vllm.utils.gc_utils import freeze_gc_heap, maybe_attach_gc_debug_callback
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
 from vllm.utils.torch_utils import set_random_seed
@@ -719,6 +720,9 @@ class Worker(WorkerBase):
 
         activate_triton_jit_monitor()
 
+        freeze_gc_heap()
+        maybe_attach_gc_debug_callback()
+
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,
@@ -1034,6 +1038,7 @@ class Worker(WorkerBase):
         torch.accelerator.synchronize()
 
     def shutdown(self) -> None:
+        gc.unfreeze()
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:
             ensure_kv_transfer_shutdown()
