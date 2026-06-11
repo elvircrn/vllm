@@ -473,7 +473,6 @@ class MoERunner(MoERunnerInterface):
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 shared_experts_input=shared_experts_input,
-                shared_experts=self._shared_experts,
             )
 
         self._maybe_apply_shared_experts(

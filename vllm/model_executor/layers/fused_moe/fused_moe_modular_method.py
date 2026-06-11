@@ -29,11 +29,15 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
     # --8<-- [end:modular_fused_moe]
 
     def __init__(
-        self, old_quant_method: FusedMoEMethodBase, moe_kernel: FusedMoEKernel
+        self,
+        old_quant_method: FusedMoEMethodBase,
+        moe_kernel: FusedMoEKernel,
+        shared_experts: SharedExperts | None = None,
     ):
         super().__init__(old_quant_method.moe)
         self.moe_quant_config = old_quant_method.moe_quant_config
         self.moe_kernel = moe_kernel
+        self._shared_experts = shared_experts
         self.disable_expert_map = getattr(
             old_quant_method,
             "disable_expert_map",
@@ -56,6 +60,7 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
                 prepare_finalize,
                 old_quant_method.select_gemm_impl(prepare_finalize, moe_layer),
             ),
+            shared_experts=shared_experts,
         )
 
     @property
@@ -89,7 +94,6 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
-        shared_experts: SharedExperts | None = None,
     ) -> torch.Tensor:
         assert self.moe_kernel is not None
         return self.moe_kernel.apply(
@@ -102,6 +106,6 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
             global_num_experts=layer.global_num_experts,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
             expert_map=None if self.disable_expert_map else layer.expert_map,
-            shared_experts=shared_experts,
+            shared_experts=self._shared_experts,
             shared_experts_input=shared_experts_input,
         )
