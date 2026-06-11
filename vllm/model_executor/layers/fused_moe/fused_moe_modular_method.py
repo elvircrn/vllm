@@ -37,7 +37,7 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
         self.disable_expert_map = getattr(
             old_quant_method,
             "disable_expert_map",
-            not self.moe_kernel.supports_expert_map(),
+            False,
         )
         self.old_quant_method = old_quant_method
         logger.debug("Swapping out %s", self.old_quant_method.__class__.__name__)
