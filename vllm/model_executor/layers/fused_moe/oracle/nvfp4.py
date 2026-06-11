@@ -517,8 +517,6 @@ def make_nvfp4_moe_kernel(
     kernel = mk.FusedMoEKernel(
         prepare_finalize,
         experts,
-        shared_experts=shared_experts,
-        inplace=False,
     )
 
     # TODO(rob): update inplace logic to be part of the kernel.

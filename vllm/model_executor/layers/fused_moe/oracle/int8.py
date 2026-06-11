@@ -214,8 +214,6 @@ def make_int8_moe_kernel(
     kernel = mk.FusedMoEKernel(
         prepare_finalize,
         experts,
-        shared_experts=shared_experts,
-        inplace=not moe_config.disable_inplace,
     )
 
     return kernel

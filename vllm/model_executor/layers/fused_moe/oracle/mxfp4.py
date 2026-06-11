@@ -1540,14 +1540,6 @@ def make_mxfp4_moe_kernel(
     kernel = mk.FusedMoEKernel(
         prepare_finalize,
         experts,
-        shared_experts=(
-            shared_experts
-            if moe_config.moe_parallel_config.use_batched_activation_format
-            else None
-        ),
-        inplace=(
-            not moe_config.disable_inplace and mxfp4_backend not in TRTLLM_BACKENDS
-        ),
     )
 
     return kernel

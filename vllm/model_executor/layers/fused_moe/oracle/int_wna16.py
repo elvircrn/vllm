@@ -202,8 +202,6 @@ def make_wna16_moe_kernel(
     return mk.FusedMoEKernel(
         prepare_finalize,
         experts,
-        shared_experts=shared_experts,
-        inplace=not moe_config.disable_inplace,
     )
 
 
