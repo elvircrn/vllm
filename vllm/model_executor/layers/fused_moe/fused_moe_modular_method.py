@@ -55,8 +55,6 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
             FusedMoEKernel(
                 prepare_finalize,
                 old_quant_method.select_gemm_impl(prepare_finalize, moe_layer),
-                shared_experts=shared_experts,
-                inplace=inplace,
             ),
         )
 

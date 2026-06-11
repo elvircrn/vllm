@@ -190,29 +190,23 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             expert_x, expert_x_scale = recv_x, None
 
         if self.do_expand:
-            if self.use_cudagraph:
-                recv_topk_idx = None
-                recv_topk_weights = None
-            else:
-                # Prefill: build topk_ids from per-expert token counts.
-                total_tokens = sum(recv_expert_num_tokens)
-                if total_tokens > 0:
-                    recv_topk_idx = torch.empty(
-                        total_tokens,
-                        dtype=torch.int64,
-                        device=expert_x.device,
-                    )
-                    offset = 0
-                    for i, count in enumerate(recv_expert_num_tokens):
-                        if count > 0:
-                            recv_topk_idx[offset:offset + count].fill_(
-                                i + self.rank_expert_offset)
-                            offset += count
-                else:
-                    recv_topk_idx = torch.empty(
-                        0, dtype=torch.int64, device=expert_x.device,
-                    )
-                recv_topk_idx = recv_topk_idx.unsqueeze(1)
+            # Build per-row expert IDs from per-expert token counts.
+            # Sized to expert_x.size(0) so cudagraph padding rows get id=0.
+            buf_size = expert_x.size(0)
+            recv_topk_idx = torch.zeros(
+                buf_size, dtype=torch.int64, device=expert_x.device,
+            )
+            offset = 0
+            for i, count in enumerate(recv_expert_num_tokens):
+                if count > 0:
+                    recv_topk_idx[offset:offset + count].fill_(
+                        i + self.rank_expert_offset)
+                    offset += count
+            recv_topk_idx = recv_topk_idx.unsqueeze(1)
+            if recv_topk_weights is None:
+                recv_topk_weights = torch.ones(
+                    buf_size, dtype=torch.float32, device=expert_x.device,
+                )
         else:
             # do_expand=False (decode/cudagraph mode): recv_topk_idx has
             # LOCAL expert IDs (-1 for non-local and padding rows).
