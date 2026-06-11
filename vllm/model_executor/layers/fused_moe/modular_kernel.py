@@ -1102,6 +1102,14 @@ class FusedMoEKernelModularImpl:
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ):
+        logger.debug_once(
+            "MK._maybe_apply_shared_experts: shared_experts=%s, "
+            "shared_experts_input=%s",
+            type(shared_experts).__name__
+            if shared_experts is not None
+            else "None",
+            shared_experts_input is not None,
+        )
         if shared_experts is not None:
             assert self.prepare_finalize.supports_async()
             assert shared_experts_input is not None
