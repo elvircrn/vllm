@@ -41,7 +41,8 @@ __global__ void __launch_bounds__((N_COMPUTE + 1) * 32)
   int const halfDim = static_cast<int>(H);
   int const G = halfDim / SCALE_BLOCK_SIZE;
 
-  extern __shared__ char smem_raw[];
+  static constexpr int kTMAAlignBytes = 32;
+  extern __shared__ __align__(kTMAAlignBytes) int8_t smem_raw[];
   uint64_t* full_mbar = reinterpret_cast<uint64_t*>(smem_raw);
   uint64_t* empty_mbar = &full_mbar[NUM_STAGES];
   int32_t* batch_token_start =
