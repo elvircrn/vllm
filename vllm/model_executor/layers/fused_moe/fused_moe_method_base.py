@@ -163,6 +163,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
+        shared_experts: "SharedExperts | None" = None,
     ) -> torch.Tensor:
         raise NotImplementedError
 
