@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import Any
 
 import torch
@@ -231,6 +232,11 @@ def maybe_make_prepare_finalize(
         vllm_config = get_current_vllm_config()
         use_cudagraph = not vllm_config.model_config.enforce_eager
 
+        force_expand = os.environ.get("VLLM_DEEPEP_V2_DO_EXPAND")
+        do_expand = None
+        if force_expand is not None:
+            do_expand = force_expand == "1"
+
         prepare_finalize = DeepEPV2PrepareAndFinalize(
             buffer=handle,
             num_dispatchers=all2all_manager.world_size,
@@ -241,6 +247,7 @@ def maybe_make_prepare_finalize(
             use_fp8_dispatch=use_fp8_dispatch,
             use_nvfp4_dispatch=use_nvfp4_dispatch,
             use_cudagraph=use_cudagraph,
+            do_expand=do_expand,
         )
 
     elif moe.use_hybrid_v2_kernels:
