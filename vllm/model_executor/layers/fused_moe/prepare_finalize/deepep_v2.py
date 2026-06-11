@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
 from collections.abc import Callable
 from typing import Any
 
@@ -68,6 +67,7 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         use_fp8_dispatch: bool = False,
         use_nvfp4_dispatch: bool = False,
         use_cudagraph: bool = False,
+        do_expand: bool | None = None,
     ):
         super().__init__()
         assert not (use_fp8_dispatch and use_nvfp4_dispatch), \
@@ -81,6 +81,7 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.use_fp8_dispatch = use_fp8_dispatch
         self.use_nvfp4_dispatch = use_nvfp4_dispatch
         self.use_cudagraph = use_cudagraph
+        self.do_expand = do_expand if do_expand is not None else not use_cudagraph
 
         # DBO microbatching: one handle slot per micro-batch.
         self.handles: list[deep_ep.EPHandle | None] = [None, None]
@@ -126,13 +127,7 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         if has_scales:
             token_data = (tokens, token_scales)
 
-        # Decode: do_expand=False + do_cpu_sync=False (cudagraph-safe)
-        # Prefill: do_expand=True + do_cpu_sync=True (memory-efficient)
-        force_expand = os.environ.get("VLLM_DEEPEP_V2_FORCE_EXPAND")
-        if force_expand is not None:
-            do_expand = force_expand == "1"
-        else:
-            do_expand = not self.use_cudagraph
+        do_expand = self.do_expand
         do_cpu_sync = not self.use_cudagraph
 
         dispatch_kwargs: dict[str, Any] = dict(
@@ -194,27 +189,30 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         else:
             expert_x, expert_x_scale = recv_x, None
 
-        if recv_topk_idx is None:
-            # do_expand=True (prefill mode): build topk_ids from
-            # per-expert token counts.
-            total_tokens = sum(recv_expert_num_tokens)
-            if total_tokens > 0:
-                recv_topk_idx = torch.empty(
-                    total_tokens,
-                    dtype=torch.int64,
-                    device=expert_x.device,
-                )
-                offset = 0
-                for i, count in enumerate(recv_expert_num_tokens):
-                    if count > 0:
-                        recv_topk_idx[offset:offset + count].fill_(
-                            i + self.rank_expert_offset)
-                        offset += count
+        if self.do_expand:
+            if self.use_cudagraph:
+                recv_topk_idx = None
+                recv_topk_weights = None
             else:
-                recv_topk_idx = torch.empty(
-                    0, dtype=torch.int64, device=expert_x.device,
-                )
-            recv_topk_idx = recv_topk_idx.unsqueeze(1)
+                # Prefill: build topk_ids from per-expert token counts.
+                total_tokens = sum(recv_expert_num_tokens)
+                if total_tokens > 0:
+                    recv_topk_idx = torch.empty(
+                        total_tokens,
+                        dtype=torch.int64,
+                        device=expert_x.device,
+                    )
+                    offset = 0
+                    for i, count in enumerate(recv_expert_num_tokens):
+                        if count > 0:
+                            recv_topk_idx[offset:offset + count].fill_(
+                                i + self.rank_expert_offset)
+                            offset += count
+                else:
+                    recv_topk_idx = torch.empty(
+                        0, dtype=torch.int64, device=expert_x.device,
+                    )
+                recv_topk_idx = recv_topk_idx.unsqueeze(1)
         else:
             # do_expand=False (decode/cudagraph mode): recv_topk_idx has
             # LOCAL expert IDs (-1 for non-local and padding rows).
