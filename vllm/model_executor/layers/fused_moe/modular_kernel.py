@@ -1105,7 +1105,7 @@ class FusedMoEKernelModularImpl:
         if shared_experts is not None:
             assert self.prepare_finalize.supports_async()
             assert shared_experts_input is not None
-            shared_experts(
+            shared_experts.apply(
                 shared_experts_input,
                 SharedExpertsOrder.MK_INTERNAL_OVERLAPPED,
             )
