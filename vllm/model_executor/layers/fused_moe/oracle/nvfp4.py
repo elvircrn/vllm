@@ -42,6 +42,7 @@ logger = init_logger(__name__)
 
 
 class NvFp4MoeBackend(Enum):
+    FLASHINFER_GROUP_GEMM = "FLASHINFER_GROUP_GEMM"
     FLASHINFER_TRTLLM = "FLASHINFER_TRTLLM"
     FLASHINFER_CUTLASS = "FLASHINFER_CUTLASS"
     FLASHINFER_CUTEDSL = "FLASHINFER_CUTEDSL"
@@ -52,6 +53,7 @@ class NvFp4MoeBackend(Enum):
 
 
 FLASHINFER_NVFP4_MOE_BACKENDS = [
+    NvFp4MoeBackend.FLASHINFER_GROUP_GEMM,
     NvFp4MoeBackend.FLASHINFER_TRTLLM,
     NvFp4MoeBackend.FLASHINFER_CUTLASS,
     NvFp4MoeBackend.FLASHINFER_CUTEDSL,
@@ -76,7 +78,14 @@ def is_global_sf_supported_for_nvfp4_backend(backend: NvFp4MoeBackend) -> bool:
 def backend_to_kernel_cls(
     backend: NvFp4MoeBackend,
 ) -> list[type[mk.FusedMoEExperts]]:
-    if backend == NvFp4MoeBackend.FLASHINFER_TRTLLM:
+    if backend == NvFp4MoeBackend.FLASHINFER_GROUP_GEMM:
+        from vllm.model_executor.layers.fused_moe.experts.flashinfer_group_gemm_nvfp4_moe import (  # noqa: E501
+            FlashInferGroupGemmNvFp4Experts,
+        )
+
+        return [FlashInferGroupGemmNvFp4Experts]
+
+    elif backend == NvFp4MoeBackend.FLASHINFER_TRTLLM:
         from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
             TrtLlmNvFp4ExpertsModular,
             TrtLlmNvFp4ExpertsMonolithic,
@@ -139,6 +148,7 @@ def map_nvfp4_backend(runner_backend: MoEBackend) -> NvFp4MoeBackend:
         "flashinfer_trtllm": NvFp4MoeBackend.FLASHINFER_TRTLLM,
         "flashinfer_cutlass": NvFp4MoeBackend.FLASHINFER_CUTLASS,
         "flashinfer_cutedsl": NvFp4MoeBackend.FLASHINFER_CUTEDSL,
+        "flashinfer_group_gemm": NvFp4MoeBackend.FLASHINFER_GROUP_GEMM,
         "marlin": NvFp4MoeBackend.MARLIN,
         "emulation": NvFp4MoeBackend.EMULATION,
     }
@@ -162,6 +172,7 @@ def select_nvfp4_moe_backend(
 
     # NOTE: the kernels are selected in the following order.
     AVAILABLE_BACKENDS = [
+        NvFp4MoeBackend.FLASHINFER_GROUP_GEMM,
         NvFp4MoeBackend.FLASHINFER_TRTLLM,
         NvFp4MoeBackend.FLASHINFER_CUTEDSL,
         NvFp4MoeBackend.FLASHINFER_CUTEDSL_BATCHED,
@@ -466,6 +477,7 @@ def make_nvfp4_moe_quant_config(
             not in (
                 NvFp4MoeBackend.FLASHINFER_TRTLLM,
                 NvFp4MoeBackend.FLASHINFER_CUTEDSL,
+                NvFp4MoeBackend.FLASHINFER_GROUP_GEMM,
             )
         ),
     )

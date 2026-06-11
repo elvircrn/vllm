@@ -317,6 +317,7 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
         NvFp4MoeBackend.FLASHINFER_CUTLASS,
         NvFp4MoeBackend.FLASHINFER_TRTLLM,
         NvFp4MoeBackend.FLASHINFER_CUTEDSL_BATCHED,
+        NvFp4MoeBackend.FLASHINFER_GROUP_GEMM,
     ]
 
     # Reorder [w1, w3] to [w3, w1] for FI NVFP4 MoE kernels.
@@ -368,6 +369,9 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
             num_experts=w13.size(0),
             is_gated_activation=is_gated,
         )
+    elif backend == NvFp4MoeBackend.FLASHINFER_GROUP_GEMM:
+        # group_gemm uses raw (non-swizzled) block scales — no transformation
+        pass
     else:
         # Swizzle the block scales for other FI NVFP4 MoE kernels.
         w13_scale = swizzle_blockscale(w13_scale)
