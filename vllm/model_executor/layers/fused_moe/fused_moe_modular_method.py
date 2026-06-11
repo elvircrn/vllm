@@ -96,14 +96,6 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         assert self.moe_kernel is not None
-        logger.debug_once(
-            "FusedMoEModularMethod.apply: _shared_experts=%s, "
-            "shared_experts_input=%s",
-            type(self._shared_experts).__name__
-            if self._shared_experts is not None
-            else "None",
-            shared_experts_input is not None,
-        )
         return self.moe_kernel.apply(
             hidden_states=x,
             w1=layer.w13_weight,

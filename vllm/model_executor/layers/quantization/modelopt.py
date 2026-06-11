@@ -989,6 +989,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             global_num_experts=layer.global_num_experts,
             expert_map=layer.expert_map,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            shared_experts=layer.shared_experts,
             shared_experts_input=shared_experts_input,
         )
 
@@ -1483,6 +1484,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             global_num_experts=layer.global_num_experts,
             expert_map=layer.expert_map,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            shared_experts=layer.shared_experts,
             shared_experts_input=shared_experts_input,
         )
 
