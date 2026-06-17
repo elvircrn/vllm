@@ -179,7 +179,7 @@ class FlashInferSSUBackend(MambaSSUBackend):
             out=out,
             rand_seed=rand_seed,
             philox_rounds=self._mamba_config.stochastic_rounding_philox_rounds or 10,
-            algorithm='horizontal'
+            algorithm='vertical'
         )
 
 
