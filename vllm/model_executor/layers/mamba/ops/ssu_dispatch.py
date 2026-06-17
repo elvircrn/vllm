@@ -275,4 +275,5 @@ def selective_state_update(
         num_accepted_tokens=num_accepted_tokens,
         cu_seqlens=cu_seqlens,
         is_blackwell=is_blackwell,
+        algorithm='horizontal'
     )
