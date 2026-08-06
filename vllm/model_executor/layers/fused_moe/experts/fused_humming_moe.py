@@ -501,6 +501,7 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
         activation: MoEActivation,
         output: torch.Tensor,
         input: torch.Tensor,
+        valid_rows: torch.Tensor | None = None,
     ) -> None:
         activation_config = self.activation_config
         if (
@@ -517,6 +518,7 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
                 activation=activation,
                 input=input,
                 output=output,
+                valid_rows=valid_rows,
             )
 
 
@@ -639,10 +641,18 @@ class HummingIndexedExperts(HummingExpertsBase):
             **moe_kwargs1,
         )
 
+        valid_rows = None
+        if (expert_tokens_meta is not None
+                and expert_tokens_meta.psum_recv_per_rank is not None):
+            psum = expert_tokens_meta.psum_recv_per_rank
+            topk = topk_ids.size(1)
+            valid_rows = psum[-1:].to(torch.int64) * topk
+
         self.apply_activation(
             activation=activation,
             input=buffers["gate_up_output"],
             output=buffers["activation_output"],
+            valid_rows=valid_rows,
         )
 
         inputs, input_scale = HummingMethod.may_quant_input(

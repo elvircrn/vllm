@@ -6,10 +6,7 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
-from vllm.model_executor.layers.fused_moe.activation import (
-    MoEActivation,
-    apply_moe_activation_supported,
-)
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEParallelConfig,
@@ -34,6 +31,7 @@ from vllm.model_executor.layers.fused_moe.utils import (
     _resize_cache,
     moe_kernel_quantize_input,
     swiglu_limit_func,
+    uses_whole_tensor_dynamic_scale,
 )
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     is_deep_gemm_e8m0_used,
@@ -71,6 +69,15 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         # higher-precision + activation QDQ.
         self.quantization_emulation = False
         super().__init__(moe_config, quant_config)
+
+        self.gemm1_clamp_limit = quant_config.gemm1_clamp_limit
+        # Gated-activation params: silu == swigluoai with alpha=1, beta=0.
+        self.gemm1_alpha = (
+            quant_config.gemm1_alpha if quant_config.gemm1_alpha is not None else 1.0
+        )
+        self.gemm1_beta = (
+            quant_config.gemm1_beta if quant_config.gemm1_beta is not None else 0.0
+        )
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -130,7 +137,18 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
-        return apply_moe_activation_supported(activation)
+        return activation in [
+            MoEActivation.SILU,
+            MoEActivation.GELU,
+            MoEActivation.GELU_TANH,
+            MoEActivation.SWIGLUOAI,
+            MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+            MoEActivation.SWIGLUSTEP,
+            MoEActivation.SILU_NO_MUL,
+            MoEActivation.GELU_NO_MUL,
+            MoEActivation.GELU_TANH_NO_MUL,
+            MoEActivation.RELU2_NO_MUL,
+        ]
 
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
@@ -153,18 +171,17 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         input: torch.Tensor,
         **kwargs,
     ) -> None:
-        activation_config = self.activation_config
-        if (
-            activation == MoEActivation.SILU
-            and activation_config.clamp_limit is not None
-        ):
-            swiglu_limit_func(output, input, activation_config.clamp_limit)
+        gemm1_clamp_limit = self.quant_config.gemm1_clamp_limit
+        if activation == MoEActivation.SILU and gemm1_clamp_limit is not None:
+            swiglu_limit_func(output, input, float(gemm1_clamp_limit))
             return
 
         # SWIGLUOAI_UNINTERLEAVE routes to the silu_and_mul_with_clamp kernel and
-        # requires a clamp limit. Other activations ignore these parameters.
+        # needs the clamped-SwiGLU params (gemm1_clamp_limit/alpha/beta read from
+        # the quant config in __init__) forwarded; without a clamp_limit it
+        # asserts. Other activations ignore alpha/beta/clamp_limit.
         if activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE:
-            assert activation_config.clamp_limit is not None, (
+            assert gemm1_clamp_limit is not None, (
                 "SWIGLUOAI_UNINTERLEAVE requires gemm1_clamp_limit"
             )
 
@@ -172,6 +189,9 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             activation,
             output,
             input,
+            clamp_limit=gemm1_clamp_limit,
+            alpha=self.gemm1_alpha,
+            beta=self.gemm1_beta,
         )
 
     def workspace_shapes(
@@ -285,6 +305,16 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             workspace13, (num_tokens * top_k_num, cache2_dim)
         )
         intermediate_cache3 = _resize_cache(workspace2, (num_tokens, top_k_num, K))
+
+        if uses_whole_tensor_dynamic_scale(
+            self.quant_dtype, a2_scale, self.per_act_token_quant, self.block_shape
+        ):
+            # The w13 GEMM only writes rows whose expert id is valid, so rows
+            # for topk slots marked -1 (EP non-local experts, all2all padding)
+            # keep whatever the reused workspace held. The a2 scale below is an
+            # amax over the whole tensor, so that stale data would set the scale
+            # for every real token. Zeroing carries through the activation.
+            intermediate_cache1.fill_(0)
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = (
             _prepare_expert_assignment(
@@ -573,6 +603,7 @@ class TritonWNA16Experts(TritonExperts):
 
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
+        # Why?
         return not (
             moe_parallel_config.use_fi_nvl_two_sided_kernels
             or moe_parallel_config.use_fi_nvl_one_sided_kernels
@@ -655,6 +686,13 @@ class TritonWNA16Experts(TritonExperts):
             workspace13, (num_tokens * top_k_num, activation_out_dim)
         )
         intermediate_cache3 = _resize_cache(workspace2, (num_tokens, top_k_num, K))
+
+        if uses_whole_tensor_dynamic_scale(
+            self.quant_dtype, a2_scale, self.per_act_token_quant, self.block_shape
+        ):
+            # See the matching comment in TritonExperts.apply: unwritten rows
+            # would otherwise set the shared a2 amax.
+            intermediate_cache1.fill_(0)
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             topk_ids, config["BLOCK_SIZE_M"], global_num_experts, expert_map
