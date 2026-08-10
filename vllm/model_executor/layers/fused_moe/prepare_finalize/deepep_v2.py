@@ -264,6 +264,17 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             else None
         )
         if self.use_cudagraph:
+            # Decode mode: carry the device-side per-rank prefix sum so the SiTU
+            # activation can skip the worst-case padding rows. There is no CPU
+            # sync here, so recv_expert_num_tokens is empty and
+            # expert_tokens_meta is None above; attach psum to a metadata object
+            # whose per-expert counts stay unset (experts recover them from
+            # topk_ids).
+            if expert_tokens_meta is None:
+                expert_tokens_meta = mk.ExpertTokensMetadata(
+                    expert_num_tokens=None,
+                    expert_num_tokens_cpu=None,
+                )
             expert_tokens_meta.psum_recv_per_rank = psum_recv_per_rank
 
         if not quant_config.is_block_quantized and not defer_input_quant:
