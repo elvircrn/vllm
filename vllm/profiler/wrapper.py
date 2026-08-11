@@ -11,6 +11,7 @@ from typing import Literal
 import torch
 from typing_extensions import override
 
+import vllm.envs as envs
 import vllm.version
 from vllm.config import ProfilerConfig
 from vllm.config.profiler import _is_uri_path
@@ -54,9 +55,41 @@ class WorkerProfiler(ABC):
         """Stop the profiler."""
         pass
 
+    def _maybe_multinode_barrier(self) -> None:
+        """Rendezvous all ranks right before the profiler starts.
+
+        Kineto timestamps each event on the local CLOCK_MONOTONIC, whose origin
+        differs per host, so traces gathered from different nodes do not share a
+        time axis. Independently, each rank receives start_profile at a slightly
+        different wall time, so even single-node traces can cover different
+        iterations. A collective barrier immediately before _start() makes every
+        rank begin capture at the same instant, so the resulting per-rank traces
+        line up on the same iterations (and, once shifted to a common origin,
+        overlap cleanly).
+
+        Gated by VLLM_ENABLE_MULTINODE_PROFILING: it injects a collective on the
+        profiler control path, which would hang if only a subset of ranks ever
+        calls start_profile. Enable it only when every rank is profiled.
+        """
+        if not envs.VLLM_ENABLE_MULTINODE_PROFILING:
+            return
+        import torch.distributed as dist
+
+        if not (dist.is_available() and dist.is_initialized()):
+            return
+        logger.info_once(
+            "VLLM_ENABLE_MULTINODE_PROFILING: barrier before profiler start."
+        )
+        # Flush outstanding device work first, then rendezvous, so the barrier
+        # marks a common point in the device stream across ranks.
+        if torch.accelerator.is_available():
+            torch.accelerator.synchronize()
+        dist.barrier()
+
     def _call_start(self) -> None:
         """Call _start with error handling but no safeguards."""
         try:
+            self._maybe_multinode_barrier()
             self._start()
             self._running = True  # Only mark as running if start succeeds
         except Exception as e:
