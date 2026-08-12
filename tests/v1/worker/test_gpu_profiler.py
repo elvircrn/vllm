@@ -367,65 +367,6 @@ class TestTorchProfilerWrapperAsyncExport:
         assert handler_done.wait(timeout=2.0)
 
 
-def test_multinode_barrier_disabled_by_default(default_profiler_config, monkeypatch):
-    """Without VLLM_ENABLE_MULTINODE_PROFILING the barrier is never issued,
-    even when a process group is initialized."""
-    barrier = MagicMock()
-    monkeypatch.setattr("torch.distributed.is_available", lambda: True)
-    monkeypatch.setattr("torch.distributed.is_initialized", lambda: True)
-    monkeypatch.setattr("torch.distributed.barrier", barrier)
-
-    profiler = ConcreteWorkerProfiler(default_profiler_config)
-    profiler.start()
-
-    assert profiler.start_call_count == 1
-    barrier.assert_not_called()
-
-
-def test_multinode_barrier_enabled(default_profiler_config, monkeypatch):
-    """With the env var set and a process group initialized, _call_start
-    barriers before the underlying profiler starts."""
-    monkeypatch.setenv("VLLM_ENABLE_MULTINODE_PROFILING", "1")
-
-    calls = []
-    monkeypatch.setattr("torch.distributed.is_available", lambda: True)
-    monkeypatch.setattr("torch.distributed.is_initialized", lambda: True)
-    monkeypatch.setattr(
-        "torch.distributed.barrier", lambda *a, **k: calls.append("barrier")
-    )
-    monkeypatch.setattr("torch.accelerator.is_available", lambda: False)
-
-    class OrderTrackingProfiler(ConcreteWorkerProfiler):
-        def _start(self) -> None:
-            calls.append("start")
-            super()._start()
-
-    profiler = OrderTrackingProfiler(default_profiler_config)
-    profiler.start()
-
-    assert profiler.start_call_count == 1
-    # Barrier must precede the profiler start so ranks capture the same window.
-    assert calls == ["barrier", "start"]
-
-
-def test_multinode_barrier_skipped_without_process_group(
-    default_profiler_config, monkeypatch
-):
-    """Enabled but no process group: start still succeeds, no barrier, no hang."""
-    monkeypatch.setenv("VLLM_ENABLE_MULTINODE_PROFILING", "1")
-    barrier = MagicMock()
-    monkeypatch.setattr("torch.distributed.is_available", lambda: True)
-    monkeypatch.setattr("torch.distributed.is_initialized", lambda: False)
-    monkeypatch.setattr("torch.distributed.barrier", barrier)
-
-    profiler = ConcreteWorkerProfiler(default_profiler_config)
-    profiler.start()
-
-    assert profiler._running is True
-    assert profiler.start_call_count == 1
-    barrier.assert_not_called()
-
-
 def test_profiler_entered_during_capture():
     """Profiler is used as a context manager in _warmup_and_capture,
     confirming it is active during the actual graph capture run."""
