@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
-import os
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -19,20 +18,6 @@ from vllm.config.profiler import _is_uri_path
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
-
-
-def _multinode_profiling_enabled() -> bool:
-    """Whether VLLM_ENABLE_MULTINODE_PROFILING is set.
-
-    Prefers ``vllm.envs`` (where normal builds register the flag); falls back
-    to ``os.environ`` for the surgical serve overlay, which patches this file
-    onto a stock image whose ``envs.py`` predates this flag (so
-    ``envs.VLLM_ENABLE_MULTINODE_PROFILING`` raises AttributeError there).
-    """
-    try:
-        return bool(envs.VLLM_ENABLE_MULTINODE_PROFILING)
-    except AttributeError:
-        return bool(int(os.environ.get("VLLM_ENABLE_MULTINODE_PROFILING", "0")))
 
 
 class WorkerProfiler(ABC):
@@ -86,7 +71,7 @@ class WorkerProfiler(ABC):
         profiler control path, which would hang if only a subset of ranks ever
         calls start_profile. Enable it only when every rank is profiled.
         """
-        if not _multinode_profiling_enabled():
+        if not envs.VLLM_ENABLE_MULTINODE_PROFILING:
             return
         import torch.distributed as dist
 
