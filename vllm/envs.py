@@ -186,6 +186,7 @@ if TYPE_CHECKING:
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
     VLLM_HUMMING_FUSE_ACT_QUANT: bool = False
+    VLLM_HUMMING_CAP_MOE_TUNING_K_BLOCK: bool = True
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
     VLLM_TPU_USING_PATHWAYS: bool = False
@@ -1525,6 +1526,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # quant; falls back to the separate situ_and_mul + quant_input otherwise.
     "VLLM_HUMMING_FUSE_ACT_QUANT": lambda: maybe_convert_bool(
         os.environ.get("VLLM_HUMMING_FUSE_ACT_QUANT", "0")
+    ),
+    # Whether to cap the Humming MoE tuning K-block (block_shape[2]) at 128.
+    # Small-M tiles can otherwise select a K-block of 256, whose TMA descriptor
+    # the driver rejects at cuLaunchKernelEx (CUDA_ERROR_MISALIGNED_ADDRESS)
+    # during profile_run -- not avoidable with --enforce-eager. Default on; set
+    # to 0 to test whether a newer Humming/driver no longer needs the cap.
+    "VLLM_HUMMING_CAP_MOE_TUNING_K_BLOCK": lambda: maybe_convert_bool(
+        os.environ.get("VLLM_HUMMING_CAP_MOE_TUNING_K_BLOCK", "1")
     ),
     # Whether to use DeepEPLL kernels for NVFP4 quantization and dispatch method
     # only supported on Blackwell GPUs and with
