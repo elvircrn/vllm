@@ -153,6 +153,8 @@ def _fixup_moe_tuning_config(tuning_config: list, max_k_block: int = 128) -> Non
     widen = _widen_moe_warp_n_enabled()
     if not (cap or widen):
         return
+    capped = 0
+    widened = 0
     for entry in tuning_config:
         config = entry[2]
         block_shape = config.get("block_shape")
@@ -161,6 +163,7 @@ def _fixup_moe_tuning_config(tuning_config: list, max_k_block: int = 128) -> Non
         block_m, block_n, block_k = block_shape
         if cap and block_k > max_k_block:
             config["block_shape"] = [block_m, block_n, max_k_block]
+            capped += 1
         warp_shape = config.get("warp_shape")
         if (
             widen
@@ -170,6 +173,20 @@ def _fixup_moe_tuning_config(tuning_config: list, max_k_block: int = 128) -> Non
             and warp_shape[1] < 32
         ):
             config["warp_shape"] = [warp_shape[0], 32, warp_shape[2]]
+            widened += 1
+    # One-time proof the fixup is live (grep the logs for this line). If it never
+    # appears, the running process is not this file (stale image / overlay not
+    # updated / not restarted). widened=0 with widen=True means no entry had
+    # warp_n<16-and-block_n%32==0 to change.
+    logger.info_once(
+        "Humming MoE tuning fixup live: cap_k_block=%s (capped %d), "
+        "widen_warp_n=%s (widened %d), %d entries",
+        cap,
+        capped,
+        widen,
+        widened,
+        len(tuning_config),
+    )
 
 
 class HummingExpertsBase(mk.FusedMoEExpertsModular):
