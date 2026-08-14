@@ -787,6 +787,7 @@ class HummingIndexedExperts(HummingExpertsBase):
             **moe_kwargs2,
         )
 
+        # moe_fused_mul_sum skips worst-case padding rows via expert_map.
         moe_fused_mul_sum(
             inputs=buffers["down_output"].view(*topk_ids.shape, -1),
             topk_weights=topk_weights,

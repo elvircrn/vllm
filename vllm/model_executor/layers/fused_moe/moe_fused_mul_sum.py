@@ -29,6 +29,17 @@ def moe_fused_mul_sum_kernel(
     offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
 
     m_mask = offs_m < num_tokens
+
+    if has_expert_map:
+        # Skip worst-case padding rows (all top ids < 0) with no host sync.
+        row_valid = tl.zeros((BLOCK_M,), dtype=tl.int32)
+        for n in tl.static_range(top_k):
+            idn = tl.load(top_ids_ptr + offs_m * top_k + n, mask=m_mask, other=-1)
+            row_valid += (idn >= 0).to(tl.int32)
+        if tl.sum(row_valid) == 0:
+            return
+        m_mask = m_mask & (row_valid > 0)
+
     k_mask = offs_k < size
     mask = m_mask[:, None] & k_mask[None, :]
 
@@ -153,7 +164,9 @@ def moe_fused_mul_sum(
         topk_ids: Optional indices of the top-k experts. Used when
             `expert_map` is provided. Shape: (num_tokens, top_k).
         expert_map: Optional mapping for Expert Parallelism. A value < 0
-            indicates an invalid token/expert pair that will be skipped.
+            indicates an invalid token/expert pair that will be skipped. When
+            provided, rows with all top ids < 0 (worst-case padding) are skipped
+            and their output rows left untouched.
 
     Returns:
         The fused weighted sum of expert outputs.
