@@ -110,83 +110,17 @@ def get_humming_moe_gemm_type() -> str:
     logger.info_once(f"Using {gemm_type} gemm for humming moe")  # noqa
     return gemm_type
 
-
-def _widen_moe_warp_n_enabled() -> bool:
-    """Whether to widen get_config2's warp_n=16 tiles to warp_n=32.
-
-    Humming's sm90 heuristic routes the w13 (gate/up) GEMM to get_config2 --
-    which pins warp_shape N to 16 -- because its activation is block-FP8
-    (group-128, input_scale_group_size > 0; see _prequantizes_dispatch_activation
-    and the (kMxfp4Static, kFp8Dynamic128Sym) support). warp_n=16 under-fills the
-    Hopper WGMMA N dimension and leaves the up-proj running far below its ceiling.
-    w2 (down) uses per-token FP8 (group 0) so it already gets get_config1's
-    warp_n=32 and is left untouched (the warp_n < 32 guard skips it).
-
-    Default on; disable with VLLM_HUMMING_WIDEN_MOE_WARP_N=0. Reads via envs with
-    an os.environ fallback for the surgical serve overlay (see
-    _fuse_act_quant_enabled).
-    """
-    try:
-        return bool(envs.VLLM_HUMMING_WIDEN_MOE_WARP_N)
-    except AttributeError:
-        val = os.environ.get("VLLM_HUMMING_WIDEN_MOE_WARP_N", "1")
-        try:
-            return bool(int(val))
-        except ValueError:
-            return val.strip().lower() in ("true", "yes", "on")
-
-
 def _fixup_moe_tuning_config(tuning_config: list, max_k_block: int = 128) -> None:
-    """Fix up each MoE tile in place: cap the K-block and widen warp-N.
-
-    - block_shape[2] (K-block) > ``max_k_block`` builds a TMA descriptor the
-      driver rejects at cuLaunchKernelEx (CUDA_ERROR_MISALIGNED_ADDRESS). Cap it
-      at 128 -- what Humming already uses for larger M and which launches cleanly
-      (warp_shape K is 128 in every entry). Gated by
-      VLLM_HUMMING_CAP_MOE_TUNING_K_BLOCK (default on).
-    - warp_shape[1] (warp-N) < 32 is widened to 32 (only when block_n % 32 == 0).
-      This runs INDEPENDENTLY of the cap above: the w13 tile is already at
-      block_k=128 and so is never capped, yet still ships warp_n=16. Gated by
-      VLLM_HUMMING_WIDEN_MOE_WARP_N (default on).
-    """
-    cap = envs.VLLM_HUMMING_CAP_MOE_TUNING_K_BLOCK
-    widen = _widen_moe_warp_n_enabled()
-    if not (cap or widen):
-        return
-    capped = 0
-    widened = 0
     for entry in tuning_config:
         config = entry[2]
         block_shape = config.get("block_shape")
         if not (block_shape and len(block_shape) == 3):
             continue
         block_m, block_n, block_k = block_shape
-        if cap and block_k > max_k_block:
+        if block_k > max_k_block:
             config["block_shape"] = [block_m, block_n, max_k_block]
-            capped += 1
         warp_shape = config.get("warp_shape")
-        if (
-            widen
-            and warp_shape
-            and len(warp_shape) == 3
-            and block_n % 32 == 0
-            and warp_shape[1] < 32
-        ):
-            config["warp_shape"] = [warp_shape[0], 32, warp_shape[2]]
-            widened += 1
-    # One-time proof the fixup is live (grep the logs for this line). If it never
-    # appears, the running process is not this file (stale image / overlay not
-    # updated / not restarted). widened=0 with widen=True means no entry had
-    # warp_n<16-and-block_n%32==0 to change.
-    logger.info_once(
-        "Humming MoE tuning fixup live: cap_k_block=%s (capped %d), "
-        "widen_warp_n=%s (widened %d), %d entries",
-        cap,
-        capped,
-        widen,
-        widened,
-        len(tuning_config),
-    )
+        config["warp_shape"] = [warp_shape[0], 32, warp_shape[2]]
 
 
 class HummingExpertsBase(mk.FusedMoEExpertsModular):
@@ -240,13 +174,6 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             gemm_type=self.humming_gemm_type(),
         )
         self.compute_config_str = json.dumps(self.compute_config)
-        # Fix up the heuristic-chosen tiles in place before they are frozen to
-        # JSON: cap the K-block at 128 (a K-block of 256 builds a TMA descriptor
-        # the driver rejects with CUDA_ERROR_MISALIGNED_ADDRESS; the cap also
-        # fires in profile_run, so it is not avoidable with --enforce-eager), and
-        # widen the w13 get_config2 warp_n=16 tile to warp_n=32 (the block-FP8
-        # group-128 activation routes w13 to get_config2, which under-fills the
-        # WGMMA N dim). See _fixup_moe_tuning_config for the per-fixup gates.
         _fixup_moe_tuning_config(self.w13_tuning_config)
         _fixup_moe_tuning_config(self.w2_tuning_config)
         self.w13_tuning_config_str = json.dumps(self.w13_tuning_config)
