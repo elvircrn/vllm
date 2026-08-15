@@ -612,6 +612,9 @@ __global__ void situ_and_mul_quant_group_pipelined_kernel(
     // Number of groups this warp processes, strided by NUM_WARPS.
     const int num_iters = (num_groups - warp_id + NUM_WARPS - 1) / NUM_WARPS;
 
+    // unroll 1: keep ptxas from emitting a 64-bit trip-count division
+    // (int64 range / runtime gridDim.x stride) as an out-of-line CALL.
+#pragma unroll 1
     for (int64_t row = blockIdx.x; row < row_bound; row += gridDim.x) {
       // Strength-reduced addressing: per-warp base pointer bumped by the warp
       // stride each iteration; `up` folds into the gate base via a +d index.
@@ -717,6 +720,7 @@ __global__ void situ_and_mul_quant_group_pipelined_kernel(
   // with a finite value so masked-out rows don't feed NaN/Inf into the w2 GEMM.
   const int64_t pad_start = row_bound * (int64_t)num_groups;
   const int64_t pad_end = num_rows * (int64_t)num_groups;
+#pragma unroll 1
   for (int64_t i = pad_start + (int64_t)blockIdx.x * blockDim.x + tid;
        i < pad_end; i += (int64_t)gridDim.x * blockDim.x) {
     scale_out[i] = 1.0f;
