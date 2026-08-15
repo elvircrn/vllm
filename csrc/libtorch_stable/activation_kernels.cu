@@ -485,17 +485,23 @@ __global__ void swigluoai_and_mul_kernel(
 // Single shared implementation of the SITU math, called from every kernel
 // below. __forceinline__ since it runs inside #pragma-unrolled per-element
 // loops, where an out-of-line call would spike register pressure for no gain.
+//
+// tanh via the sm_75+ hardware tanh.approx.f32 (single MUFU). Both tanhf and
+// libdevice __tanhf compile to an out-of-line range-reduction CALL, which drags
+// in a stack frame and ABI register spills; the PTX intrinsic has no slow path.
+__device__ __forceinline__ float tanh_approx(float x) {
+  float r;
+  asm("tanh.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
+  return r;
+}
 __device__ __forceinline__ float situ_activation(float g, float u, float beta,
                                                   float linear_beta,
                                                   bool clamp_up, float inv_beta,
                                                   float inv_linear_beta) {
-  // __tanhf/__expf lower to a single MUFU each with no out-of-line slow path.
-  // The accurate tanhf/expf carry a range-reduction CALL for extreme args that
-  // never fires on bounded activations, yet forces a stack frame + ABI register
-  // spills and holds register count high.
-  const float gate_out = beta * __tanhf(g * inv_beta) / (1.0f + __expf(-g));
+  const float gate_out =
+      beta * tanh_approx(g * inv_beta) / (1.0f + __expf(-g));
   const float up_out =
-      clamp_up ? linear_beta * __tanhf(u * inv_linear_beta) : u;
+      clamp_up ? linear_beta * tanh_approx(u * inv_linear_beta) : u;
   return gate_out * up_out;
 }
 
@@ -570,8 +576,7 @@ __device__ __forceinline__ float warp_reduce_max(float v) {
 // *valid_rows are never touched. cp.async stages gate+up into smem per group.
 template <typename scalar_t, typename fp8_type, int THREADS, int NUM_STAGES,
           int GROUP_SIZE>
-__global__ void __launch_bounds__(THREADS, 8)  // 8 blocks/SM => 100% occupancy
-situ_and_mul_quant_group_pipelined_kernel(
+__global__ void situ_and_mul_quant_group_pipelined_kernel(
     fp8_type* __restrict__ out,          // [num_tokens, d]
     float* __restrict__ scale_out,       // [num_tokens, num_groups]
     const scalar_t* __restrict__ input,  // [num_tokens, 2, d]
