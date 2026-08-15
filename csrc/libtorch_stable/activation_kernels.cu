@@ -494,6 +494,12 @@ __device__ __forceinline__ float tanh_approx(float x) {
   asm("tanh.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
   return r;
 }
+
+// Kimi-K3 SITU activation params (config.json text_config). The pipelined
+// kernel bakes these so its reciprocals and up-clamp fold at compile time; the
+// host launch falls back to the runtime scalar kernel if a model differs.
+static constexpr float SITU_BETA = 4.0f;
+static constexpr float SITU_LINEAR_BETA = 25.0f;
 __device__ __forceinline__ float situ_activation(float g, float u, float beta,
                                                   float linear_beta,
                                                   bool clamp_up, float inv_beta,
@@ -581,7 +587,6 @@ __global__ void situ_and_mul_quant_group_pipelined_kernel(
     fp8_type* __restrict__ out,          // [num_tokens, D]
     float* __restrict__ scale_out,       // [num_tokens, NUM_GROUPS]
     const scalar_t* __restrict__ input,  // [num_tokens, 2, D]
-    const float beta, const float linear_beta, const float fp8_max,
     const int64_t num_rows, const int64_t* __restrict__ valid_rows_ptr) {
   const int tid = threadIdx.x;
   const int warp_id = tid / WARP_SIZE;
@@ -602,12 +607,18 @@ __global__ void situ_and_mul_quant_group_pipelined_kernel(
     scalar_t* warp_smem = reinterpret_cast<scalar_t*>(smem_raw) +
                           (size_t)warp_id * NUM_STAGES * STAGE_ELTS;
 
-    const bool clamp_up = linear_beta > 0.0f;
-    // __fdividef reciprocal: single MUFU.RCP, no IEEE-div FCHK/CALL slow path
-    // (~2 ulp, folds into the pending accuracy eval).
-    const float inv_beta = __fdividef(1.0f, beta);
-    const float inv_linear_beta = clamp_up ? __fdividef(1.0f, linear_beta) : 0.0f;
-    const float inv_fp8_max = __fdividef(1.0f, fp8_max);
+    // beta/linear_beta are baked (Kimi-K3): every reciprocal and the up-clamp
+    // fold at compile time. The host gates this launch on the runtime values
+    // matching, else falls back to the scalar kernel.
+    static constexpr float beta = SITU_BETA;
+    static constexpr float linear_beta = SITU_LINEAR_BETA;
+    static constexpr bool clamp_up = linear_beta > 0.0f;
+    static constexpr float inv_beta = 1.0f / beta;
+    static constexpr float inv_linear_beta = clamp_up ? 1.0f / linear_beta : 0.0f;
+    // fp8_max is fixed by the output type -> compile-time reciprocal, no RCP.
+    static constexpr float FP8_MAX =
+        std::is_same_v<fp8_type, c10::Float8_e4m3fn> ? 448.0f : 224.0f;
+    static constexpr float inv_fp8_max = 1.0f / FP8_MAX;
 
     // Number of groups this warp processes, strided by NUM_WARPS.
     const int num_iters = (NUM_GROUPS - warp_id + NUM_WARPS - 1) / NUM_WARPS;
@@ -704,10 +715,10 @@ __global__ void situ_and_mul_quant_group_pipelined_kernel(
           fp8_type f[2];
         };
         O o0, o1;
-        o0.f[0] = quant_to_fp8<fp8_type>(acts[0], inv_scale, fp8_max);
-        o0.f[1] = quant_to_fp8<fp8_type>(acts[1], inv_scale, fp8_max);
-        o1.f[0] = quant_to_fp8<fp8_type>(acts[2], inv_scale, fp8_max);
-        o1.f[1] = quant_to_fp8<fp8_type>(acts[3], inv_scale, fp8_max);
+        o0.f[0] = quant_to_fp8<fp8_type>(acts[0], inv_scale, FP8_MAX);
+        o0.f[1] = quant_to_fp8<fp8_type>(acts[1], inv_scale, FP8_MAX);
+        o1.f[0] = quant_to_fp8<fp8_type>(acts[2], inv_scale, FP8_MAX);
+        o1.f[1] = quant_to_fp8<fp8_type>(acts[3], inv_scale, FP8_MAX);
         // Two 16-bit stores mirror the {2L,2L+1} / {2L+64,2L+65} ownership;
         // each spans 64 contiguous bytes across the warp (coalesced).
         out_st[0] = o0.u;
@@ -740,8 +751,7 @@ __global__ void situ_and_mul_quant_group_scalar_kernel(
     float* __restrict__ scale_out,       // [num_tokens, num_groups]
     const scalar_t* __restrict__ input,  // [num_tokens, 2, d]
     const int d, const int num_groups, const float beta, const float linear_beta,
-    const float fp8_max, const int64_t num_rows,
-    const int64_t* __restrict__ valid_rows_ptr) {
+    const int64_t num_rows, const int64_t* __restrict__ valid_rows_ptr) {
   static constexpr int ELTS_PER_LANE = GROUP_SIZE / WARP_SIZE;
   const int tid = threadIdx.x;
   const int warp_id = tid / WARP_SIZE;
@@ -755,7 +765,10 @@ __global__ void situ_and_mul_quant_group_scalar_kernel(
   // (~2 ulp, folds into the pending accuracy eval).
   const float inv_beta = __fdividef(1.0f, beta);
   const float inv_linear_beta = clamp_up ? __fdividef(1.0f, linear_beta) : 0.0f;
-  const float inv_fp8_max = __fdividef(1.0f, fp8_max);
+  // fp8_max is fixed by the output type -> compile-time reciprocal, no RCP.
+  static constexpr float FP8_MAX =
+      std::is_same_v<fp8_type, c10::Float8_e4m3fn> ? 448.0f : 224.0f;
+  static constexpr float inv_fp8_max = 1.0f / FP8_MAX;
 
   for (int64_t row = blockIdx.x; row < row_bound; row += gridDim.x) {
     const scalar_t* gate_ptr = input + row * 2 * (int64_t)d;
@@ -783,7 +796,7 @@ __global__ void situ_and_mul_quant_group_scalar_kernel(
 #pragma unroll
       for (int e = 0; e < ELTS_PER_LANE; e++) {
         const int idx = base + e * WARP_SIZE + lane_id;
-        out_ptr[idx] = quant_to_fp8<fp8_type>(acts[e], inv_scale, fp8_max);
+        out_ptr[idx] = quant_to_fp8<fp8_type>(acts[e], inv_scale, FP8_MAX);
       }
     }
   }
@@ -1002,10 +1015,7 @@ void situ_and_mul_quant(torch::stable::Tensor& out,    // [..., d]  (fp8)
   if (valid_rows.has_value()) {
     valid_rows_ptr = valid_rows->const_data_ptr<int64_t>();
   }
-  float fp8_max = 448.0f;  // e4m3fn; matches humming calc_scale (absmax / 448)
-  if (out.scalar_type() == torch::headeronly::ScalarType::Float8_e4m3fnuz) {
-    fp8_max = 224.0f;  // ROCm fnuz convention (vllm quant_type_max)
-  }
+  // fp8_max (448 e4m3fn / 224 fnuz) is derived from fp8_type inside the kernel.
   const torch::stable::accelerator::DeviceGuard device_guard(
       input.get_device_index());
   const cudaStream_t stream = get_current_cuda_stream();
@@ -1042,7 +1052,8 @@ void situ_and_mul_quant(torch::stable::Tensor& out,    // [..., d]  (fp8)
                 // Pipelined path only for the fixed hidden dim; other d (and the
                 // fp32 branch) fall through to the runtime scalar kernel.
                 if constexpr (sizeof(scalar_t) == 2) {
-                  if (d == SITU_D) {
+                  if (d == SITU_D && (float)beta == vllm::SITU_BETA &&
+                      (float)linear_beta == vllm::SITU_LINEAR_BETA) {
                     constexpr int D = SITU_D;
                     constexpr int NUM_WARPS = THREADS / 32;
                     constexpr int STAGE_ELTS = 2 * 128;  // gate + up per group
@@ -1056,8 +1067,8 @@ void situ_and_mul_quant(torch::stable::Tensor& out,    // [..., d]  (fp8)
                     kernel<<<grid, block, smem_bytes, stream>>>(
                         out.mutable_data_ptr<fp8_t>(),
                         scale.mutable_data_ptr<float>(),
-                        input.const_data_ptr<scalar_t>(), (float)beta,
-                        (float)linear_beta, fp8_max, num_tokens, valid_rows_ptr);
+                        input.const_data_ptr<scalar_t>(), num_tokens,
+                        valid_rows_ptr);
                     return;
                   }
                 }
@@ -1069,7 +1080,7 @@ void situ_and_mul_quant(torch::stable::Tensor& out,    // [..., d]  (fp8)
                         out.mutable_data_ptr<fp8_t>(),
                         scale.mutable_data_ptr<float>(),
                         input.const_data_ptr<scalar_t>(), d, num_groups,
-                        (float)beta, (float)linear_beta, fp8_max, num_tokens,
+                        (float)beta, (float)linear_beta, num_tokens,
                         valid_rows_ptr);
               });
         });
