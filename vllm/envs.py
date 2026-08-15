@@ -185,7 +185,6 @@ if TYPE_CHECKING:
     VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
-    VLLM_HUMMING_FUSE_ACT_QUANT: bool = False
     VLLM_HUMMING_CAP_MOE_TUNING_K_BLOCK: bool = True
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
@@ -1518,14 +1517,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # if None, choose better gemm type automatically
     "VLLM_HUMMING_MOE_GEMM_TYPE": lambda: os.environ.get(
         "VLLM_HUMMING_MOE_GEMM_TYPE", None
-    ),
-    # Fuse the Kimi SITU activation with the following per-token FP8 quantization
-    # on the Humming w2 (down-projection) path into a single CUDA kernel,
-    # avoiding a bf16 round-trip through the activation_output buffer. Only
-    # applies to the SITU activation with per-token FP8 (e4m3) / float32-scale w2
-    # quant; falls back to the separate situ_and_mul + quant_input otherwise.
-    "VLLM_HUMMING_FUSE_ACT_QUANT": lambda: maybe_convert_bool(
-        os.environ.get("VLLM_HUMMING_FUSE_ACT_QUANT", "0")
     ),
     # Whether to cap the Humming MoE tuning K-block (block_shape[2]) at 128.
     # Small-M tiles can otherwise select a K-block of 256, whose TMA descriptor

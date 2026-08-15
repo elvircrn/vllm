@@ -270,11 +270,7 @@ __device__ __forceinline__ void token_bounds(int32_t n_tokens,
   }
 }
 
-template <int BLOCK_COUNT, int SMEM_SIZE_BYTES_Y, typename fp8_type,
-          typename scale_t, int THREADS, typename Idx_t, bool CEIL_UE8M0,
-          int GROUP_SIZE = 128, int NUM_STAGES = 3>
-__global__ void silu_mul_fp8_quant_deep_gemm_kernel(
-    const __nv_bfloat16* __restrict__ _input, fp8_type* __restrict__ _y_q,
+§    const __nv_bfloat16* __restrict__ _input, fp8_type* __restrict__ _y_q,
     scale_t* __restrict__ _y_s, const int32_t* __restrict__ tokens_per_expert,
     // sizes
     Idx_t E, Idx_t T, Idx_t H,

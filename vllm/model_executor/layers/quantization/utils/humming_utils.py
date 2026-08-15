@@ -622,11 +622,11 @@ def make_humming_moe_quant_config(
 
 
 def get_humming_moe_quant_config(
-    layer: "RoutedExperts",
-    humming_configs: dict[str, "LayerConfig"] | None = None,
-    gemm1_alpha: float | None = None,
-    gemm1_beta: float | None = None,
-    gemm1_clamp_limit: float | None = None,
+        layer: "RoutedExperts",
+        humming_configs: dict[str, "LayerConfig"] | None = None,
+        gemm1_alpha: float | None = None,
+        gemm1_beta: float | None = None,
+        gemm1_clamp_limit: float | None = None,
 ):
     if humming_configs is None:
         humming_configs = layer.humming_configs
@@ -644,9 +644,9 @@ def get_humming_moe_quant_config(
     activation_group_shape: GroupShape | None = None
     input_scale_group_size = getattr(input_schema, "input_scale_group_size", 0) or 0
     if (
-        q_dtype is not None
-        and q_dtype.startswith("float8")
-        and input_scale_group_size == 128
+            q_dtype is not None
+            and q_dtype.startswith("float8")
+            and input_scale_group_size == 128
     ):
         q_dtype = _HUMMING_TO_QUANT_DTYPE.get(input_schema.a_dtype, FP8_DTYPE)
         activation_group_shape = GroupShape(row=1, col=input_scale_group_size)

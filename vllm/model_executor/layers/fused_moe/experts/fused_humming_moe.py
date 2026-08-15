@@ -4,7 +4,6 @@
 
 import json
 import math
-import os
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -75,24 +74,6 @@ if TYPE_CHECKING:
 
 
 logger = init_logger(__name__)
-
-
-def _fuse_act_quant_enabled() -> bool:
-    """Whether VLLM_HUMMING_FUSE_ACT_QUANT is set.
-
-    Prefers ``vllm.envs`` (where normal builds register the flag); falls back to
-    ``os.environ`` for the surgical serve overlay, which patches individual
-    fused_moe files onto a stock image whose ``envs.py`` predates this flag (so
-    ``envs.VLLM_HUMMING_FUSE_ACT_QUANT`` raises AttributeError there).
-    """
-    try:
-        return bool(envs.VLLM_HUMMING_FUSE_ACT_QUANT)
-    except AttributeError:
-        val = os.environ.get("VLLM_HUMMING_FUSE_ACT_QUANT", "0")
-        try:
-            return bool(int(val))
-        except ValueError:
-            return val.strip().lower() in ("true", "yes", "on")
 
 
 def get_humming_moe_gemm_type() -> str:
@@ -642,22 +623,36 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
     def fused_situ_quant_enabled(self, activation: MoEActivation) -> bool:
         """Whether the SITU activation + w2 quant can be fused into one kernel.
 
-        Only the per-token FP8 (e4m3) / float32-scale w2 quantization is fused;
-        anything else (block-FP8, MXFP8, 16-bit passthrough, non-SITU) falls back
-        to the separate situ_and_mul + quantize_input path.
+        Fused for per-token FP8 (group_size 0) and k-major block-FP8 group-128,
+        both e4m3 with float32 scales. A float32 as_dtype rules out MXMMA (which
+        uses e8m0 m-major scales), so a group-128 scale is guaranteed k-major --
+        the only group layout situ_and_mul_quant emits. Everything else (m-major
+        MXFP8, other group sizes, 16-bit passthrough, non-SITU) falls back to the
+        separate situ_and_mul + quantize_input path.
         """
-        if not _fuse_act_quant_enabled():
-            return False
         if activation != MoEActivation.SITU:
             return False
         w2cfg = self.humming_configs["w2"]
-        return (
-            w2cfg.a_dtype.num_bits == 8
-            and str(w2cfg.a_dtype) == "float8e4m3"
-            and not w2cfg.input_scale_group_size
-            and w2cfg.as_dtype is not None
-            and str(w2cfg.as_dtype) == "float32"
-        )
+        # Report the specific blocker once so a silent fallback to the unfused
+        # situ_and_mul + quant pair is never a mystery in a trace.
+        reason: str | None = None
+        if not (w2cfg.a_dtype.num_bits == 8 and str(w2cfg.a_dtype) == "float8e4m3"):
+            reason = f"w2 a_dtype is {w2cfg.a_dtype} (need float8e4m3)"
+        elif w2cfg.input_scale_group_size not in (0, 128):
+            reason = (
+                f"w2 input_scale_group_size is {w2cfg.input_scale_group_size} "
+                "(need 0 or 128)"
+            )
+        elif not (w2cfg.as_dtype is not None and str(w2cfg.as_dtype) == "float32"):
+            reason = f"w2 as_dtype is {w2cfg.as_dtype} (need float32, k-major)"
+        if reason is not None:
+            logger.warning_once(
+                "Humming fused SITU+FP8 quant disabled, using unfused "
+                "situ_and_mul + quant: %s",
+                reason,
+            )
+            return False
+        return True
 
     def fused_situ_quant(
         self,
@@ -665,11 +660,12 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
         quanted_down_input: torch.Tensor,
         valid_rows: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run the fused SITU activation + per-token FP8 quant for the w2 input.
+        """Run the fused SITU activation + FP8 quant for the w2 input.
 
         Returns ``(quanted_down_input, input_scale)`` in the same layout the
-        unfused ``apply_activation`` + ``quantize_input("w2")`` pair produces:
-        an fp8 [M, d] tensor and a per-token float32 [M, 1] scale.
+        unfused ``apply_activation`` + ``quantize_input("w2")`` pair produces: an
+        fp8 [M, d] tensor plus either a per-token float32 [M, 1] scale
+        (group_size 0) or a k-major block-FP8 float32 [M, d // 128] group scale.
         """
         from vllm.model_executor.layers.fused_moe.activation import (
             situ_and_mul_quant,
@@ -679,8 +675,11 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
         assert cfg.activation_situ_beta is not None, (
             "SITU requires activation_situ_beta from FusedMoEConfig"
         )
+        group_size = self.humming_configs["w2"].input_scale_group_size or 0
+        m, d = quanted_down_input.size(0), quanted_down_input.size(1)
+        num_cols = 1 if group_size == 0 else d // group_size
         input_scale = torch.empty(
-            (quanted_down_input.size(0), 1),
+            (m, num_cols),
             dtype=torch.float32,
             device=quanted_down_input.device,
         )
@@ -690,6 +689,7 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             gate_up_output,
             beta=cfg.activation_situ_beta,
             linear_beta=cfg.activation_situ_linear_beta,
+            group_size=group_size,
             valid_rows=valid_rows,
         )
         return quanted_down_input, input_scale
@@ -826,8 +826,8 @@ class HummingIndexedExperts(HummingExpertsBase):
             valid_rows = psum[-1:].to(torch.int64) * topk
 
         if self.fused_situ_quant_enabled(activation):
-            # Fused SITU + per-token FP8 quant straight into the w2 input,
-            # skipping the bf16 activation_output round-trip.
+            # Fused SITU + FP8 quant (per-token or block-FP8 group-128) straight
+            # into the w2 input, skipping the bf16 activation_output round-trip.
             inputs, input_scale = self.fused_situ_quant(
                 gate_up_output=buffers["gate_up_output"],
                 quanted_down_input=buffers["quanted_down_input"],

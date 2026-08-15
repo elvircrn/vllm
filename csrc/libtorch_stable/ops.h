@@ -519,6 +519,7 @@ void situ_and_mul(
 void situ_and_mul_quant(
     torch::stable::Tensor& out, torch::stable::Tensor& scale,
     torch::stable::Tensor& input, double beta = 1.0, double linear_beta = -1.0,
+    int64_t group_size = 0,
     std::optional<torch::stable::Tensor> valid_rows = std::nullopt);
 void masked_situ_and_mul(torch::stable::Tensor& out,
                          torch::stable::Tensor& input,

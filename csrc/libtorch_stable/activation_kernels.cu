@@ -644,6 +644,18 @@ __device__ __forceinline__ float warp_reduce_max(float v) {
   return v;
 }
 
+// Butterfly max over WIDTH-lane sub-warp segments. Every lane in the warp must
+// reach this call (full-warp mask); idle callers pass a neutral value. WIDTH
+// must divide WARP_SIZE so segments never straddle a warp boundary.
+template <int WIDTH>
+__device__ __forceinline__ float subwarp_reduce_max(float v) {
+#pragma unroll
+  for (int offset = WIDTH / 2; offset > 0; offset >>= 1) {
+    v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, offset, WIDTH));
+  }
+  return v;
+}
+
 // Fused SITU + per-token dynamic FP8 quantization: vectorized, cp.async
 // double-buffered version used whenever `d` is a multiple of VEC_ELTS (every
 // real MoE intermediate size). One block per row.
@@ -808,6 +820,180 @@ __global__ void situ_and_mul_quant_pipelined_kernel(
     }
     for (int idx = tail_start + tid; idx < d; idx += THREADS) {
       out_ptr[idx] = quant_to_fp8<fp8_type>(s_act[idx], inv_scale, fp8_max);
+    }
+  }
+}
+
+// Fused SITU + block-FP8 (per-128-group) dynamic FP8 quantization: vectorized,
+// cp.async double-buffered, SINGLE pass. Unlike the per-token pipelined kernel
+// above, each 128-element group's scale depends only on that group's abs-max, so
+// each warp finalizes ONE 128-group per iteration -- reduce, scale, quantize,
+// store -- the moment its data lands. One warp per group means a full-warp
+// abs-max reduction (no partial-warp mask hazard, so any d % GROUP_SIZE == 0
+// works), and the group's gate+up are staged with 128-bit cp.async loads split
+// across the warp (lanes 0..15 fetch the 128 gate elts, lanes 16..31 the 128 up
+// elts, 8 bf16 each); the compute phase re-reads 4 elts/lane. SITU itself stays
+// in float and rounds to scalar_t before quant, matching humming's quant_input
+// numerics exactly (see the per-token kernels' scale/cvt comments). One block
+// per row; warp w strides over groups w, w + NUM_WARPS, ... Emits k-major
+// float32 group scales scale_out[row * num_groups + g] with scale = max(absmax,
+// 1e-30) / fp8_max (reciprocal-multiply form). Padding rows leave `out`
+// untouched. GROUP_SIZE is 128: WARP_SIZE/2 lanes * (16 bytes / 2) = 128 elts.
+template <typename scalar_t, typename fp8_type, int THREADS, int NUM_STAGES,
+          int GROUP_SIZE>
+__global__ void situ_and_mul_quant_group_pipelined_kernel(
+    fp8_type* __restrict__ out,          // [num_tokens, d]
+    float* __restrict__ scale_out,       // [num_tokens, num_groups]
+    const scalar_t* __restrict__ input,  // [num_tokens, 2, d]
+    const int d, const int num_groups, const float beta, const float linear_beta,
+    const float fp8_max, const int64_t* __restrict__ valid_rows_ptr) {
+  const int64_t row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int warp_id = tid / WARP_SIZE;
+  const int lane_id = tid % WARP_SIZE;
+  static constexpr int NUM_WARPS = THREADS / WARP_SIZE;
+  float* scale_row = scale_out + row * (int64_t)num_groups;
+
+  if (valid_rows_ptr != nullptr && row >= *valid_rows_ptr) {
+    for (int g = tid; g < num_groups; g += THREADS) scale_row[g] = 1.0f;
+    return;
+  }
+
+  // Vectorized loads/stores assume a 2-byte scalar_t (see the per-token
+  // pipelined kernel); the fp32 dispatch branch is compiled out here and served
+  // by situ_and_mul_quant_group_scalar_kernel instead.
+  if constexpr (sizeof(scalar_t) == 2) {
+    static constexpr int LD_ELTS = 16 / sizeof(scalar_t);        // 8 (load)
+    static constexpr int ELTS_PER_LANE = GROUP_SIZE / WARP_SIZE;  // 4 (compute)
+    static constexpr int STAGE_ELTS = 2 * GROUP_SIZE;  // gate+up per stage/warp
+
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    scalar_t* warp_smem = reinterpret_cast<scalar_t*>(smem_raw) +
+                          (size_t)warp_id * NUM_STAGES * STAGE_ELTS;
+
+    const scalar_t* gate_row = input + row * 2 * (int64_t)d;
+    const scalar_t* up_row = gate_row + d;
+    fp8_type* out_row = out + row * (int64_t)d;
+
+    const bool clamp_up = linear_beta > 0.0f;
+    const float inv_beta = 1.0f / beta;
+    const float inv_linear_beta = clamp_up ? 1.0f / linear_beta : 0.0f;
+
+    // Number of groups this warp processes, strided by NUM_WARPS.
+    const int num_iters = (num_groups - warp_id + NUM_WARPS - 1) / NUM_WARPS;
+
+    // Stage group `it` (its 128 gate + 128 up elts) into slot it % NUM_STAGES.
+    // Every lane commits exactly one group so a constant wait_group stays valid.
+    auto issue_load = [&](int it) {
+      if (it < num_iters) {
+        const int g = warp_id + it * NUM_WARPS;
+        scalar_t* dst = warp_smem + (size_t)(it % NUM_STAGES) * STAGE_ELTS;
+        if (lane_id < WARP_SIZE / 2) {
+          cuda_async::cp_async_shared_global_16_cg(
+              dst + lane_id * LD_ELTS,
+              &gate_row[(size_t)g * GROUP_SIZE + lane_id * LD_ELTS]);
+        } else {
+          const int l = lane_id - WARP_SIZE / 2;
+          cuda_async::cp_async_shared_global_16_cg(
+              dst + GROUP_SIZE + l * LD_ELTS,
+              &up_row[(size_t)g * GROUP_SIZE + l * LD_ELTS]);
+        }
+      }
+      cuda_async::cp_async_commit_group();
+    };
+
+#pragma unroll
+    for (int s = 0; s < NUM_STAGES - 1; s++) issue_load(s);
+
+    for (int it = 0; it < num_iters; it++) {
+      issue_load(it + NUM_STAGES - 1);
+      cuda_async::cp_async_wait_group<NUM_STAGES - 1>();
+
+      const int g = warp_id + it * NUM_WARPS;
+      const scalar_t* g_src = warp_smem + (size_t)(it % NUM_STAGES) * STAGE_ELTS +
+                              lane_id * ELTS_PER_LANE;
+      const scalar_t* u_src = g_src + GROUP_SIZE;
+
+      float acts[ELTS_PER_LANE];
+      float thread_max = 0.0f;
+#pragma unroll
+      for (int e = 0; e < ELTS_PER_LANE; e++) {
+        acts[e] = (float)(scalar_t)situ_activation(
+            (float)g_src[e], (float)u_src[e], beta, linear_beta, clamp_up,
+            inv_beta, inv_linear_beta);
+        thread_max = fmaxf(thread_max, fabsf(acts[e]));
+      }
+      const float absmax = fmaxf(warp_reduce_max(thread_max), 1e-30f);
+      const float scale = absmax * (1.0f / fp8_max);
+      if (lane_id == 0) scale_row[g] = scale;
+      const float inv_scale = 1.0f / scale;
+
+      fp8_type vec_out[ELTS_PER_LANE];
+#pragma unroll
+      for (int e = 0; e < ELTS_PER_LANE; e++) {
+        vec_out[e] = quant_to_fp8<fp8_type>(acts[e], inv_scale, fp8_max);
+      }
+      // 4 fp8 (ELTS_PER_LANE) in one 32-bit vectorized store.
+      *reinterpret_cast<int*>(
+          &out_row[(size_t)g * GROUP_SIZE + lane_id * ELTS_PER_LANE]) =
+          *reinterpret_cast<int*>(vec_out);
+    }
+  }
+}
+
+// Scalar fallback for the group path (odd d or the otherwise-unreachable fp32
+// dispatch branch). One block per row; warp `w` owns groups w, w + num_warps,
+// ... Lane `l` handles elements {l, l+32, ...} of its group and a full-warp
+// shuffle reduces the group abs-max. Requires GROUP_SIZE % WARP_SIZE == 0.
+template <typename scalar_t, typename fp8_type, int GROUP_SIZE>
+__global__ void situ_and_mul_quant_group_scalar_kernel(
+    fp8_type* __restrict__ out,          // [num_tokens, d]
+    float* __restrict__ scale_out,       // [num_tokens, num_groups]
+    const scalar_t* __restrict__ input,  // [num_tokens, 2, d]
+    const int d, const int num_groups, const float beta, const float linear_beta,
+    const float fp8_max, const int64_t* __restrict__ valid_rows_ptr) {
+  static constexpr int ELTS_PER_LANE = GROUP_SIZE / WARP_SIZE;
+  const int64_t row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int warp_id = tid / WARP_SIZE;
+  const int lane_id = tid % WARP_SIZE;
+  const int num_warps = blockDim.x / WARP_SIZE;
+  float* scale_row = scale_out + row * (int64_t)num_groups;
+
+  if (valid_rows_ptr != nullptr && row >= *valid_rows_ptr) {
+    for (int g = tid; g < num_groups; g += blockDim.x) scale_row[g] = 1.0f;
+    return;
+  }
+
+  const scalar_t* gate_ptr = input + row * 2 * (int64_t)d;
+  const scalar_t* up_ptr = gate_ptr + d;
+  fp8_type* out_ptr = out + row * (int64_t)d;
+
+  const bool clamp_up = linear_beta > 0.0f;
+  const float inv_beta = 1.0f / beta;
+  const float inv_linear_beta = clamp_up ? 1.0f / linear_beta : 0.0f;
+
+  for (int g = warp_id; g < num_groups; g += num_warps) {
+    const int base = g * GROUP_SIZE;
+    float acts[ELTS_PER_LANE];
+    float thread_max = 0.0f;
+#pragma unroll
+    for (int e = 0; e < ELTS_PER_LANE; e++) {
+      const int idx = base + e * WARP_SIZE + lane_id;
+      const float gv = (float)VLLM_LDG(&gate_ptr[idx]);
+      const float uv = (float)VLLM_LDG(&up_ptr[idx]);
+      acts[e] = (float)(scalar_t)situ_activation(
+          gv, uv, beta, linear_beta, clamp_up, inv_beta, inv_linear_beta);
+      thread_max = fmaxf(thread_max, fabsf(acts[e]));
+    }
+    const float absmax = fmaxf(warp_reduce_max(thread_max), 1e-30f);
+    const float scale = absmax * (1.0f / fp8_max);
+    if (lane_id == 0) scale_row[g] = scale;
+    const float inv_scale = 1.0f / scale;
+#pragma unroll
+    for (int e = 0; e < ELTS_PER_LANE; e++) {
+      const int idx = base + e * WARP_SIZE + lane_id;
+      out_ptr[idx] = quant_to_fp8<fp8_type>(acts[e], inv_scale, fp8_max);
     }
   }
 }
@@ -983,17 +1169,20 @@ void masked_situ_and_mul(torch::stable::Tensor& out,    // [E, T, d]
       });
 }
 
-// Fused Kimi SITU activation + per-token dynamic FP8 quantization. Produces the
-// fp8 down-projection input (`out`) and its per-token scale (`scale`, dequant =
-// q * scale) in one pass, replacing the separate situ_and_mul + quant_input
-// kernels on the Humming w2 path. `linear_beta <= 0` means "unset" (up passed
-// through), matching SituAndMul(linear_beta=None). `valid_rows` (int64 scalar
-// tensor) is the DeepEP v2 contiguous-layout valid row count; padding rows are
-// skipped and receive a benign scale.
+// Fused Kimi SITU activation + dynamic FP8 quantization. Produces the fp8
+// down-projection input (`out`) and its scale (`scale`, dequant = q * scale) in
+// one pass, replacing the separate situ_and_mul + quant_input kernels on the
+// Humming w2 path. `group_size == 0` selects per-token scales (scale [.., 1]);
+// `group_size == 128` selects k-major block-FP8 group scales (scale
+// [.., d / 128], matching humming quant_input(group_size=128, float32)).
+// `linear_beta <= 0` means "unset" (up passed through), matching
+// SituAndMul(linear_beta=None). `valid_rows` (int64 scalar tensor) is the DeepEP
+// v2 contiguous-layout valid row count; padding rows are skipped and receive a
+// benign scale.
 void situ_and_mul_quant(torch::stable::Tensor& out,    // [..., d]  (fp8)
-                        torch::stable::Tensor& scale,  // [..., 1]  (float32)
+                        torch::stable::Tensor& scale,  // [..., 1 or d/128]
                         torch::stable::Tensor& input,  // [..., 2 * d]
-                        double beta, double linear_beta,
+                        double beta, double linear_beta, int64_t group_size,
                         std::optional<torch::stable::Tensor> valid_rows) {
   STD_TORCH_CHECK(
       out.scalar_type() == torch::headeronly::ScalarType::Float8_e4m3fn ||
@@ -1024,6 +1213,58 @@ void situ_and_mul_quant(torch::stable::Tensor& out,    // [..., d]  (fp8)
   const cudaStream_t stream = get_current_cuda_stream();
   static constexpr int THREADS = 256;
   static constexpr int NUM_STAGES = 2;
+  static constexpr int GROUP_STAGES = 3;  // warp-per-group cp.async depth
+
+  if (group_size > 0) {
+    // Block-FP8 group path: k-major float32 group scales [num_tokens,
+    // d / group_size], matching humming quant_input(group_size, float32).
+    STD_TORCH_CHECK(group_size == 128,
+                    "situ_and_mul_quant: only group_size 0 (per-token) or 128 "
+                    "(block-FP8) supported, got ",
+                    group_size);
+    STD_TORCH_CHECK(d % group_size == 0,
+                    "situ_and_mul_quant: d (", d,
+                    ") must be divisible by group_size ", group_size);
+    const int num_groups = d / (int)group_size;
+    VLLM_STABLE_DISPATCH_FLOATING_TYPES(
+        input.scalar_type(), "situ_and_mul_quant_group_kernel", [&] {
+          VLLM_STABLE_DISPATCH_FP8_TYPES(
+              out.scalar_type(), "situ_and_mul_quant_group_kernel_fp8", [&] {
+                // Warp-per-group pipelined kernel: one warp owns a whole
+                // 128-group, so the full-warp abs-max reduction is always safe
+                // (no partial-warp mask hazard) and any d % 128 == 0 works. Only
+                // 2-byte scalar_t is vectorized; the fp32 dispatch branch falls
+                // back to the scalar group kernel.
+                if constexpr (sizeof(scalar_t) == 2) {
+                  constexpr int NUM_WARPS = THREADS / 32;
+                  constexpr int STAGE_ELTS = 2 * 128;  // gate + up per group
+                  auto kernel = &vllm::situ_and_mul_quant_group_pipelined_kernel<
+                      scalar_t, fp8_t, THREADS, GROUP_STAGES, 128>;
+                  size_t smem_bytes = (size_t)NUM_WARPS * GROUP_STAGES *
+                                      STAGE_ELTS * sizeof(scalar_t);
+                  dim3 block(THREADS);
+                  kernel<<<grid, block, smem_bytes, stream>>>(
+                      out.mutable_data_ptr<fp8_t>(),
+                      scale.mutable_data_ptr<float>(),
+                      input.const_data_ptr<scalar_t>(), d, num_groups,
+                      (float)beta, (float)linear_beta, fp8_max, valid_rows_ptr);
+                  return;
+                }
+                const int num_warps = std::min(num_groups, 32);
+                dim3 block(num_warps * 32);
+                vllm::situ_and_mul_quant_group_scalar_kernel<scalar_t, fp8_t,
+                                                             128>
+                    <<<grid, block, 0, stream>>>(
+                        out.mutable_data_ptr<fp8_t>(),
+                        scale.mutable_data_ptr<float>(),
+                        input.const_data_ptr<scalar_t>(), d, num_groups,
+                        (float)beta, (float)linear_beta, fp8_max,
+                        valid_rows_ptr);
+              });
+        });
+    return;
+  }
+
   VLLM_STABLE_DISPATCH_FLOATING_TYPES(
       input.scalar_type(), "situ_and_mul_quant_kernel", [&] {
         VLLM_STABLE_DISPATCH_FP8_TYPES(
