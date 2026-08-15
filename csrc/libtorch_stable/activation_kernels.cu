@@ -633,18 +633,34 @@ situ_and_mul_quant_group_pipelined_kernel(
         cuda_async::cp_async_wait_group<NUM_STAGES - 1>();
 
         const int g = warp_id + it * NUM_WARPS;
-        const scalar_t* g_src = warp_smem +
-                                (size_t)(it % NUM_STAGES) * STAGE_ELTS +
-                                lane_id * ELTS_PER_LANE;
-        const scalar_t* u_src = g_src + GROUP_SIZE;
+        const scalar_t* stage =
+            warp_smem + (size_t)(it % NUM_STAGES) * STAGE_ELTS;
+        // Conflict-free smem reads: each lane pulls two 32-bit words (2 scalars
+        // each) at indices `lane` and `lane + 32`, so all 32 lanes map to
+        // distinct banks (bank == lane). Lane L thus owns group elements
+        // {2L, 2L+1, 2L+64, 2L+65} for gate and up alike, vs the old contiguous
+        // 8-byte-per-lane layout that 2-way-conflicted lanes L and L+16.
+        static_assert(ELTS_PER_LANE == 4, "expects GROUP_SIZE == 4 * WARP_SIZE");
+        union W {
+          float f;
+          scalar_t s[2];
+        };
+        const float* gate32 = reinterpret_cast<const float*>(stage);
+        const float* up32 = reinterpret_cast<const float*>(stage + GROUP_SIZE);
+        const W gw0{gate32[lane_id]}, gw1{gate32[lane_id + WARP_SIZE]};
+        const W uw0{up32[lane_id]}, uw1{up32[lane_id + WARP_SIZE]};
+        const scalar_t gs[ELTS_PER_LANE] = {gw0.s[0], gw0.s[1], gw1.s[0],
+                                            gw1.s[1]};
+        const scalar_t us[ELTS_PER_LANE] = {uw0.s[0], uw0.s[1], uw1.s[0],
+                                            uw1.s[1]};
 
         float acts[ELTS_PER_LANE];
         float thread_max = 0.0f;
 #pragma unroll
         for (int e = 0; e < ELTS_PER_LANE; e++) {
           acts[e] = (float)(scalar_t)situ_activation(
-              (float)g_src[e], (float)u_src[e], beta, linear_beta, clamp_up,
-              inv_beta, inv_linear_beta);
+              (float)gs[e], (float)us[e], beta, linear_beta, clamp_up, inv_beta,
+              inv_linear_beta);
           thread_max = fmaxf(thread_max, fabsf(acts[e]));
         }
         const float absmax = fmaxf(warp_reduce_max(thread_max), 1e-30f);
@@ -652,15 +668,21 @@ situ_and_mul_quant_group_pipelined_kernel(
         if (lane_id == 0) scale_row[g] = scale;
         const float inv_scale = 1.0f / scale;
 
-        fp8_type vec_out[ELTS_PER_LANE];
-#pragma unroll
-        for (int e = 0; e < ELTS_PER_LANE; e++) {
-          vec_out[e] = quant_to_fp8<fp8_type>(acts[e], inv_scale, fp8_max);
-        }
-        // 4 fp8 in one 32-bit vectorized store.
-        *reinterpret_cast<int*>(
-            &out_row[(size_t)g * GROUP_SIZE + lane_id * ELTS_PER_LANE]) =
-            *reinterpret_cast<int*>(vec_out);
+        union O {
+          uint16_t u;
+          fp8_type f[2];
+        };
+        O o0, o1;
+        o0.f[0] = quant_to_fp8<fp8_type>(acts[0], inv_scale, fp8_max);
+        o0.f[1] = quant_to_fp8<fp8_type>(acts[1], inv_scale, fp8_max);
+        o1.f[0] = quant_to_fp8<fp8_type>(acts[2], inv_scale, fp8_max);
+        o1.f[1] = quant_to_fp8<fp8_type>(acts[3], inv_scale, fp8_max);
+        // Two 16-bit stores mirror the {2L,2L+1} / {2L+64,2L+65} ownership;
+        // each spans 64 contiguous bytes across the warp (coalesced).
+        uint16_t* out16 =
+            reinterpret_cast<uint16_t*>(out_row + (size_t)g * GROUP_SIZE);
+        out16[lane_id] = o0.u;
+        out16[lane_id + WARP_SIZE] = o1.u;
       }
       // Drain before reusing smem slots for the next row.
       cuda_async::cp_async_wait_group<0>();
