@@ -489,9 +489,13 @@ __device__ __forceinline__ float situ_activation(float g, float u, float beta,
                                                   float linear_beta,
                                                   bool clamp_up, float inv_beta,
                                                   float inv_linear_beta) {
-  const float gate_out = beta * tanhf(g * inv_beta) / (1.0f + expf(-g));
+  // __tanhf/__expf lower to a single MUFU each with no out-of-line slow path.
+  // The accurate tanhf/expf carry a range-reduction CALL for extreme args that
+  // never fires on bounded activations, yet forces a stack frame + ABI register
+  // spills and holds register count high.
+  const float gate_out = beta * __tanhf(g * inv_beta) / (1.0f + __expf(-g));
   const float up_out =
-      clamp_up ? linear_beta * tanhf(u * inv_linear_beta) : u;
+      clamp_up ? linear_beta * __tanhf(u * inv_linear_beta) : u;
   return gate_out * up_out;
 }
 
@@ -566,11 +570,7 @@ __device__ __forceinline__ float warp_reduce_max(float v) {
 // *valid_rows are never touched. cp.async stages gate+up into smem per group.
 template <typename scalar_t, typename fp8_type, int THREADS, int NUM_STAGES,
           int GROUP_SIZE>
-// Cap at 4 blocks/SM (=> up to 64 regs/thread) so the compiler keeps acts[]
-// and the FP8 temps in registers instead of spilling to local memory. The
-// kernel is issue-bound with ~6 eligible warps/scheduler, not occupancy-bound,
-// so the extra registers beat the theoretical-occupancy the 32-reg cap bought.
-__global__ void __launch_bounds__(THREADS, 4)
+__global__ void __launch_bounds__(THREADS, 8)  // 8 blocks/SM => 100% occupancy
 situ_and_mul_quant_group_pipelined_kernel(
     fp8_type* __restrict__ out,          // [num_tokens, d]
     float* __restrict__ scale_out,       // [num_tokens, num_groups]
