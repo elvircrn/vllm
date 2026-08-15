@@ -498,8 +498,9 @@ __device__ __forceinline__ float situ_activation(float g, float u, float beta,
                                                   float linear_beta,
                                                   bool clamp_up, float inv_beta,
                                                   float inv_linear_beta) {
+  // __fdividef: fast MUFU.RCP + FMUL, no FCHK range-check / slow-path branch.
   const float gate_out =
-      beta * tanh_approx(g * inv_beta) / (1.0f + __expf(-g));
+      __fdividef(beta * tanh_approx(g * inv_beta), 1.0f + __expf(-g));
   const float up_out =
       clamp_up ? linear_beta * tanh_approx(u * inv_linear_beta) : u;
   return gate_out * up_out;
@@ -609,28 +610,26 @@ __global__ void situ_and_mul_quant_group_pipelined_kernel(
     const int num_iters = (num_groups - warp_id + NUM_WARPS - 1) / NUM_WARPS;
 
     for (int64_t row = blockIdx.x; row < row_bound; row += gridDim.x) {
-      const scalar_t* gate_row = input + row * 2 * (int64_t)d;
-      const scalar_t* up_row = gate_row + d;
-      fp8_type* out_row = out + row * (int64_t)d;
-      float* scale_row = scale_out + row * (int64_t)num_groups;
+      // Strength-reduced addressing: per-warp base pointer bumped by the warp
+      // stride each iteration; `up` folds into the gate base via a +d index.
+      const scalar_t* gate_ld =
+          input + row * 2 * (int64_t)d + (int64_t)warp_id * GROUP_SIZE;
 
-      // Stage group `it` into `slot` (a rotating 0..NUM_STAGES-1 counter, not a
-      // per-iteration modulo); every lane commits exactly one group so a
-      // constant wait_group stays valid.
-      auto issue_load = [&](int it, int slot) {
+      // Stage the next group into `slot` (rotating 0..NUM_STAGES-1). Called once
+      // per group in increasing order, so the bumping load pointer stays in step.
+      auto issue_load = [&gate_ld, d, num_iters, lane_id, warp_smem](int it,
+                                                                     int slot) {
         if (it < num_iters) {
-          const int g = warp_id + it * NUM_WARPS;
           scalar_t* dst = warp_smem + (size_t)slot * STAGE_ELTS;
           if (lane_id < WARP_SIZE / 2) {
-            cuda_async::cp_async_shared_global_16_cg(
-                dst + lane_id * LD_ELTS,
-                &gate_row[(size_t)g * GROUP_SIZE + lane_id * LD_ELTS]);
+            cuda_async::cp_async_shared_global_16_cg(dst + lane_id * LD_ELTS,
+                                                     gate_ld + lane_id * LD_ELTS);
           } else {
             const int l = lane_id - WARP_SIZE / 2;
             cuda_async::cp_async_shared_global_16_cg(
-                dst + GROUP_SIZE + l * LD_ELTS,
-                &up_row[(size_t)g * GROUP_SIZE + l * LD_ELTS]);
+                dst + GROUP_SIZE + l * LD_ELTS, gate_ld + (size_t)d + l * LD_ELTS);
           }
+          gate_ld += (int64_t)NUM_WARPS * GROUP_SIZE;
         }
         cuda_async::cp_async_commit_group();
       };
@@ -643,13 +642,18 @@ __global__ void situ_and_mul_quant_group_pipelined_kernel(
         load_slot = bump(load_slot);
       }
 
+      // Compute/store bases bump like the load stream (out is fp8, so the uint16
+      // view advances by half the element stride).
+      uint16_t* out_st = reinterpret_cast<uint16_t*>(
+          out + row * (int64_t)d + (int64_t)warp_id * GROUP_SIZE);
+      float* scale_st = scale_out + row * (int64_t)num_groups + warp_id;
+
       int comp_slot = 0;
       for (int it = 0; it < num_iters; it++) {
         issue_load(it + NUM_STAGES - 1, load_slot);
         load_slot = bump(load_slot);
         cuda_async::cp_async_wait_group<NUM_STAGES - 1>();
 
-        const int g = warp_id + it * NUM_WARPS;
         const scalar_t* stage = warp_smem + (size_t)comp_slot * STAGE_ELTS;
         comp_slot = bump(comp_slot);
         // Conflict-free smem reads: each lane pulls two 32-bit words (2 scalars
@@ -682,7 +686,8 @@ __global__ void situ_and_mul_quant_group_pipelined_kernel(
         }
         const float absmax = fmaxf(warp_reduce_max(thread_max), 1e-30f);
         const float scale = absmax * (1.0f / fp8_max);
-        if (lane_id == 0) scale_row[g] = scale;
+        if (lane_id == 0) *scale_st = scale;
+        scale_st += NUM_WARPS;
         const float inv_scale = 1.0f / scale;
 
         union O {
@@ -696,10 +701,9 @@ __global__ void situ_and_mul_quant_group_pipelined_kernel(
         o1.f[1] = quant_to_fp8<fp8_type>(acts[3], inv_scale, fp8_max);
         // Two 16-bit stores mirror the {2L,2L+1} / {2L+64,2L+65} ownership;
         // each spans 64 contiguous bytes across the warp (coalesced).
-        uint16_t* out16 =
-            reinterpret_cast<uint16_t*>(out_row + (size_t)g * GROUP_SIZE);
-        out16[lane_id] = o0.u;
-        out16[lane_id + WARP_SIZE] = o1.u;
+        out_st[lane_id] = o0.u;
+        out_st[lane_id + WARP_SIZE] = o1.u;
+        out_st += (int64_t)NUM_WARPS * GROUP_SIZE / 2;
       }
       // Drain before reusing smem slots for the next row.
       cuda_async::cp_async_wait_group<0>();
