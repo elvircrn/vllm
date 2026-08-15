@@ -566,7 +566,8 @@ __device__ __forceinline__ float warp_reduce_max(float v) {
 // *valid_rows are never touched. cp.async stages gate+up into smem per group.
 template <typename scalar_t, typename fp8_type, int THREADS, int NUM_STAGES,
           int GROUP_SIZE>
-__global__ void situ_and_mul_quant_group_pipelined_kernel(
+__global__ void __launch_bounds__(THREADS, 8)  // 8 blocks/SM => 100% occupancy
+situ_and_mul_quant_group_pipelined_kernel(
     fp8_type* __restrict__ out,          // [num_tokens, d]
     float* __restrict__ scale_out,       // [num_tokens, num_groups]
     const scalar_t* __restrict__ input,  // [num_tokens, 2, d]
@@ -665,6 +666,15 @@ __global__ void situ_and_mul_quant_group_pipelined_kernel(
       cuda_async::cp_async_wait_group<0>();
     }
   }
+
+  // Padding rows past *valid_rows are never streamed above; fill their scales
+  // with a finite value so masked-out rows don't feed NaN/Inf into the w2 GEMM.
+  const int64_t pad_start = row_bound * (int64_t)num_groups;
+  const int64_t pad_end = num_rows * (int64_t)num_groups;
+  for (int64_t i = pad_start + (int64_t)blockIdx.x * blockDim.x + tid;
+       i < pad_end; i += (int64_t)gridDim.x * blockDim.x) {
+    scale_out[i] = 1.0f;
+  }
 }
 
 // Scalar fallback for the group path (odd d or the otherwise-unreachable fp32
@@ -719,6 +729,15 @@ __global__ void situ_and_mul_quant_group_scalar_kernel(
         out_ptr[idx] = quant_to_fp8<fp8_type>(acts[e], inv_scale, fp8_max);
       }
     }
+  }
+
+  // Padding rows past *valid_rows are never streamed above; fill their scales
+  // with a finite value so masked-out rows don't feed NaN/Inf into the w2 GEMM.
+  const int64_t pad_start = row_bound * (int64_t)num_groups;
+  const int64_t pad_end = num_rows * (int64_t)num_groups;
+  for (int64_t i = pad_start + (int64_t)blockIdx.x * blockDim.x + tid;
+       i < pad_end; i += (int64_t)gridDim.x * blockDim.x) {
+    scale_out[i] = 1.0f;
   }
 }
 
@@ -935,7 +954,7 @@ void situ_and_mul_quant(torch::stable::Tensor& out,    // [..., d]  (fp8)
   const cudaStream_t stream = get_current_cuda_stream();
   static constexpr int THREADS = 256;
   static constexpr int GROUP_STAGES = 3;  // warp-per-group cp.async depth
-  static constexpr int BLOCKS_PER_SM = 8;  // persistent occupancy target
+  static constexpr int BLOCKS_PER_SM = 8;  // matches kernel __launch_bounds__
 
   // Block-FP8 group path only: k-major float32 group scales [num_tokens,
   // d / group_size], matching humming quant_input(group_size, float32).
