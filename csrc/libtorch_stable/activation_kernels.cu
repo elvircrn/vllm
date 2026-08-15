@@ -605,12 +605,13 @@ situ_and_mul_quant_group_pipelined_kernel(
       fp8_type* out_row = out + row * (int64_t)d;
       float* scale_row = scale_out + row * (int64_t)num_groups;
 
-      // Stage group `it` into slot it % NUM_STAGES; every lane commits exactly
-      // one group so a constant wait_group stays valid.
-      auto issue_load = [&](int it) {
+      // Stage group `it` into `slot` (a rotating 0..NUM_STAGES-1 counter, not a
+      // per-iteration modulo); every lane commits exactly one group so a
+      // constant wait_group stays valid.
+      auto issue_load = [&](int it, int slot) {
         if (it < num_iters) {
           const int g = warp_id + it * NUM_WARPS;
-          scalar_t* dst = warp_smem + (size_t)(it % NUM_STAGES) * STAGE_ELTS;
+          scalar_t* dst = warp_smem + (size_t)slot * STAGE_ELTS;
           if (lane_id < WARP_SIZE / 2) {
             cuda_async::cp_async_shared_global_16_cg(
                 dst + lane_id * LD_ELTS,
@@ -625,16 +626,23 @@ situ_and_mul_quant_group_pipelined_kernel(
         cuda_async::cp_async_commit_group();
       };
 
+      int load_slot = 0;
+      auto bump = [](int s) { return s + 1 == NUM_STAGES ? 0 : s + 1; };
 #pragma unroll
-      for (int s = 0; s < NUM_STAGES - 1; s++) issue_load(s);
+      for (int s = 0; s < NUM_STAGES - 1; s++) {
+        issue_load(s, load_slot);
+        load_slot = bump(load_slot);
+      }
 
+      int comp_slot = 0;
       for (int it = 0; it < num_iters; it++) {
-        issue_load(it + NUM_STAGES - 1);
+        issue_load(it + NUM_STAGES - 1, load_slot);
+        load_slot = bump(load_slot);
         cuda_async::cp_async_wait_group<NUM_STAGES - 1>();
 
         const int g = warp_id + it * NUM_WARPS;
-        const scalar_t* stage =
-            warp_smem + (size_t)(it % NUM_STAGES) * STAGE_ELTS;
+        const scalar_t* stage = warp_smem + (size_t)comp_slot * STAGE_ELTS;
+        comp_slot = bump(comp_slot);
         // Conflict-free smem reads: each lane pulls two 32-bit words (2 scalars
         // each) at indices `lane` and `lane + 32`, so all 32 lanes map to
         // distinct banks (bank == lane). Lane L thus owns group elements
