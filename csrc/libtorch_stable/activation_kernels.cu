@@ -620,26 +620,36 @@ __global__ void situ_and_mul_quant_group_pipelined_kernel(
         std::is_same_v<fp8_type, c10::Float8_e4m3fn> ? 448.0f : 224.0f;
     static constexpr float inv_fp8_max = 1.0f / FP8_MAX;
 
-    // Number of groups this warp processes, strided by NUM_WARPS.
-    const int num_iters = (NUM_GROUPS - warp_id + NUM_WARPS - 1) / NUM_WARPS;
+    // Groups per warp. When NUM_GROUPS splits evenly across warps every warp
+    // does the same count, so this folds to a constant (no per-warp register,
+    // compile-time loop bound). D=SITU_D satisfies this.
+    static_assert(NUM_GROUPS % NUM_WARPS == 0,
+                  "constexpr num_iters requires groups evenly split across warps");
+    static constexpr int num_iters = NUM_GROUPS / NUM_WARPS;
 
     // Per-lane load offsets, hoisted out of the loops: lanes 0..15 take the gate
     // half, 16..31 the up half (+D), each a 16B cp.async. Only the base bumps.
     const bool up_half = lane_id >= WARP_SIZE / 2;
     const int lane_l = up_half ? lane_id - WARP_SIZE / 2 : lane_id;
-    const int64_t lane_src_off =
-        (up_half ? (int64_t)D : 0) + (int64_t)lane_l * LD_ELTS;
+    const int lane_src_off = (up_half ? D : 0) + lane_l * LD_ELTS;
     const int lane_dst_off = (up_half ? GROUP_SIZE : 0) + lane_l * LD_ELTS;
-    static constexpr int64_t warp_stride = (int64_t)NUM_WARPS * GROUP_SIZE;
+    static constexpr int warp_stride = NUM_WARPS * GROUP_SIZE;
+
+    // Invariant per-lane source base; the row term folds into the running
+    // pointer so the loop bumps by a compile-time stride instead of
+    // recomputing row * 2 * D each iteration. All offsets fit int32 (stride
+    // GRID_DIM*2*D ~6.5M); the pointer stays 64-bit, so num_tokens is unbounded.
+    const scalar_t* src_ptr = input + warp_id * GROUP_SIZE + lane_src_off;
+    static constexpr int src_row_stride = GRID_DIM * 2 * D;
+    const scalar_t* row_src = src_ptr + blockIdx.x * 2 * D;
 
     // Persistent outer loop kept sequential (nounroll): it wraps the whole
     // pipeline, and GRID_DIM is compile-time so the stride folds to a constant.
 #pragma unroll 1
-    for (int64_t row = blockIdx.x; row < row_bound; row += GRID_DIM) {
-      // Pre-offset per-lane source: warp/group/lane offsets folded in once, then
-      // bumped by the warp stride each group.
-      const scalar_t* src = input + row * 2 * (int64_t)D +
-                            (int64_t)warp_id * GROUP_SIZE + lane_src_off;
+    for (int64_t row = blockIdx.x; row < row_bound;
+         row += GRID_DIM, row_src += src_row_stride) {
+      // Per-lane source for this row; issue_load bumps `src` by warp_stride.
+      const scalar_t* src = row_src;
 
       // Stage the next group into `slot` (rotating 0..NUM_STAGES-1). Called once
       // per group in increasing order, so the bumping load pointer stays in step.
@@ -729,6 +739,7 @@ __global__ void situ_and_mul_quant_group_pipelined_kernel(
       cuda_async::cp_async_wait_group<0>();
     }
   }
+
 
   // Padding rows past *valid_rows are never streamed above; fill their scales
   // with a finite value so masked-out rows don't feed NaN/Inf into the w2 GEMM.
