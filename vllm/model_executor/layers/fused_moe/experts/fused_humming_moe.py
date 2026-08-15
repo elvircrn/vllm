@@ -678,7 +678,9 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
         group_size = self.humming_configs["w2"].input_scale_group_size or 0
         m, d = quanted_down_input.size(0), quanted_down_input.size(1)
         num_cols = 1 if group_size == 0 else d // group_size
-        input_scale = torch.empty(
+        # Persistent situ kernel writes scales only for valid rows; pre-fill so
+        # padding rows carry a benign finite scale for the w2 GEMM.
+        input_scale = torch.ones(
             (m, num_cols),
             dtype=torch.float32,
             device=quanted_down_input.device,
