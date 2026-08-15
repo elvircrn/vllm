@@ -566,7 +566,11 @@ __device__ __forceinline__ float warp_reduce_max(float v) {
 // *valid_rows are never touched. cp.async stages gate+up into smem per group.
 template <typename scalar_t, typename fp8_type, int THREADS, int NUM_STAGES,
           int GROUP_SIZE>
-__global__ void __launch_bounds__(THREADS, 8)  // 8 blocks/SM => 100% occupancy
+// Cap at 4 blocks/SM (=> up to 64 regs/thread) so the compiler keeps acts[]
+// and the FP8 temps in registers instead of spilling to local memory. The
+// kernel is issue-bound with ~6 eligible warps/scheduler, not occupancy-bound,
+// so the extra registers beat the theoretical-occupancy the 32-reg cap bought.
+__global__ void __launch_bounds__(THREADS, 4)
 situ_and_mul_quant_group_pipelined_kernel(
     fp8_type* __restrict__ out,          // [num_tokens, d]
     float* __restrict__ scale_out,       // [num_tokens, num_groups]
