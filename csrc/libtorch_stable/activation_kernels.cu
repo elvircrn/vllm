@@ -596,6 +596,21 @@ __global__ void situ_and_mul_quant_group_pipelined_kernel(
   const int64_t row_bound =
       valid_rows_ptr != nullptr ? *valid_rows_ptr : num_rows;
 
+  // Padding rows past *valid_rows are never streamed below; fill their scales
+  // with 1.0 so masked-out rows don't feed NaN/Inf into the w2 GEMM. NUM_GROUPS
+  // is a multiple of 4, so the run is float4-aligned and exact (scale_out is a
+  // tensor base, >=16B aligned).
+  static_assert(NUM_GROUPS % 4 == 0, "float4 scale fill needs NUM_GROUPS % 4 == 0");
+  static constexpr int NG4 = NUM_GROUPS / 4;
+  const int64_t pad_start4 = row_bound * NG4;
+  const int64_t pad_end4 = num_rows * NG4;
+  float4* scale4 = reinterpret_cast<float4*>(scale_out);
+  constexpr float4 ones{1.0f, 1.0f, 1.0f, 1.0f};
+  for (int64_t i = pad_start4 + (int64_t)blockIdx.x * THREADS + tid;
+       i < pad_end4; i += (int64_t)GRID_DIM * THREADS) {
+    scale4[i] = ones;
+  }
+
   // Vectorized loads/stores assume a 2-byte scalar_t; the fp32 dispatch branch
   // is compiled out here and served by the scalar group kernel instead.
   if constexpr (sizeof(scalar_t) == 2) {
@@ -643,12 +658,12 @@ __global__ void situ_and_mul_quant_group_pipelined_kernel(
     static constexpr int src_row_stride = GRID_DIM * 2 * D;
     const scalar_t* row_src = src_ptr + blockIdx.x * 2 * D;
 
-    // Same reduction for the store bases (out uint16 view, and scale). Per-row
-    // strides fit int32 (out ~1.6M, scale ~25K); pointers stay 64-bit.
-    uint16_t* out_ptr =
-        reinterpret_cast<uint16_t*>(out + warp_id * GROUP_SIZE) + lane_id;
-    static constexpr int out_row_stride = GRID_DIM * D / 2;
-    uint16_t* row_out = out_ptr + blockIdx.x * (D / 2);
+    // Same reduction for the store bases (out uint32 view = 4 fp8/lane, and
+    // scale). Per-row strides fit int32 (out ~0.8M, scale ~25K); ptrs stay 64b.
+    uint32_t* out_ptr =
+        reinterpret_cast<uint32_t*>(out + warp_id * GROUP_SIZE) + lane_id;
+    static constexpr int out_row_stride = GRID_DIM * D / 4;
+    uint32_t* row_out = out_ptr + blockIdx.x * (D / 4);
     float* scale_ptr = scale_out + warp_id;
     static constexpr int scale_row_stride = GRID_DIM * NUM_GROUPS;
     float* row_scale = scale_ptr + blockIdx.x * NUM_GROUPS;
@@ -682,7 +697,7 @@ __global__ void situ_and_mul_quant_group_pipelined_kernel(
       }
 
       // Compute/store bases for this row (bumped per group below).
-      uint16_t* out_st = row_out;
+      uint32_t* out_st = row_out;
       float* scale_st = row_scale;
 
       int comp_slot = 0;
@@ -693,24 +708,22 @@ __global__ void situ_and_mul_quant_group_pipelined_kernel(
 
         const scalar_t* stage = warp_smem + (size_t)comp_slot * STAGE_ELTS;
         comp_slot = bump(comp_slot);
-        // Conflict-free smem reads: each lane pulls two 32-bit words (2 scalars
-        // each) at indices `lane` and `lane + 32`, so all 32 lanes map to
-        // distinct banks (bank == lane). Lane L thus owns group elements
-        // {2L, 2L+1, 2L+64, 2L+65} for gate and up alike, vs the old contiguous
-        // 8-byte-per-lane layout that 2-way-conflicted lanes L and L+16.
+        // Lane L owns 4 contiguous group elements {4L..4L+3}: one 64-bit smem
+        // load (float2) each for gate and up, vs 4x 32-bit before. lane L -> word
+        // L is the conflict-free 64-bit pattern, and float2 is 8B-aligned (stage
+        // is 512B-aligned, up half at +256B).
         static_assert(ELTS_PER_LANE == 4, "expects GROUP_SIZE == 4 * WARP_SIZE");
-        union W {
-          float f;
-          scalar_t s[2];
+        union V {
+          float2 f2;
+          scalar_t s[ELTS_PER_LANE];
         };
-        const float* gate32 = reinterpret_cast<const float*>(stage);
-        const float* up32 = reinterpret_cast<const float*>(stage + GROUP_SIZE);
-        const W gw0{gate32[lane_id]}, gw1{gate32[lane_id + WARP_SIZE]};
-        const W uw0{up32[lane_id]}, uw1{up32[lane_id + WARP_SIZE]};
-        const scalar_t gs[ELTS_PER_LANE] = {gw0.s[0], gw0.s[1], gw1.s[0],
-                                            gw1.s[1]};
-        const scalar_t us[ELTS_PER_LANE] = {uw0.s[0], uw0.s[1], uw1.s[0],
-                                            uw1.s[1]};
+        const float2* gate2 = reinterpret_cast<const float2*>(stage);
+        const float2* up2 =
+            reinterpret_cast<const float2*>(stage + GROUP_SIZE);
+        const V gv{gate2[lane_id]};
+        const V uv{up2[lane_id]};
+        const scalar_t* gs = gv.s;
+        const scalar_t* us = uv.s;
 
         float acts[ELTS_PER_LANE];
         float thread_max = 0.0f;
@@ -727,36 +740,23 @@ __global__ void situ_and_mul_quant_group_pipelined_kernel(
         scale_st += NUM_WARPS;
         const float inv_scale = __fdividef(1.0f, scale);
 
+        // 4 contiguous fp8 outputs -> one 32-bit coalesced store: lanes 0..31
+        // write out[0..127] of the group as 128 contiguous bytes.
         union O {
-          uint16_t u;
-          fp8_type f[2];
+          uint32_t u;
+          fp8_type f[ELTS_PER_LANE];
         };
-        O o0, o1;
-        o0.f[0] = quant_to_fp8<fp8_type>(acts[0], inv_scale, FP8_MAX);
-        o0.f[1] = quant_to_fp8<fp8_type>(acts[1], inv_scale, FP8_MAX);
-        o1.f[0] = quant_to_fp8<fp8_type>(acts[2], inv_scale, FP8_MAX);
-        o1.f[1] = quant_to_fp8<fp8_type>(acts[3], inv_scale, FP8_MAX);
-        // Two 16-bit stores mirror the {2L,2L+1} / {2L+64,2L+65} ownership;
-        // each spans 64 contiguous bytes across the warp (coalesced).
-        out_st[0] = o0.u;
-        out_st[WARP_SIZE] = o1.u;
-        out_st += NUM_WARPS * GROUP_SIZE / 2;
+        O o;
+#pragma unroll
+        for (int e = 0; e < ELTS_PER_LANE; e++) {
+          o.f[e] = quant_to_fp8<fp8_type>(acts[e], inv_scale, FP8_MAX);
+        }
+        out_st[0] = o.u;
+        out_st += NUM_WARPS * GROUP_SIZE / 4;
       }
       // Drain before reusing smem slots for the next row.
       cuda_async::cp_async_wait_group<0>();
     }
-  }
-
-
-  // Padding rows past *valid_rows are never streamed above; fill their scales
-  // with a finite value so masked-out rows don't feed NaN/Inf into the w2 GEMM.
-  const int64_t pad_start = row_bound * (int64_t)NUM_GROUPS;
-  const int64_t pad_end = num_rows * (int64_t)NUM_GROUPS;
-  // THREADS and GRID_DIM are compile-time; the whole stride folds to a constant.
-#pragma unroll 1
-  for (int64_t i = pad_start + (int64_t)blockIdx.x * THREADS + tid;
-       i < pad_end; i += (int64_t)GRID_DIM * THREADS) {
-    scale_out[i] = 1.0f;
   }
 }
 
