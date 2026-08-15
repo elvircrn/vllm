@@ -643,11 +643,22 @@ __global__ void situ_and_mul_quant_group_pipelined_kernel(
     static constexpr int src_row_stride = GRID_DIM * 2 * D;
     const scalar_t* row_src = src_ptr + blockIdx.x * 2 * D;
 
+    // Same reduction for the store bases (out uint16 view, and scale). Per-row
+    // strides fit int32 (out ~1.6M, scale ~25K); pointers stay 64-bit.
+    uint16_t* out_ptr =
+        reinterpret_cast<uint16_t*>(out + warp_id * GROUP_SIZE) + lane_id;
+    static constexpr int out_row_stride = GRID_DIM * D / 2;
+    uint16_t* row_out = out_ptr + blockIdx.x * (D / 2);
+    float* scale_ptr = scale_out + warp_id;
+    static constexpr int scale_row_stride = GRID_DIM * NUM_GROUPS;
+    float* row_scale = scale_ptr + blockIdx.x * NUM_GROUPS;
+
     // Persistent outer loop kept sequential (nounroll): it wraps the whole
     // pipeline, and GRID_DIM is compile-time so the stride folds to a constant.
 #pragma unroll 1
     for (int64_t row = blockIdx.x; row < row_bound;
-         row += GRID_DIM, row_src += src_row_stride) {
+         row += GRID_DIM, row_src += src_row_stride,
+                  row_out += out_row_stride, row_scale += scale_row_stride) {
       // Per-lane source for this row; issue_load bumps `src` by warp_stride.
       const scalar_t* src = row_src;
 
@@ -670,13 +681,9 @@ __global__ void situ_and_mul_quant_group_pipelined_kernel(
         load_slot = bump(load_slot);
       }
 
-      // Compute/store bases bump like the load stream (out is fp8, so the uint16
-      // view advances by half the element stride). out_st is pre-offset by lane.
-      uint16_t* out_st = reinterpret_cast<uint16_t*>(
-                             out + row * (int64_t)D +
-                             (int64_t)warp_id * GROUP_SIZE) +
-                         lane_id;
-      float* scale_st = scale_out + row * (int64_t)NUM_GROUPS + warp_id;
+      // Compute/store bases for this row (bumped per group below).
+      uint16_t* out_st = row_out;
+      float* scale_st = row_scale;
 
       int comp_slot = 0;
       for (int it = 0; it < num_iters; it++) {
@@ -733,7 +740,7 @@ __global__ void situ_and_mul_quant_group_pipelined_kernel(
         // each spans 64 contiguous bytes across the warp (coalesced).
         out_st[0] = o0.u;
         out_st[WARP_SIZE] = o1.u;
-        out_st += (int64_t)NUM_WARPS * GROUP_SIZE / 2;
+        out_st += NUM_WARPS * GROUP_SIZE / 2;
       }
       // Drain before reusing smem slots for the next row.
       cuda_async::cp_async_wait_group<0>();
