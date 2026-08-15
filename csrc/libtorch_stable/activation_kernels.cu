@@ -603,8 +603,10 @@ __global__ void situ_and_mul_quant_group_pipelined_kernel(
                           (size_t)warp_id * NUM_STAGES * STAGE_ELTS;
 
     const bool clamp_up = linear_beta > 0.0f;
-    const float inv_beta = 1.0f / beta;
-    const float inv_linear_beta = clamp_up ? 1.0f / linear_beta : 0.0f;
+    // __frcp_rn: correctly-rounded reciprocal, no IEEE-div FCHK slow-path CALL.
+    const float inv_beta = __frcp_rn(beta);
+    const float inv_linear_beta = clamp_up ? __frcp_rn(linear_beta) : 0.0f;
+    const float inv_fp8_max = __frcp_rn(fp8_max);
 
     // Number of groups this warp processes, strided by NUM_WARPS.
     const int num_iters = (num_groups - warp_id + NUM_WARPS - 1) / NUM_WARPS;
@@ -685,10 +687,10 @@ __global__ void situ_and_mul_quant_group_pipelined_kernel(
           thread_max = fmaxf(thread_max, fabsf(acts[e]));
         }
         const float absmax = fmaxf(warp_reduce_max(thread_max), 1e-30f);
-        const float scale = absmax * (1.0f / fp8_max);
+        const float scale = absmax * inv_fp8_max;
         if (lane_id == 0) *scale_st = scale;
         scale_st += NUM_WARPS;
-        const float inv_scale = 1.0f / scale;
+        const float inv_scale = __frcp_rn(scale);
 
         union O {
           uint16_t u;
@@ -740,8 +742,10 @@ __global__ void situ_and_mul_quant_group_scalar_kernel(
       valid_rows_ptr != nullptr ? *valid_rows_ptr : num_rows;
 
   const bool clamp_up = linear_beta > 0.0f;
-  const float inv_beta = 1.0f / beta;
-  const float inv_linear_beta = clamp_up ? 1.0f / linear_beta : 0.0f;
+  // __frcp_rn: correctly-rounded reciprocal, no IEEE-div FCHK slow-path CALL.
+  const float inv_beta = __frcp_rn(beta);
+  const float inv_linear_beta = clamp_up ? __frcp_rn(linear_beta) : 0.0f;
+  const float inv_fp8_max = __frcp_rn(fp8_max);
 
   for (int64_t row = blockIdx.x; row < row_bound; row += gridDim.x) {
     const scalar_t* gate_ptr = input + row * 2 * (int64_t)d;
@@ -763,9 +767,9 @@ __global__ void situ_and_mul_quant_group_scalar_kernel(
         thread_max = fmaxf(thread_max, fabsf(acts[e]));
       }
       const float absmax = fmaxf(warp_reduce_max(thread_max), 1e-30f);
-      const float scale = absmax * (1.0f / fp8_max);
+      const float scale = absmax * inv_fp8_max;
       if (lane_id == 0) scale_row[g] = scale;
-      const float inv_scale = 1.0f / scale;
+      const float inv_scale = __frcp_rn(scale);
 #pragma unroll
       for (int e = 0; e < ELTS_PER_LANE; e++) {
         const int idx = base + e * WARP_SIZE + lane_id;
