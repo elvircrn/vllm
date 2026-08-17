@@ -106,7 +106,8 @@ __device__ void _moe_align_block_size(
     int32_t padded_num_experts, int32_t experts_per_warp, int32_t block_size,
     size_t numel, int32_t* __restrict__ cumsum, int32_t max_num_tokens_padded,
     int32_t max_num_m_blocks, int32_t model_offset, int32_t inactive_expert_id,
-    int32_t topk_num, int32_t* token_mask, bool has_expert_map) {
+    int32_t topk_num, int32_t* token_mask, bool has_expert_map,
+    int32_t fill_id, int32_t num_fill_blocks) {
   extern __shared__ int32_t shared_counts[];
 
   // Compute input buffer offsets. Typically these will all be 0, except when
@@ -115,12 +116,14 @@ __device__ void _moe_align_block_size(
   int expert_ids_offset = max_num_m_blocks * model_offset;
   int cumsum_offset = (num_experts + 1) * model_offset;
 
-  // Use separate threadblocks to fill sorted_token_ids.
-  // This is safe since the current kernel does not use sorted_token_ids.
-  if (blockIdx.x % 2) {
-    // Initialize sorted_token_ids with numel
-    for (size_t it = threadIdx.x; it < max_num_tokens_padded;
-         it += blockDim.x) {
+  // Blocks with fill_id >= 0 only initialize sorted_token_ids; the counting
+  // block (fill_id < 0) never reads it, so the two roles are independent.
+  // Fill blocks partition the buffer by fill_id so the init is spread across
+  // the grid instead of a single block.
+  if (fill_id >= 0) {
+    for (size_t it = (size_t)fill_id * blockDim.x + threadIdx.x;
+         it < max_num_tokens_padded;
+         it += (size_t)num_fill_blocks * blockDim.x) {
       sorted_token_ids[sorted_token_ids_offset + it] = numel;
     }
     return;
@@ -331,11 +334,14 @@ __global__ void moe_align_block_size_kernel(
     int32_t padded_num_experts, int32_t experts_per_warp, int32_t block_size,
     size_t numel, int32_t* __restrict__ cumsum, int32_t max_num_tokens_padded,
     int32_t topk_num, bool has_expert_map) {
+  // Block 0 counts and aligns; blocks 1..gridDim.x-1 fill sorted_token_ids.
+  int32_t fill_id = blockIdx.x == 0 ? -1 : (int32_t)blockIdx.x - 1;
+  int32_t num_fill_blocks = gridDim.x - 1;
   _moe_align_block_size(
       topk_ids, sorted_token_ids, expert_ids, total_tokens_post_pad, expert_map,
       num_experts, padded_num_experts, experts_per_warp, block_size, numel,
       cumsum, max_num_tokens_padded, CEILDIV(max_num_tokens_padded, block_size),
-      0, -1, topk_num, nullptr, has_expert_map);
+      0, -1, topk_num, nullptr, has_expert_map, fill_id, num_fill_blocks);
 }
 
 template <typename scalar_t>
@@ -545,11 +551,13 @@ __global__ void moe_lora_align_block_size_kernel(
 
   __syncthreads();
 
+  // Two blocks per LoRA slot: even counts/aligns, odd fills (single fill block).
+  int32_t fill_id = (blockIdx.x % 2) ? 0 : -1;
   _moe_align_block_size(
       topk_ids, sorted_token_ids, expert_ids, total_tokens_post_pad, expert_map,
       num_experts, padded_num_experts, experts_per_warp, block_size, numel,
       cumsum, max_num_tokens_padded, max_num_m_blocks, lora_id, -1, topk_num,
-      &token_mask[(lora_id * num_tokens)], has_expert_map);
+      &token_mask[(lora_id * num_tokens)], has_expert_map, fill_id, 1);
 }
 
 template <typename scalar_t>
@@ -689,10 +697,15 @@ void moe_align_block_size(
           size_t shared_mem_size =
               num_warps * experts_per_warp * sizeof(int32_t);
 
-          // launch two threadblocks
           // blockIdx.x == 0: counting experts and aligning
-          // blockIdx.x == 1: filling sorted_token_ids
-          align_kernel<<<2, threads, shared_mem_size, stream>>>(
+          // blockIdx.x >= 1: filling sorted_token_ids, one strided slice each.
+          // Size the fill grid to cover the buffer in a single pass (capped),
+          // so the init is spread across SMs instead of a single block.
+          const int max_fill_blocks = 256;
+          const int fill_blocks = std::max(
+              1, std::min((int)CEILDIV(sorted_token_ids.size(0), threads),
+                          max_fill_blocks));
+          align_kernel<<<1 + fill_blocks, threads, shared_mem_size, stream>>>(
               reinterpret_cast<const scalar_t*>(topk_ids.const_data_ptr()),
               reinterpret_cast<int32_t*>(sorted_token_ids.mutable_data_ptr()),
               reinterpret_cast<int32_t*>(experts_ids.mutable_data_ptr()),

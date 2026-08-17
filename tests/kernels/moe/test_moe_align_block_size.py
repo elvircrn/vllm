@@ -299,6 +299,64 @@ def test_moe_align_block_size_with_expert_map(
     )
 
 
+@pytest.mark.parametrize("m", [16, 512, 2048])
+@pytest.mark.parametrize("topk", [2, 6])
+@pytest.mark.parametrize("num_experts", [64, 256])
+@pytest.mark.parametrize("block_size", [64, 128])
+def test_moe_align_block_size_local_expert_sizing(
+    m: int, topk: int, num_experts: int, block_size: int
+):
+    """num_local_experts shrinks the output buffers without changing results.
+
+    Under EP dispatch only local experts can receive tokens, so padding is
+    bounded by the local count. Sizing the buffers by num_local_experts must
+    produce the same num_tokens_post_pad and the same per-expert token grouping
+    as the default (global-sized) call, just in smaller tensors.
+    """
+    num_local = num_experts // 2
+    expert_map = torch.full((num_experts,), -1, device="cuda", dtype=torch.int32)
+    local_experts = list(range(0, num_experts, 2))
+    for i, expert_id in enumerate(local_experts):
+        expert_map[expert_id] = i
+
+    topk_ids = torch.randint(
+        0, num_experts, (m, topk), device="cuda", dtype=torch.int32
+    )
+
+    base_sorted, base_expert_ids, base_num = moe_align_block_size(
+        topk_ids=topk_ids,
+        block_size=block_size,
+        num_experts=num_experts,
+        expert_map=expert_map,
+        ignore_invalid_experts=True,
+    )
+    loc_sorted, loc_expert_ids, loc_num = moe_align_block_size(
+        topk_ids=topk_ids,
+        block_size=block_size,
+        num_experts=num_experts,
+        expert_map=expert_map,
+        ignore_invalid_experts=True,
+        num_local_experts=num_local,
+    )
+
+    torch.testing.assert_close(loc_num, base_num, atol=0, rtol=0)
+
+    # Local sizing yields smaller buffers that still hold the real output.
+    assert loc_sorted.numel() < base_sorted.numel()
+    assert loc_expert_ids.numel() < base_expert_ids.numel()
+    assert loc_sorted.numel() >= base_num.item()
+
+    # The valid region is identical to the default-sized call.
+    n = int(base_num.item())
+    num_blocks = n // block_size
+    torch.testing.assert_close(
+        loc_expert_ids[:num_blocks], base_expert_ids[:num_blocks], atol=0, rtol=0
+    )
+    _verify_expert_level_sorting(
+        loc_sorted, base_sorted, base_expert_ids, block_size, n, m * topk
+    )
+
+
 def test_moe_align_block_size_deterministic():
     m, topk, num_experts, block_size = 128, 2, 32, 64
 
