@@ -257,6 +257,10 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         if recv_topk_weights is not None and recv_topk_weights.ndim == 1:
             recv_topk_weights = recv_topk_weights.unsqueeze(1)
 
+        if self.use_cudagraph:
+            # Carry the per-rank prefix sum so SiTU can skip padding rows.
+            expert_tokens_meta.psum_recv_per_rank = psum_recv_per_rank
+
         if not quant_config.is_block_quantized and not defer_input_quant:
             expert_x_scale = None
             if expert_x.numel() != 0:
