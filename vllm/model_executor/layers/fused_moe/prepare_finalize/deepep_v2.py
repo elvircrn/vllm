@@ -175,8 +175,35 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # Fused MoE-align: decode only. align_m comes from the experts' GEMM
         # tile-M selector so the dispatch pads exactly to the tile the GEMM will
         # use. Derived from a CPU-side token count -> cudagraph-safe.
+        #
+        # CRITICAL: align_m (the block expert_ids is padded to here) MUST equal
+        # the tile-M the experts pick at apply time. The experts derive that from
+        # get_global_valid_shape_m(recv_topk_idx): with dp_metadata it is the
+        # global DP token *sum* (identical whether fed the local sent or the
+        # received tensor -> rank_topk_ids is fine); WITHOUT dp_metadata it falls
+        # back to <tensor>.size(0), and there the two sides diverge -- dispatch
+        # would see the local *sent* count while apply sees the *received* buffer
+        # (num_max_tokens_per_rank * num_dispatchers rows). A different count can
+        # land in a different tuning bucket -> align_m != tile-M -> expert_ids is
+        # strided by the wrong block and boundary blocks read the wrong expert's
+        # weights (silent partial-accuracy corruption). So when dp_metadata is
+        # absent, feed the selector the SAME received-buffer count apply will see.
+        # (Asserted in FusedHummingExperts.prepare_humming_moe_kwargs.)
         fuse_moe_align = not do_expand and self._align_m_fn is not None
-        align_m = int(self._align_m_fn(rank_topk_ids)) if fuse_moe_align else 16
+        if fuse_moe_align:
+            if get_forward_context().dp_metadata is not None:
+                align_ref = rank_topk_ids
+            else:
+                n_recv = num_max_tokens_per_rank * self.num_dispatchers
+                # meta tensor: shape only, zero allocation -> cudagraph-safe.
+                align_ref = torch.empty(
+                    (n_recv, rank_topk_ids.size(1)),
+                    dtype=rank_topk_ids.dtype,
+                    device="meta",
+                )
+            align_m = int(self._align_m_fn(align_ref))
+        else:
+            align_m = 16
 
         (
             recv_x,

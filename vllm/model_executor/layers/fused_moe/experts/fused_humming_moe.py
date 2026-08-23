@@ -804,6 +804,22 @@ class HummingIndexedExperts(HummingExpertsBase):
             # re-derive it from the post-dispatch shape estimate.
             moe_block_size = expert_tokens_meta.moe_align_block_size_m
             assert moe_block_size is not None
+            # Invariant: the dispatch padded expert_ids to `moe_block_size`
+            # (align_m). The GEMM strides expert_ids by the tile-M it derives
+            # from valid_shape_m via _block_size_for_shape_m; if that differs,
+            # boundary blocks read the wrong expert's weights -- silent partial
+            # accuracy corruption, not a crash. DeepEPV2 selects align_m from the
+            # same token population this estimate uses, so they are equal by
+            # construction; assert it so any future drift fails loudly instead of
+            # quietly degrading accuracy.
+            derived_block = self._block_size_for_shape_m(valid_shape_m)
+            assert derived_block == moe_block_size, (
+                "fused MoE-align block mismatch: dispatch padded expert_ids to "
+                f"align_m={moe_block_size} but the GEMM tile-M is "
+                f"{derived_block} (valid_shape_m={valid_shape_m}); expert_ids "
+                "would be mis-strided. DeepEPV2 align_m selection is out of sync "
+                "with FusedHummingExperts.select_moe_block_size."
+            )
             sorted_ids = expert_tokens_meta.sorted_token_ids
             expert_ids = expert_tokens_meta.fused_expert_ids
             num_tokens_padded = expert_tokens_meta.num_tokens_post_pad
