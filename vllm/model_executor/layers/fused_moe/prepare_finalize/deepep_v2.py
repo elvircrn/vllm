@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Callable
 
 import deep_ep
@@ -88,6 +89,13 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self._align_m_fn: Callable[[torch.Tensor], int] | None = None
 
     def enable_fused_moe_align(self, align_m_fn: Callable[[torch.Tensor], int]) -> None:
+        # A/B kill switch: set VLLM_DEEPEP_DISABLE_FUSED_MOE_ALIGN=1 to keep the
+        # separate globalize + moe_align_block_size + count_and_sort kernels
+        # (the pre-fusion path) instead of folding them into the dispatch copy
+        # epilogue. Used to isolate correctness regressions to the fused path.
+        if os.environ.get("VLLM_DEEPEP_DISABLE_FUSED_MOE_ALIGN", "0") == "1":
+            self._align_m_fn = None
+            return
         self._align_m_fn = align_m_fn
 
         # arange(num_local_experts) + rank_expert_offset. Rank-constant, so it
