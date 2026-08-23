@@ -100,8 +100,21 @@ class ExpertTokensMetadata:
     Metadata regarding expert-token routing.
     """
 
-    expert_num_tokens: torch.Tensor
+    expert_num_tokens: torch.Tensor | None
     expert_num_tokens_cpu: torch.Tensor | None
+    psum_recv_per_rank: torch.Tensor | None = None
+
+    # Fused MoE-align metadata, emitted directly by the DeepEP v2 dispatch
+    # epilogue (decode path) when `fuse_moe_align=True`. When present, these are
+    # the ready-to-GEMM grouped-GEMM inputs -- equivalent to what
+    # `moe_align_block_size` would produce -- so the expert can skip that kernel.
+    # `moe_align_block_size_m` is the per-expert padding divisibility (align_m)
+    # the dispatch used; it MUST equal the GEMM tile M the expert selects, which
+    # is guaranteed because both come from the same block-size selector.
+    sorted_token_ids: torch.Tensor | None = None
+    fused_expert_ids: torch.Tensor | None = None
+    num_tokens_post_pad: torch.Tensor | None = None
+    moe_align_block_size_m: int | None = None
 
     @staticmethod
     def make_from_list(
@@ -901,6 +914,7 @@ class FusedMoEExpertsModular(FusedMoEExperts):
         *,
         topk_ids: torch.Tensor | None = None,
         expert_map: torch.Tensor | None = None,
+        valid_rows: torch.Tensor | None = None,
     ) -> None:
         apply_moe_activation(
             activation,
@@ -909,6 +923,7 @@ class FusedMoEExpertsModular(FusedMoEExperts):
             activation_config=self.activation_config,
             topk_ids=topk_ids,
             expert_map=expert_map,
+            valid_rows=valid_rows,
         )
 
     @abstractmethod
@@ -1106,6 +1121,16 @@ class FusedMoEKernelModularImpl:
         self.prepare_finalize = prepare_finalize
         self.fused_experts = fused_experts
         self.shared_experts: SharedExperts | None = None
+
+        # Single source of truth for the MoE-align block size: if the experts
+        # expose a block-size selector and the prepare/finalize can fold the
+        # MoE-align into its dispatch epilogue (DeepEP v2 fused path), wire the
+        # selector in so changing the GEMM tuning config automatically changes
+        # the dispatch-time padding (align_m). Duck-typed to keep this generic.
+        enable_fused = getattr(prepare_finalize, "enable_fused_moe_align", None)
+        selector = getattr(fused_experts, "select_moe_block_size", None)
+        if enable_fused is not None and selector is not None:
+            enable_fused(selector)
         moe_parallel_config = fused_experts.moe_config.moe_parallel_config
         self.moe_parallel_config = moe_parallel_config
         self.is_dp_ep = (

@@ -32,7 +32,7 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
       - Worst-case tensor allocation; padding rows zeroed via
         handle.psum_num_recv_tokens_per_scaleup_rank
       - Fully cudagraph-capturable
-      - Expert kernel sorts internally (expert_tokens_meta=None)
+      - Expert kernel sorts internally (expert_tokens_meta carries no counts)
 
     **Prefill mode (use_cudagraph=False):**
       - do_expand=True, do_cpu_sync=True
@@ -79,6 +79,16 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
         # DBO microbatching: one handle slot per micro-batch.
         self.handles: list[deep_ep.EPHandle | None] = [None, None]
+
+        # Fused MoE-align: when set (via `enable_fused_moe_align`), the decode
+        # dispatch folds globalize + moe_align_block_size + count_and_sort into
+        # its copy epilogue and emits ready-to-GEMM metadata. The callable maps
+        # the (pre-dispatch) rank topk_ids to the align_m padding divisibility --
+        # it is the experts' GEMM tile-M selector, so tuning changes propagate.
+        self._align_m_fn: Callable[[torch.Tensor], int] | None = None
+
+    def enable_fused_moe_align(self, align_m_fn: Callable[[torch.Tensor], int]) -> None:
+        self._align_m_fn = align_m_fn
 
         # arange(num_local_experts) + rank_expert_offset. Rank-constant, so it
         # is built once per device instead of once per layer per step.
@@ -154,6 +164,12 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 n = tokens.shape[0]
             num_max_tokens_per_rank = 1 << max(n - 1, 0).bit_length()
 
+        # Fused MoE-align: decode only. align_m comes from the experts' GEMM
+        # tile-M selector so the dispatch pads exactly to the tile the GEMM will
+        # use. Derived from a CPU-side token count -> cudagraph-safe.
+        fuse_moe_align = not do_expand and self._align_m_fn is not None
+        align_m = int(self._align_m_fn(rank_topk_ids)) if fuse_moe_align else 16
+
         (
             recv_x,
             recv_topk_idx,
@@ -169,6 +185,8 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             do_expand=do_expand,
             do_cpu_sync=do_cpu_sync,
             async_with_compute_stream=False,
+            fuse_moe_align=fuse_moe_align,
+            align_m=align_m,
         )
 
         a2a_idx = dbo_current_ubatch_id()
@@ -186,6 +204,16 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             a1_scale,
             quant_config,
             defer_input_quant=defer_input_quant,
+            fused_moe_align=(
+                (
+                    handle.sorted_token_ids,
+                    handle.moe_align_expert_ids,
+                    handle.num_tokens_post_pad,
+                    align_m,
+                )
+                if fuse_moe_align
+                else None
+            ),
         )
 
     def _receiver(
@@ -201,6 +229,8 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         a1_scale: torch.Tensor | None,
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool,
+        fused_moe_align: tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]
+        | None = None,
     ) -> mk.PrepareResultType:
         if event.event is not None:
             event.current_stream_wait()
@@ -255,16 +285,48 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             #     be treated as real routed tokens by experts that build routing
             #     over *all* rows (e.g. triton MoE backend's make_routing_data),
             #     polluting the per-expert token lists and corrupting real tokens.
-            recv_topk_idx = _globalize_recv_topk_idx(
-                recv_topk_idx,
-                psum_recv_per_rank,
-                self.rank_expert_offset,
-                self.num_experts,
-            )
+            #
+            # When the fused dispatch epilogue ran, it already stored the global
+            # expert ids AND sanitized the padding tail to -1 (folding this kernel
+            # away), so skip it entirely.
+            if fused_moe_align is None:
+                recv_topk_idx = _globalize_recv_topk_idx(
+                    recv_topk_idx,
+                    psum_recv_per_rank,
+                    self.rank_expert_offset,
+                    self.num_experts,
+                )
 
         # Reshape recv_topk_weights to match recv_topk_idx shape [N, 1]
         if recv_topk_weights is not None and recv_topk_weights.ndim == 1:
             recv_topk_weights = recv_topk_weights.unsqueeze(1)
+
+        if self.use_cudagraph:
+            # Carry the per-rank prefix sum so SiTU can skip padding rows.
+            # expert_num_tokens stays None: count-based consumers (DeepGEMM,
+            # Triton) must treat a None field as "no counts" and derive their
+            # own, exactly as in the meta-absent decode case.
+            if expert_tokens_meta is None:
+                expert_tokens_meta = mk.ExpertTokensMetadata(
+                    expert_num_tokens=None,
+                    expert_num_tokens_cpu=None,
+                )
+            expert_tokens_meta.psum_recv_per_rank = psum_recv_per_rank
+
+            # Carry the dispatch-emitted grouped-GEMM metadata so the expert can
+            # skip moe_align_block_size. align_m is stored as the block size the
+            # GEMM must tile to (the dispatch padded the metadata to it).
+            if fused_moe_align is not None:
+                (
+                    sorted_token_ids,
+                    fused_expert_ids,
+                    num_tokens_post_pad,
+                    align_m,
+                ) = fused_moe_align
+                expert_tokens_meta.sorted_token_ids = sorted_token_ids
+                expert_tokens_meta.fused_expert_ids = fused_expert_ids
+                expert_tokens_meta.num_tokens_post_pad = num_tokens_post_pad
+                expert_tokens_meta.moe_align_block_size_m = align_m
 
         if not quant_config.is_block_quantized and not defer_input_quant:
             expert_x_scale = None
