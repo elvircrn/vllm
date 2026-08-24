@@ -772,6 +772,29 @@ class HummingIndexedExperts(HummingExpertsBase):
         )
         return 64
 
+    def _valid_shape_m_for_block(self, block_size: int, preferred: int) -> int:
+        """Return a valid_shape_m that makes the humming GEMM pick tile-M ==
+        block_size.
+
+        The launcher selects the compile-time BlockShape::M from valid_shape_m
+        via the tuning-config buckets (csrc launcher
+        find_kernel_configs_target_index) and the kernel then reads one
+        expert_ids entry per BlockShape::M rows of sorted_ids (scheduler.cuh
+        `expert_ids_ptr[m_block_id]` / `sorted_ids_ptr + m_block_id * BlockShape::M`).
+        The fused dispatch padded expert_ids to `block_size` (align_m), so the
+        GEMM tile-M MUST equal it or expert_ids is mis-strided and boundary
+        blocks read the wrong expert's weights.
+
+        If `preferred` already lands in a bucket whose tile-M is `block_size`,
+        keep it (best tuning). Otherwise snap to a bucket whose tile-M matches.
+        """
+        if self._block_size_for_shape_m(preferred) == block_size:
+            return preferred
+        for min_shape_m, max_shape_m, config in self.w13_tuning_config:
+            if config["block_shape"][0] == block_size:
+                return max_shape_m
+        return preferred
+
     def select_moe_block_size(self, topk_ids: torch.Tensor) -> int:
         """Pick the MoE-align block size (GEMM tile M) for these tokens.
 
@@ -804,21 +827,21 @@ class HummingIndexedExperts(HummingExpertsBase):
             # re-derive it from the post-dispatch shape estimate.
             moe_block_size = expert_tokens_meta.moe_align_block_size_m
             assert moe_block_size is not None
-            # Invariant: the dispatch padded expert_ids to `moe_block_size`
-            # (align_m). The GEMM strides expert_ids by the tile-M it derives
-            # from valid_shape_m via _block_size_for_shape_m; if that differs,
-            # boundary blocks read the wrong expert's weights -- silent partial
-            # accuracy corruption, not a crash. DeepEPV2 selects align_m from the
-            # same token population this estimate uses, so they are equal by
-            # construction; assert it so any future drift fails loudly instead of
-            # quietly degrading accuracy.
-            derived_block = self._block_size_for_shape_m(valid_shape_m)
-            assert derived_block == moe_block_size, (
-                "fused MoE-align block mismatch: dispatch padded expert_ids to "
-                f"align_m={moe_block_size} but the GEMM tile-M is "
-                f"{derived_block} (valid_shape_m={valid_shape_m}); expert_ids "
-                "would be mis-strided. DeepEPV2 align_m selection is out of sync "
-                "with FusedHummingExperts.select_moe_block_size."
+            # The dispatch padded expert_ids to `moe_block_size` (align_m): one
+            # expert_ids entry per align_m rows of sorted_ids. The GEMM reads one
+            # expert_ids entry per BlockShape::M rows (scheduler.cuh), and it
+            # picks BlockShape::M from valid_shape_m via the tuning-config buckets
+            # (launcher find_kernel_configs_target_index). If that tile-M differs
+            # from align_m, expert_ids is mis-strided and boundary blocks read
+            # the wrong expert's weights -- silent partial-accuracy corruption,
+            # not a crash. The two sides can diverge: the dispatch derives
+            # align_m from the pre-dispatch local-token estimate, while here
+            # valid_shape_m comes from the capacity-sized recv buffer; without
+            # dp_metadata they land in different buckets. Snap valid_shape_m into
+            # align_m's bucket so the GEMM tile-M matches the metadata by
+            # construction (no-op when they already agree).
+            valid_shape_m = self._valid_shape_m_for_block(
+                moe_block_size, valid_shape_m
             )
             sorted_ids = expert_tokens_meta.sorted_token_ids
             expert_ids = expert_tokens_meta.fused_expert_ids
