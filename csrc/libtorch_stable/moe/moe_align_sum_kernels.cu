@@ -117,13 +117,9 @@ __device__ void _moe_align_block_size(
 
   // Use separate threadblocks to fill sorted_token_ids.
   // This is safe since the current kernel does not use sorted_token_ids.
-  if (blockIdx.x % 2) {
-    // Initialize sorted_token_ids with numel
-    for (size_t it = threadIdx.x; it < max_num_tokens_padded;
-         it += blockDim.x) {
-      sorted_token_ids[sorted_token_ids_offset + it] = numel;
-    }
-    return;
+  // Initialize sorted_token_ids with numel
+  for (size_t it = threadIdx.x; it < max_num_tokens_padded; it += blockDim.x) {
+    sorted_token_ids[sorted_token_ids_offset + it] = numel;
   }
 
   const int warp_id = threadIdx.x / WARP_SIZE;
@@ -692,7 +688,7 @@ void moe_align_block_size(
           // launch two threadblocks
           // blockIdx.x == 0: counting experts and aligning
           // blockIdx.x == 1: filling sorted_token_ids
-          align_kernel<<<2, threads, shared_mem_size, stream>>>(
+          align_kernel<<<1, threads, shared_mem_size, stream>>>(
               reinterpret_cast<const scalar_t*>(topk_ids.const_data_ptr()),
               reinterpret_cast<int32_t*>(sorted_token_ids.mutable_data_ptr()),
               reinterpret_cast<int32_t*>(experts_ids.mutable_data_ptr()),
