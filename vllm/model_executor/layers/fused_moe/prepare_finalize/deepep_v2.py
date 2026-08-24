@@ -87,6 +87,9 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # the (pre-dispatch) rank topk_ids to the align_m padding divisibility --
         # it is the experts' GEMM tile-M selector, so tuning changes propagate.
         self._align_m_fn: Callable[[torch.Tensor], int] | None = None
+        # When the kill switch is set, also skip the always-on apply-side carry
+        # so DISABLE=1 is a true pre-feature no-op (see enable_fused_moe_align).
+        self._fused_moe_align_disabled: bool = False
 
     def enable_fused_moe_align(self, align_m_fn: Callable[[torch.Tensor], int]) -> None:
         # A/B kill switch: set VLLM_DEEPEP_DISABLE_FUSED_MOE_ALIGN=1 to keep the
@@ -95,7 +98,16 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # epilogue. Used to isolate correctness regressions to the fused path.
         if os.environ.get("VLLM_DEEPEP_DISABLE_FUSED_MOE_ALIGN", "0") == "1":
             self._align_m_fn = None
+            # True no-op: also skip the feature's always-on apply-side carry
+            # (non-None expert_tokens_meta + psum_recv_per_rank on the cudagraph
+            # decode path). Without this the kill switch only reverts the
+            # dispatch align while the rewritten apply path (valid_tokens
+            # bounding of SITU + moe_fused_mul_sum) still runs, so DISABLE=1 is
+            # NOT the pre-feature reference. Restore the pre-feature contract
+            # (expert_tokens_meta is None on cudagraph decode, PR #52632).
+            self._fused_moe_align_disabled = True
             return
+        self._fused_moe_align_disabled = False
         self._align_m_fn = align_m_fn
 
         # arange(num_local_experts) + rank_expert_offset. Rank-constant, so it
@@ -314,7 +326,7 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         if recv_topk_weights is not None and recv_topk_weights.ndim == 1:
             recv_topk_weights = recv_topk_weights.unsqueeze(1)
 
-        if self.use_cudagraph:
+        if self.use_cudagraph and not self._fused_moe_align_disabled:
             # Carry the per-rank prefix sum so SiTU can skip padding rows.
             # expert_num_tokens stays None: count-based consumers (DeepGEMM,
             # Triton) must treat a None field as "no counts" and derive their
