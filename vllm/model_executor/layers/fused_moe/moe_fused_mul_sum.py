@@ -49,8 +49,13 @@ def moe_fused_mul_sum_kernel(
                 take = valid & (local_id >= 0)
             takes += (take,)  # type: ignore[assignment]
             weights += (tl.load(w_row + n).to(tl.float32),)  # type: ignore[assignment]
-        # All-padding rows early-return untouched (decode contract past num_recv).
-        if any_valid == 0:
+        # All-padding rows: only leave them UNTOUCHED on the num_valid decode
+        # path (persistent cudagraph buffer, rows past num_recv are never read).
+        # Without a num_valid bound (the pre-feature / DISABLE noop path) fall
+        # through so the row is written as 0, matching the old kernel which
+        # stored every row < num_tokens -- otherwise a reused output buffer keeps
+        # stale values here and diverges from the reference path.
+        if has_num_valid and any_valid == 0:
             return
     else:
         for n in tl.static_range(top_k):
