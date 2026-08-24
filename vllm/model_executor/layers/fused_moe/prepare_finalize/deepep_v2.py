@@ -97,14 +97,18 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # (the pre-fusion path) instead of folding them into the dispatch copy
         # epilogue. Used to isolate correctness regressions to the fused path.
         if os.environ.get("VLLM_DEEPEP_DISABLE_FUSED_MOE_ALIGN", "0") == "1":
+            # True no-op: setting _align_m_fn=None makes fuse_moe_align False, so
+            # fused_moe_align is None in the receiver and the dispatch epilogue +
+            # its grouped-GEMM metadata attach are both skipped. The globalize +
+            # moe_align_block_size + count_and_sort reference kernels run instead.
+            # IMPORTANT: do NOT disable the psum_recv_per_rank carrier here. That
+            # carrier is the PRE-fusion known-good mechanism (PR #52632): under
+            # cudagraph decode it always populated expert_tokens_meta so that
+            # num_valid bounds SITU + moe_fused_mul_sum. Suppressing it forced
+            # has_num_valid=False -- an untested path that left stale cudagraph
+            # output rows and cost ~0.05 gsm8k. The carrier now runs under plain
+            # `if self.use_cudagraph:` in the receiver, matching the baseline.
             self._align_m_fn = None
-            # True no-op: also skip the feature's always-on apply-side carry
-            # (non-None expert_tokens_meta + psum_recv_per_rank on the cudagraph
-            # decode path). Without this the kill switch only reverts the
-            # dispatch align while the rewritten apply path (valid_tokens
-            # bounding of SITU + moe_fused_mul_sum) still runs, so DISABLE=1 is
-            # NOT the pre-feature reference. Restore the pre-feature contract
-            # (expert_tokens_meta is None on cudagraph decode, PR #52632).
             self._fused_moe_align_disabled = True
             return
         self._fused_moe_align_disabled = False
@@ -326,8 +330,13 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         if recv_topk_weights is not None and recv_topk_weights.ndim == 1:
             recv_topk_weights = recv_topk_weights.unsqueeze(1)
 
-        if self.use_cudagraph and not self._fused_moe_align_disabled:
+        if self.use_cudagraph:
             # Carry the per-rank prefix sum so SiTU can skip padding rows.
+            # NOTE: this psum carrier is the pre-fusion known-good mechanism and
+            # must run whenever cudagraph is active -- it feeds num_valid into
+            # SiTU and moe_fused_mul_sum. The fused MoE-align kill switch only
+            # gates the dispatch-emitted grouped-GEMM metadata below (guarded by
+            # `fused_moe_align is not None`), NOT this carrier.
             # expert_num_tokens stays None: count-based consumers (DeepGEMM,
             # Triton) must treat a None field as "no counts" and derive their
             # own, exactly as in the meta-absent decode case.
