@@ -792,8 +792,18 @@ class HummingIndexedExperts(HummingExpertsBase):
             return preferred
         for min_shape_m, max_shape_m, config in self.w13_tuning_config:
             if config["block_shape"][0] == block_size:
+                if max_shape_m != preferred:
+                    logger.warning_once(
+                        "Snapped valid_shape_m from %s to %s so the humming "
+                        "GEMM's tile-M matches align_m=%s.",
+                        preferred,
+                        max_shape_m,
+                        block_size,
+                    )
                 return max_shape_m
-        return preferred
+        raise AssertionError(
+            f"No bucket in w13_tuning_config maps to block_size={block_size}"
+        )
 
     def select_moe_block_size(self, topk_ids: torch.Tensor) -> int:
         """Pick the MoE-align block size (GEMM tile M) for these tokens.
