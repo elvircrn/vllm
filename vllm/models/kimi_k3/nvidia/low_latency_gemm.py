@@ -931,7 +931,13 @@ class KimiK3LowLatencyEmbeddingMethod(
 def _enable_kda_projection_overlap(module: nn.Module) -> bool:
     from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention
 
-    if envs.VLLM_BATCH_INVARIANT:
+    # The custom KDA skinny GEMMs currently fail libNVVM compilation for
+    # sm_90a. Keep H100/H200 on the existing sequential projection path until
+    # the SM90 kernel is supported and validated. The overlap path was
+    # validated on SM100/SM103.
+    if envs.VLLM_BATCH_INVARIANT or not (
+        current_platform.is_device_capability((10, 0)) or _is_sm103()
+    ):
         return False
 
     enabled = False

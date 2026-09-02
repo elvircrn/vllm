@@ -269,12 +269,38 @@ def test_kda_overlap_configs_match_measured_table() -> None:
 
 
 @pytest.mark.parametrize("tp_size", [1, 2, 4, 16])
-def test_kda_projection_overlap_is_tp8_only(tp_size: int) -> None:
+def test_kda_projection_overlap_is_tp8_only(
+    tp_size: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention
 
+    monkeypatch.setattr(
+        k3_gemm.current_platform,
+        "is_device_capability",
+        lambda capability: capability == (10, 0),
+    )
     kda = KimiK3DeltaAttention.__new__(KimiK3DeltaAttention)
     nn.Module.__init__(kda)
     kda.tp_size = tp_size
+    kda._projection_overlap_max_tokens = 0
+
+    assert not k3_gemm._enable_kda_projection_overlap(kda)
+    assert kda._projection_overlap_max_tokens == 0
+
+
+def test_kda_projection_overlap_is_disabled_on_sm90(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention
+
+    monkeypatch.setattr(
+        k3_gemm.current_platform,
+        "is_device_capability",
+        lambda capability: capability == (9, 0),
+    )
+    kda = KimiK3DeltaAttention.__new__(KimiK3DeltaAttention)
+    nn.Module.__init__(kda)
+    kda.tp_size = 8
     kda._projection_overlap_max_tokens = 0
 
     assert not k3_gemm._enable_kda_projection_overlap(kda)
