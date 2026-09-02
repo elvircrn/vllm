@@ -82,6 +82,11 @@ class MoEPermuteScratch:
         n_token, n_hidden = hidden_states.shape
         assert hidden_states.device == self.device
         assert topk_ids.device == self.device
+        if n_token > self.max_num_tokens:
+            print(
+                f"dbg ERROR: n_token = {n_token} max_num_tokens = {self.max_num_tokens}"
+            )
+            print(f"self = {self}")
         assert n_token <= self.max_num_tokens
         assert topk_ids.size(1) == self.topk
         assert topk_ids.size(0) == n_token
