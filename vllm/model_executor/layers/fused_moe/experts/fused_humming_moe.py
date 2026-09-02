@@ -255,19 +255,25 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             **kwargs,
         )
 
-    def _get_permute_scratch(self, topk: int) -> MoEPermuteScratch | None:
+    def _get_permute_scratch(
+        self, topk: int, num_tokens: int
+    ) -> MoEPermuteScratch | None:
         if not moe_permute_unpermute_supported():
             return None
 
         scratch = self._permute_scratch.get(topk)
-        if scratch is None:
-            max_expanded_rows = (
-                self.moe_config.max_num_tokens
-                * self.moe_config.dp_size
-                * self.moe_config.experts_per_token
-            )
+        # The configured scheduler budget is normally sufficient, but a
+        # profile run or DP dispatch can produce a larger local tensor. The
+        # scratch capacity must bound the tensor passed to moe_permute.
+        max_expanded_rows = (
+            self.moe_config.max_num_tokens
+            * self.moe_config.dp_size
+            * self.moe_config.experts_per_token
+        )
+        required_num_tokens = max(num_tokens, math.ceil(max_expanded_rows / topk))
+        if scratch is None or scratch.max_num_tokens < required_num_tokens:
             scratch = MoEPermuteScratch(
-                max_num_tokens=math.ceil(max_expanded_rows / topk),
+                max_num_tokens=required_num_tokens,
                 topk=topk,
                 num_experts=self.moe_config.num_experts,
                 num_local_experts=self.moe_config.num_local_experts,
@@ -998,7 +1004,7 @@ class HummingGroupedExperts(HummingExpertsBase):
             n_expert=global_num_experts,
             n_local_expert=self.num_experts,
             expert_map=expert_map,
-            scratch=self._get_permute_scratch(topk_ids.size(1)),
+            scratch=self._get_permute_scratch(topk_ids.size(1), topk_ids.size(0)),
         )
 
         inputs, input_scale = self.quantize_input(
@@ -1020,22 +1026,32 @@ class HummingGroupedExperts(HummingExpertsBase):
             tuning_config=self.w13_tuning_config_str,
         )
 
-        self.apply_activation(
-            activation=activation,
-            input=buffers["gate_up_output"],
-            output=buffers["activation_output"],
-            valid_token_counts=(
-                expert_first_token_offset[-1:].to(torch.int32)
-                if expert_tokens_meta is None
-                else None
-            ),
+        valid_rows = (
+            expert_first_token_offset[-1:].to(torch.int32)
+            if expert_tokens_meta is None
+            else None
         )
-
-        inputs, input_scale = self.quantize_input(
-            "w2",
-            inputs=buffers["activation_output"],
-            quanted_input=buffers.get("quanted_down_input", None),
-        )
+        if self.fused_situ_quant_enabled(activation):
+            inputs, input_scale = self.fused_situ_quant(
+                gate_up_output=buffers["gate_up_output"],
+                quanted_down_input=buffers["quanted_down_input"],
+                num_valid_tokens=(
+                    valid_rows // topk_ids.size(1) if valid_rows is not None else None
+                ),
+                topk=topk_ids.size(1),
+            )
+        else:
+            self.apply_activation(
+                activation=activation,
+                input=buffers["gate_up_output"],
+                output=buffers["activation_output"],
+                valid_token_counts=valid_rows,
+            )
+            inputs, input_scale = self.quantize_input(
+                "w2",
+                inputs=buffers["activation_output"],
+                quanted_input=buffers.get("quanted_down_input", None),
+            )
 
         self.humming_forward(
             "w2",
