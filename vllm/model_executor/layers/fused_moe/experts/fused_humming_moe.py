@@ -176,7 +176,7 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             max_num_tokens=max_num_tokens,
             num_dispatchers=num_dispatchers,
         )
-        self._permute_scratch: dict[int, MoEPermuteScratch] = {}
+        self._permute_scratch: dict[tuple[int, torch.dtype], MoEPermuteScratch] = {}
 
     def init_humming_moe(self):
         from vllm.utils.humming import get_heuristics_config
@@ -256,12 +256,13 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
         )
 
     def _get_permute_scratch(
-        self, topk: int, num_tokens: int
+        self, topk: int, num_tokens: int, hidden_dtype: torch.dtype
     ) -> MoEPermuteScratch | None:
         if not moe_permute_unpermute_supported():
             return None
 
-        scratch = self._permute_scratch.get(topk)
+        scratch_key = (topk, hidden_dtype)
+        scratch = self._permute_scratch.get(scratch_key)
         # The configured scheduler budget is normally sufficient, but a
         # profile run or DP dispatch can produce a larger local tensor. The
         # scratch capacity must bound the tensor passed to moe_permute.
@@ -279,9 +280,9 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
                 num_local_experts=self.moe_config.num_local_experts,
                 device=torch.device(self.moe_config.device),
                 hidden_size=self.moe_config.hidden_dim,
-                hidden_dtype=self.moe_config.in_dtype,
+                hidden_dtype=hidden_dtype,
             )
-            self._permute_scratch[topk] = scratch
+            self._permute_scratch[scratch_key] = scratch
         return scratch
 
     def get_global_valid_shape_m(self, topk_ids: torch.Tensor):
@@ -1004,7 +1005,9 @@ class HummingGroupedExperts(HummingExpertsBase):
             n_expert=global_num_experts,
             n_local_expert=self.num_experts,
             expert_map=expert_map,
-            scratch=self._get_permute_scratch(topk_ids.size(1), topk_ids.size(0)),
+            scratch=self._get_permute_scratch(
+                topk_ids.size(1), topk_ids.size(0), hidden_states.dtype
+            ),
         )
 
         inputs, input_scale = self.quantize_input(
