@@ -82,12 +82,12 @@ class MoEPermuteScratch:
         n_token, n_hidden = hidden_states.shape
         assert hidden_states.device == self.device
         assert topk_ids.device == self.device
-        if n_token > self.max_num_tokens:
-            print(
-                f"dbg ERROR: n_token = {n_token} max_num_tokens = {self.max_num_tokens}"
-            )
-            print(f"self = {self}")
-        assert n_token <= self.max_num_tokens
+        assert n_token <= self.max_num_tokens, (
+            "MoE permute scratch capacity exceeded: "
+            f"n_token={n_token}, capacity={self.max_num_tokens}, "
+            f"topk={topk_ids.size(1)}, scratch_topk={self.topk}, "
+            f"hidden_dtype={hidden_states.dtype}, scratch_dtype={self.hidden_dtype}"
+        )
         assert topk_ids.size(1) == self.topk
         assert topk_ids.size(0) == n_token
         if self.hidden_size is not None:
