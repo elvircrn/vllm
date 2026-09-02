@@ -496,10 +496,15 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             dtypes.int4: torch.uint8,
         }
 
+        permuted_dtype = (
+            torch_dtype_map[a_dtype]
+            if self._prequantizes_dispatch_activation()
+            else self.moe_config.in_dtype
+        )
         buffer_metas = {
             "permuted_hidden_states": {
                 "shape": (real_shape_m, K),
-                "dtype": torch_dtype_map[a_dtype],
+                "dtype": permuted_dtype,
             },
             "quanted_gate_up_input": {
                 "shape": (input_shape_m, K),

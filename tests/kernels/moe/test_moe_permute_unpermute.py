@@ -288,6 +288,61 @@ def test_moe_permute_reuses_scratch_buffers(dtype: torch.dtype):
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_moe_permute_uses_external_output_with_metadata_scratch(dtype: torch.dtype):
+    if not moe_permute_unpermute_supported():
+        pytest.skip("moe_permute_unpermute is not supported on this platform.")
+
+    n_token = 64
+    n_hidden = 2048
+    n_expert = 16
+    topk = 4
+    hidden_states = torch.randn((n_token, n_hidden), device="cuda").to(dtype)
+    gating_output = torch.randn((n_token, n_expert), device="cuda").to(dtype)
+    _, topk_ids, _ = fused_topk(hidden_states, gating_output, topk, False)
+    external_output = torch.empty(
+        (n_token * topk, n_hidden), dtype=dtype, device="cuda"
+    )
+    scratch = MoEPermuteScratch(
+        max_num_tokens=n_token,
+        topk=topk,
+        num_experts=n_expert,
+        num_local_experts=n_expert,
+        device=hidden_states.device,
+    )
+
+    result = moe_permute(
+        hidden_states=hidden_states,
+        a1q_scale=None,
+        topk_ids=topk_ids,
+        n_expert=n_expert,
+        permuted_hidden_states=external_output,
+        scratch=scratch,
+    )
+
+    assert (
+        result[0].untyped_storage().data_ptr()
+        == external_output.untyped_storage().data_ptr()
+    )
+
+    too_small_scratch = MoEPermuteScratch(
+        max_num_tokens=n_token - 1,
+        topk=topk,
+        num_experts=n_expert,
+        num_local_experts=n_expert,
+        device=hidden_states.device,
+    )
+    with pytest.raises(AssertionError, match="capacity exceeded"):
+        moe_permute(
+            hidden_states=hidden_states,
+            a1q_scale=None,
+            topk_ids=topk_ids,
+            n_expert=n_expert,
+            permuted_hidden_states=external_output,
+            scratch=too_small_scratch,
+        )
+
+
 def test_moe_permute_ignores_invalid_expert_ids_with_scratch() -> None:
     if not moe_permute_unpermute_supported():
         pytest.skip("moe_permute_unpermute is not supported on this platform.")

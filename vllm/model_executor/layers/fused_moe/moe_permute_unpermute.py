@@ -168,6 +168,8 @@ def moe_permute(
         f"Expected permuted hidden states to be {(permuted_row_size, n_hidden)}"
         f" but got {permuted_hidden_states.size()}"
     )
+    assert permuted_hidden_states.device == hidden_states.device
+    assert permuted_hidden_states.dtype == hidden_states.dtype
 
     if scratch is None:
         token_expert_indices = torch.arange(
