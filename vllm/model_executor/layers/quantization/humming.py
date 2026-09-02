@@ -287,10 +287,8 @@ class HummingConfig(QuantizationConfig):
                 quant_config = envs.VLLM_HUMMING_INPUT_QUANT_CONFIG.copy()
                 quant_config["quant_method"] = "humming"
                 force_input_schema = self.get_layer_input_schema(quant_config, prefix)
-                # An explicit input quantization config must override a
-                # checkpoint-provided schema; otherwise it never affects
-                # Humming layers that already declare BF16 inputs.
-                input_schema = force_input_schema
+                if input_schema is None:
+                    input_schema = force_input_schema
 
             if force_weight_schema is not None and force_input_schema is None:
                 force_input_schema = _hm.HummingInputSchema()

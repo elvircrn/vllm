@@ -145,6 +145,8 @@ def moe_permute(
     assert (n_hidden * hidden_states.element_size()) % 16 == 0, (
         "permue kernel need hidden dim align to 16B"
     )
+    if scratch is not None:
+        scratch.validate(hidden_states, topk_ids)
     permuted_row_size = n_token * topk
     if n_local_expert == -1:
         n_local_expert = n_expert
@@ -156,7 +158,6 @@ def moe_permute(
                 device=hidden_states.device,
             )
         else:
-            scratch.validate(hidden_states, topk_ids)
             hidden_numel = permuted_row_size * n_hidden
             scratch_hidden_states = scratch.permuted_hidden_states
             assert scratch_hidden_states is not None

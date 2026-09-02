@@ -261,19 +261,15 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
 
         scratch = self._permute_scratch.get(topk)
         if scratch is None:
-            max_expanded_rows = (
-                self.moe_config.max_num_tokens
-                * self.moe_config.dp_size
-                * self.moe_config.experts_per_token
-            )
             scratch = MoEPermuteScratch(
-                max_num_tokens=math.ceil(max_expanded_rows / topk),
+                # Grouped EP receives tokens from every rank in the EP group.
+                max_num_tokens=(
+                    self.moe_config.max_num_tokens * self.moe_config.ep_size
+                ),
                 topk=topk,
                 num_experts=self.moe_config.num_experts,
                 num_local_experts=self.moe_config.num_local_experts,
                 device=torch.device(self.moe_config.device),
-                hidden_size=self.moe_config.hidden_dim,
-                hidden_dtype=self.moe_config.in_dtype,
             )
             self._permute_scratch[topk] = scratch
         return scratch
@@ -501,6 +497,10 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
         }
 
         buffer_metas = {
+            "permuted_hidden_states": {
+                "shape": (real_shape_m, K),
+                "dtype": torch_dtype_map[a_dtype],
+            },
             "quanted_gate_up_input": {
                 "shape": (input_shape_m, K),
                 "dtype": torch_dtype_map[a_dtype],
@@ -557,6 +557,19 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             #        on DIFFERENT workspaces.
             if self.fused_situ_quant_enabled(activation):
                 required_buffers.remove("activation_output")
+
+        if (
+            not self.is_batched()
+            and self.humming_gemm_type() == HummingGemmType.GROUPED_CONTIGUOUS
+        ):
+            # Grouped Humming permutes the dispatched activation before w13.
+            # Keep this large buffer in the lifetime-colored shared workspace,
+            # not in every layer's persistent MoEPermuteScratch.
+            required_buffers.insert(0, "permuted_hidden_states")
+            if self._prequantizes_dispatch_activation():
+                # The dispatched activation is already quantized and is the
+                # direct w13 input, so no second quantization buffer is needed.
+                required_buffers.remove("quanted_gate_up_input")
 
         # batched moe use down_output as output
         if not self.is_batched():
@@ -998,6 +1011,7 @@ class HummingGroupedExperts(HummingExpertsBase):
             n_expert=global_num_experts,
             n_local_expert=self.num_experts,
             expert_map=expert_map,
+            permuted_hidden_states=buffers["permuted_hidden_states"],
             scratch=self._get_permute_scratch(topk_ids.size(1)),
         )
 
