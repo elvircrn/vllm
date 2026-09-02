@@ -145,6 +145,11 @@ def moe_permute(
     assert (n_hidden * hidden_states.element_size()) % 16 == 0, (
         "permue kernel need hidden dim align to 16B"
     )
+    # Cached scratch buffers are sized for the steady-state scheduler budget.
+    # Startup memory profiling can intentionally use a wider synthetic batch;
+    # use the regular per-call allocation path instead of slicing past scratch.
+    if scratch is not None and n_token > scratch.max_num_tokens:
+        scratch = None
     permuted_row_size = n_token * topk
     if n_local_expert == -1:
         n_local_expert = n_expert
