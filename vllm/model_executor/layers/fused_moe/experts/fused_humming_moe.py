@@ -176,7 +176,7 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             max_num_tokens=max_num_tokens,
             num_dispatchers=num_dispatchers,
         )
-        self._permute_scratch: dict[tuple[int, torch.dtype], MoEPermuteScratch] = {}
+        self._permute_scratch: dict[int, MoEPermuteScratch] = {}
 
     def init_humming_moe(self):
         from vllm.utils.humming import get_heuristics_config
@@ -255,34 +255,27 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             **kwargs,
         )
 
-    def _get_permute_scratch(
-        self, topk: int, num_tokens: int, hidden_dtype: torch.dtype
-    ) -> MoEPermuteScratch | None:
+    def _get_permute_scratch(self, topk: int) -> MoEPermuteScratch | None:
         if not moe_permute_unpermute_supported():
             return None
 
-        scratch_key = (topk, hidden_dtype)
-        scratch = self._permute_scratch.get(scratch_key)
-        # The configured scheduler budget is normally sufficient, but a
-        # profile run or DP dispatch can produce a larger local tensor. The
-        # scratch capacity must bound the tensor passed to moe_permute.
-        max_expanded_rows = (
-            self.moe_config.max_num_tokens
-            * self.moe_config.dp_size
-            * self.moe_config.experts_per_token
-        )
-        required_num_tokens = max(num_tokens, math.ceil(max_expanded_rows / topk))
-        if scratch is None or scratch.max_num_tokens < required_num_tokens:
+        scratch = self._permute_scratch.get(topk)
+        if scratch is None:
+            max_expanded_rows = (
+                self.moe_config.max_num_tokens
+                * self.moe_config.dp_size
+                * self.moe_config.experts_per_token
+            )
             scratch = MoEPermuteScratch(
-                max_num_tokens=required_num_tokens,
+                max_num_tokens=math.ceil(max_expanded_rows / topk),
                 topk=topk,
                 num_experts=self.moe_config.num_experts,
                 num_local_experts=self.moe_config.num_local_experts,
                 device=torch.device(self.moe_config.device),
                 hidden_size=self.moe_config.hidden_dim,
-                hidden_dtype=hidden_dtype,
+                hidden_dtype=self.moe_config.in_dtype,
             )
-            self._permute_scratch[scratch_key] = scratch
+            self._permute_scratch[topk] = scratch
         return scratch
 
     def get_global_valid_shape_m(self, topk_ids: torch.Tensor):
@@ -1005,9 +998,7 @@ class HummingGroupedExperts(HummingExpertsBase):
             n_expert=global_num_experts,
             n_local_expert=self.num_experts,
             expert_map=expert_map,
-            scratch=self._get_permute_scratch(
-                topk_ids.size(1), topk_ids.size(0), hidden_states.dtype
-            ),
+            scratch=self._get_permute_scratch(topk_ids.size(1)),
         )
 
         inputs, input_scale = self.quantize_input(
