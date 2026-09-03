@@ -123,6 +123,47 @@ from ..common.mm_preprocess import (
 
 logger = init_logger(__name__)
 
+
+class KimiK3MixtureOfExperts(MixtureOfExperts):
+    """Expose Kimi-K3's routed experts to EPLB."""
+
+    moe_mlp_layers: list["KimiMoE"]
+
+    def extract_moe_parameters(self, example_moe: "KimiMoE | None") -> None:
+        if example_moe is None:
+            self.num_moe_layers = 0
+            self.num_expert_groups = 0
+            self.num_logical_experts = 0
+            self.num_physical_experts = 0
+            self.num_local_physical_experts = 0
+            self.num_routed_experts = 0
+            self.num_shared_experts = 0
+            self.num_redundant_experts = 0
+            return
+
+        expert_config = getattr(example_moe.experts, "moe_config", example_moe.experts)
+        self.num_logical_experts = expert_config.num_logical_experts
+        self.num_physical_experts = expert_config.num_experts
+        self.num_local_physical_experts = expert_config.num_local_experts
+        self.num_routed_experts = expert_config.num_logical_experts
+        self.num_shared_experts = example_moe.num_shared_experts or 0
+        self.num_redundant_experts = (
+            expert_config.num_experts - expert_config.num_logical_experts
+        )
+
+    def update_physical_experts_metadata(
+        self,
+        num_physical_experts: int,
+        num_local_physical_experts: int,
+    ) -> None:
+        assert self.num_local_physical_experts == num_local_physical_experts
+        self.num_physical_experts = num_physical_experts
+        self.num_local_physical_experts = num_local_physical_experts
+        self.num_redundant_experts = num_physical_experts - self.num_logical_experts
+        for moe in self.moe_mlp_layers:
+            moe.experts.update_expert_map()
+
+
 # Token-count cutoff for overlapping the MoE router gate with the routed-expert
 # down projection on a separate CUDA stream (latent MoE). At or below this many
 # tokens the launch-bound decode path benefits from multi-stream overlap; above
@@ -1564,7 +1605,7 @@ class KimiLinearForCausalLM(
     nn.Module,
     HasInnerState,
     SupportsPP,
-    MixtureOfExperts,
+    KimiK3MixtureOfExperts,
     IsHybrid,
     SupportsEagle3,
     SupportsReplaySSM,
@@ -1593,6 +1634,26 @@ class KimiLinearForCausalLM(
         self.logits_processor = LogitsProcessor(
             self.config.vocab_size, scale=logit_scale
         )
+        self.set_moe_parameters()
+
+    def set_moe_parameters(self) -> None:
+        self.num_expert_groups = getattr(self.config, "num_expert_group", 1)
+        self.moe_layers: list[nn.Module] = []
+        self.moe_mlp_layers = []
+        example_moe: KimiMoE | None = None
+        for layer in self.model.layers:
+            if isinstance(layer, PPMissingLayer):
+                continue
+            if not isinstance(layer, KimiDecoderLayer):
+                continue
+            if layer.is_moe_layer:
+                example_moe = layer.block_sparse_moe
+                assert example_moe is not None
+                self.moe_mlp_layers.append(example_moe)
+                self.moe_layers.append(example_moe.experts)
+
+        self.num_moe_layers = len(self.moe_layers)
+        self.extract_moe_parameters(example_moe)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
