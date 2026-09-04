@@ -328,6 +328,10 @@ def FusedMoEFactory(
         # since model_config is not set in the pytest test.
         moe_in_dtype = params_dtype
 
+    layer_index = next(
+        (int(component) for component in layer_name.split(".") if component.isdigit()),
+        -1,
+    )
     moe_config = FusedMoEConfig(
         num_experts=global_num_experts,
         experts_per_token=top_k,
@@ -352,6 +356,7 @@ def FusedMoEFactory(
         activation_situ_beta=activation_situ_beta,
         activation_situ_linear_beta=activation_situ_linear_beta,
         max_capture_size=vllm_config.compilation_config.max_cudagraph_capture_size,
+        layer_index=layer_index,
         skip_final_all_reduce=skip_final_all_reduce,
     )
 

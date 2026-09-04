@@ -85,8 +85,15 @@ def _group_by_expert(sorted_ids, expert_ids, block_size, valid_len, total):
 def test_fused_matches_reference(n, topk, block_size, local_e, rank, fill):
     ep_size = 4
     local_idx, psum, reo, gne = _make_case(
-        n, topk, ep_size, local_e, block_size, seed=n * 131 + topk,
-        frac_recv=0.75, rank=rank, fill=fill,
+        n,
+        topk,
+        ep_size,
+        local_e,
+        block_size,
+        seed=n * 131 + topk,
+        frac_recv=0.75,
+        rank=rank,
+        fill=fill,
     )
 
     ref_global = _globalize_recv_topk_idx(local_idx.clone(), psum, reo, gne)
@@ -100,7 +107,7 @@ def test_fused_matches_reference(n, topk, block_size, local_e, rank, fill):
 
     fused_global, fused_sorted, fused_expert_ids, fused_num = (
         fused_globalize_align_block_size(
-            local_idx.clone(), psum, reo, gne, local_e, block_size
+            local_idx.clone(), psum, reo, -1, -1, gne, local_e, block_size
         )
     )
 
@@ -114,10 +121,12 @@ def test_fused_matches_reference(n, topk, block_size, local_e, rank, fill):
     assert bool((fused_expert_ids[nb:] == -1).all())
     assert bool((fused_sorted[valid:] == total).all())
 
-    ref_groups = _group_by_expert(ref_sorted, ref_expert_ids, block_size,
-                                  int(ref_num.item()), total)
-    fused_groups = _group_by_expert(fused_sorted, fused_expert_ids, block_size,
-                                    valid, total)
+    ref_groups = _group_by_expert(
+        ref_sorted, ref_expert_ids, block_size, int(ref_num.item()), total
+    )
+    fused_groups = _group_by_expert(
+        fused_sorted, fused_expert_ids, block_size, valid, total
+    )
     assert set(ref_groups) == set(fused_groups)
     for eid in ref_groups:
         assert sorted(ref_groups[eid]) == sorted(fused_groups[eid])

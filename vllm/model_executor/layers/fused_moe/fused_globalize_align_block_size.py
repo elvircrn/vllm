@@ -11,6 +11,8 @@ def fused_globalize_align_block_size(
     recv_topk_idx: torch.Tensor,
     psum_recv_per_rank: torch.Tensor,
     rank_expert_offset: int,
+    layer_index: int,
+    ep_rank: int,
     global_num_experts: int,
     local_num_experts: int,
     block_size: int,
@@ -35,9 +37,7 @@ def fused_globalize_align_block_size(
         max_num_tokens_padded = min(numel * block_size, max_num_tokens_padded)
     max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
 
-    sorted_ids = torch.empty(
-        (max_num_tokens_padded,), dtype=torch.int32, device=device
-    )
+    sorted_ids = torch.empty((max_num_tokens_padded,), dtype=torch.int32, device=device)
     expert_ids = torch.empty((max_num_m_blocks,), dtype=torch.int32, device=device)
     num_tokens_post_pad = torch.empty((1,), dtype=torch.int32, device=device)
 
@@ -45,6 +45,8 @@ def fused_globalize_align_block_size(
         recv_topk_idx,
         psum_recv_per_rank,
         rank_expert_offset,
+        layer_index,
+        ep_rank,
         global_num_experts,
         local_num_experts,
         block_size,
