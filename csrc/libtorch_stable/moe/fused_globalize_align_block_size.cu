@@ -11,6 +11,8 @@
 #include <cooperative_groups.h>
 #include <cuda_runtime.h>
 
+#include <optional>
+
 #include <torch/csrc/stable/macros.h>
 #include <torch/csrc/stable/accelerator.h>
 #include <torch/csrc/stable/ops.h>
@@ -36,9 +38,8 @@ __device__ __forceinline__ void fused_gas_body(
     long* __restrict__ topk_idx, int* __restrict__ sorted_ids,
     int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_pad,
     int* __restrict__ counts, int num_recv, int rank_expert_offset,
-    int layer_index, int ep_rank, int global_num_experts, int numel,
-    int max_num_tokens_padded, int max_num_m_blocks, int local_num_experts,
-    int topk, int block_size) {
+    int global_num_experts, int numel, int max_num_tokens_padded,
+    int max_num_m_blocks, int local_num_experts, int topk, int block_size) {
   extern __shared__ int sh[];  // [local_num_experts] per-block histogram
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
   const int stride = gridDim.x * blockDim.x;
@@ -121,29 +122,6 @@ __device__ __forceinline__ void fused_gas_body(
     }
     topk_idx[i] = valid ? g : -1;
   }
-
-  // EPLB debug stats. Phase 3 uses counts as write cursors, so wait for all
-  // atomics, then subtract the padded prefix saved in block 0's shared memory.
-  // This barrier and printf are diagnostic-only and should not be benchmarked.
-  BAR();
-  if (!threadIdx.x && !blockIdx.x) {
-    int total_raw = 0;
-    int total_padded = 0;
-    int max_raw = 0;
-    int* sh_start = sh;
-    printf("EPLB layer=%d ep_rank=%d rank_expert_offset=%d num_recv=%d:",
-           layer_index, ep_rank, rank_expert_offset, num_recv);
-    for (int e = 0; e < local_num_experts; e++) {
-      int raw = counts[e] - sh_start[e];
-      int padded = ((raw + block_size - 1) / block_size) * block_size;
-      total_raw += raw;
-      total_padded += padded;
-      max_raw = max(max_raw, raw);
-      printf(" e%d(raw=%d,pad=%d)", e, raw, padded);
-    }
-    printf(" total_raw=%d total_padded=%d max_raw=%d\n", total_raw,
-           total_padded, max_raw);
-  }
 }
 
 template <bool COOP>
@@ -151,15 +129,14 @@ __global__ void fused_gas_kernel(
     long* __restrict__ topk_idx, const int* __restrict__ psum,
     int* __restrict__ sorted_ids, int* __restrict__ expert_ids,
     int* __restrict__ num_tokens_post_pad, int* __restrict__ counts, int P,
-    int rank_expert_offset, int layer_index, int ep_rank,
-    int global_num_experts, int numel, int max_num_tokens_padded,
-    int max_num_m_blocks, int local_num_experts, int topk, int block_size) {
+    int rank_expert_offset, int global_num_experts, int numel,
+    int max_num_tokens_padded, int max_num_m_blocks, int local_num_experts,
+    int topk, int block_size) {
   // num_recv read on-device (psum[P-1]) -> baked into replay, cudagraph-safe.
   fused_gas_body<COOP>(topk_idx, sorted_ids, expert_ids, num_tokens_post_pad,
-                       counts, psum[P - 1], rank_expert_offset, layer_index,
-                       ep_rank, global_num_experts, numel,
-                       max_num_tokens_padded, max_num_m_blocks,
-                       local_num_experts, topk, block_size);
+                       counts, psum[P - 1], rank_expert_offset,
+                       global_num_experts, numel, max_num_tokens_padded,
+                       max_num_m_blocks, local_num_experts, topk, block_size);
 }
 
 static int fgas_sm_count() {
@@ -184,9 +161,9 @@ static int fgas_cooperative_blocks(int bps, long work) {
 
 static void fgas_launch(long* p_topk, const int* p_psum, int* p_sorted,
                         int* p_expert, int* p_num, int* p_counts, int P,
-                        int reo, int layer_index, int ep_rank, int gne,
-                        int numel, int mntp, int mnmb, int local_e, int topk,
-                        int block_size, cudaStream_t stream) {
+                        int reo, int gne, int numel, int mntp, int mnmb,
+                        int local_e, int topk, int block_size,
+                        cudaStream_t stream) {
   long work = numel > mntp ? numel : mntp;
   // Histogram [local_e] + one scalar (phase-2 padded-run total).
   size_t smem = (size_t)(local_e + 1) * sizeof(int);
@@ -195,9 +172,8 @@ static void fgas_launch(long* p_topk, const int* p_psum, int* p_sorted,
   // cooperative-launch + grid.sync floor that dominates when work is tiny.
   if (work <= FGAS_SB_MAX_WORK) {
     fused_gas_kernel<false><<<1, FGAS_SB_THREADS, smem, stream>>>(
-        p_topk, p_psum, p_sorted, p_expert, p_num, p_counts, P, reo,
-        layer_index, ep_rank, gne, numel, mntp, mnmb, local_e, topk,
-        block_size);
+        p_topk, p_psum, p_sorted, p_expert, p_num, p_counts, P, reo, gne, numel,
+        mntp, mnmb, local_e, topk, block_size);
     STD_CUDA_CHECK(cudaGetLastError());
     return;
   }
@@ -225,8 +201,52 @@ static void fgas_launch(long* p_topk, const int* p_psum, int* p_sorted,
   config.numAttrs = 1;
   STD_CUDA_CHECK(cudaLaunchKernelEx(&config, fused_gas_kernel<true>, p_topk,
                                     p_psum, p_sorted, p_expert, p_num, p_counts,
-                                    P, reo, layer_index, ep_rank, gne, numel,
-                                    mntp, mnmb, local_e, topk, block_size));
+                                    P, reo, gne, numel, mntp, mnmb, local_e,
+                                    topk, block_size));
+}
+
+// One-block diagnostic intended for debugging, never on the normal path. The
+// shared histogram gives an exact local-expert count after DeepEP dispatch.
+// `psum` is present for fixed-capacity CUDA-graph buffers; eager receive
+// tensors are exact-shaped and use all rows.
+__global__ void post_dispatch_eplb_stats_kernel(
+    const long* __restrict__ topk_idx, const int* __restrict__ psum, int P,
+    int rank_expert_offset, int layer_index, int ep_rank,
+    int global_num_experts, int local_num_experts, int numel, int topk,
+    int block_size, bool ids_are_local) {
+  extern __shared__ int counts[];
+  for (int e = threadIdx.x; e < local_num_experts; e += blockDim.x)
+    counts[e] = 0;
+  __syncthreads();
+
+  const int num_recv = psum == nullptr ? numel / topk : psum[P - 1];
+  for (int i = threadIdx.x; i < numel; i += blockDim.x) {
+    const int id = (int)topk_idx[i];
+    const int local_id = ids_are_local ? id : id - rank_expert_offset;
+    const bool valid = (i / topk < num_recv) && local_id >= 0 &&
+                       local_id < local_num_experts &&
+                       local_id + rank_expert_offset < global_num_experts;
+    if (valid) atomicAdd(&counts[local_id], 1);
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    int total_raw = 0;
+    int total_padded = 0;
+    int max_raw = 0;
+    printf("EPLB layer=%d ep_rank=%d rank_expert_offset=%d num_recv=%d:",
+           layer_index, ep_rank, rank_expert_offset, num_recv);
+    for (int e = 0; e < local_num_experts; ++e) {
+      const int raw = counts[e];
+      const int padded = ((raw + block_size - 1) / block_size) * block_size;
+      total_raw += raw;
+      total_padded += padded;
+      max_raw = max(max_raw, raw);
+      printf(" e%d(raw=%d,pad=%d)", e, raw, padded);
+    }
+    printf(" total_raw=%d total_padded=%d max_raw=%d\n", total_raw,
+           total_padded, max_raw);
+  }
 }
 
 }  // namespace moe
@@ -237,8 +257,8 @@ static void fgas_launch(long* p_topk, const int* p_psum, int* p_sorted,
 // here.
 void fused_globalize_align_block_size(
     torch::stable::Tensor topk_idx, torch::stable::Tensor psum,
-    int64_t rank_expert_offset, int64_t layer_index, int64_t ep_rank,
-    int64_t global_num_experts, int64_t local_num_experts, int64_t block_size,
+    int64_t rank_expert_offset, int64_t global_num_experts,
+    int64_t local_num_experts, int64_t block_size,
     torch::stable::Tensor sorted_ids, torch::stable::Tensor expert_ids,
     torch::stable::Tensor num_tokens_post_pad) {
   STD_TORCH_CHECK(topk_idx.scalar_type() == torch::headeronly::ScalarType::Long,
@@ -258,8 +278,6 @@ void fused_globalize_align_block_size(
   int mnmb = (int)expert_ids.size(0);
   int local_e = (int)local_num_experts;
   int reo = (int)rank_expert_offset;
-  int layer = (int)layer_index;
-  int rank = (int)ep_rank;
   int gne = (int)global_num_experts;
   int P = (int)psum.size(0);
 
@@ -275,6 +293,36 @@ void fused_globalize_align_block_size(
   int* p_counts = reinterpret_cast<int*>(counts.mutable_data_ptr());
 
   vllm::moe::fgas_launch(p_topk, p_psum, p_sorted, p_expert, p_num, p_counts, P,
-                         reo, layer, rank, gne, numel, mntp, mnmb, local_e,
-                         topk, (int)block_size, stream);
+                         reo, gne, numel, mntp, mnmb, local_e, topk,
+                         (int)block_size, stream);
+}
+
+void log_post_dispatch_expert_load(
+    torch::stable::Tensor topk_idx,
+    std::optional<torch::stable::Tensor> psum_recv_per_rank,
+    int64_t rank_expert_offset, int64_t layer_index, int64_t ep_rank,
+    int64_t global_num_experts, int64_t local_num_experts, int64_t block_size,
+    bool ids_are_local) {
+  STD_TORCH_CHECK(topk_idx.scalar_type() == torch::headeronly::ScalarType::Long,
+                  "log_post_dispatch_expert_load: topk_idx must be int64");
+  STD_TORCH_CHECK(local_num_experts <= 1024,
+                  "log_post_dispatch_expert_load: local_num_experts <= 1024");
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      topk_idx.get_device_index());
+  const cudaStream_t stream =
+      get_current_cuda_stream(topk_idx.get_device_index());
+  const int* psum = nullptr;
+  int P = 0;
+  if (psum_recv_per_rank.has_value()) {
+    psum = reinterpret_cast<const int*>(psum_recv_per_rank->const_data_ptr());
+    P = (int)psum_recv_per_rank->size(0);
+  }
+  const int local_e = (int)local_num_experts;
+  vllm::moe::post_dispatch_eplb_stats_kernel<<<1, 1024, local_e * sizeof(int),
+                                               stream>>>(
+      reinterpret_cast<const long*>(topk_idx.const_data_ptr()), psum, P,
+      (int)rank_expert_offset, (int)layer_index, (int)ep_rank,
+      (int)global_num_experts, local_e, (int)topk_idx.numel(),
+      (int)topk_idx.size(1), (int)block_size, ids_are_local);
+  STD_CUDA_CHECK(cudaGetLastError());
 }

@@ -2275,8 +2275,6 @@ def fused_globalize_align_block_size(
     topk_idx: torch.Tensor,
     psum: torch.Tensor,
     rank_expert_offset: int,
-    layer_index: int,
-    ep_rank: int,
     global_num_experts: int,
     local_num_experts: int,
     block_size: int,
@@ -2288,14 +2286,36 @@ def fused_globalize_align_block_size(
         topk_idx,
         psum,
         rank_expert_offset,
-        layer_index,
-        ep_rank,
         global_num_experts,
         local_num_experts,
         block_size,
         sorted_ids,
         expert_ids,
         num_tokens_post_pad,
+    )
+
+
+def log_post_dispatch_expert_load(
+    topk_idx: torch.Tensor,
+    psum: torch.Tensor | None,
+    rank_expert_offset: int,
+    layer_index: int,
+    ep_rank: int,
+    global_num_experts: int,
+    local_num_experts: int,
+    block_size: int,
+    ids_are_local: bool,
+) -> None:
+    torch.ops._moe_C.log_post_dispatch_expert_load(
+        topk_idx,
+        psum,
+        rank_expert_offset,
+        layer_index,
+        ep_rank,
+        global_num_experts,
+        local_num_experts,
+        block_size,
+        ids_are_local,
     )
 
 

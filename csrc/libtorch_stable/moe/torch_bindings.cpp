@@ -44,12 +44,17 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_moe_C, m) {
   // path (one launch; num_recv read on device from psum[-1], cudagraph-safe).
   m.def(
       "fused_globalize_align_block_size(Tensor! topk_idx, Tensor psum,"
-      "                     int rank_expert_offset, int layer_index, int "
-      "ep_rank,"
-      "                     int global_num_experts,"
+      "                     int rank_expert_offset, int global_num_experts,"
       "                     int local_num_experts, int block_size,"
       "                     Tensor! sorted_ids, Tensor! expert_ids,"
       "                     Tensor! num_tokens_post_pad) -> ()");
+
+  m.def(
+      "log_post_dispatch_expert_load(Tensor topk_idx, Tensor? psum,"
+      "                     int rank_expert_offset, int layer_index, int "
+      "ep_rank,"
+      "                     int global_num_experts, int local_num_experts,"
+      "                     int block_size, bool ids_are_local) -> ()");
 
   // Aligning the number of tokens to be processed by each expert such
   // that it is divisible by the block size, but for the batched case.
@@ -152,6 +157,8 @@ STABLE_TORCH_LIBRARY_IMPL(_moe_C, CUDA, m) {
   m.impl("moe_align_block_size", TORCH_BOX(&moe_align_block_size));
   m.impl("fused_globalize_align_block_size",
          TORCH_BOX(&fused_globalize_align_block_size));
+  m.impl("log_post_dispatch_expert_load",
+         TORCH_BOX(&log_post_dispatch_expert_load));
   m.impl("batched_moe_align_block_size",
          TORCH_BOX(&batched_moe_align_block_size));
   m.impl("moe_lora_align_block_size", TORCH_BOX(&moe_lora_align_block_size));
