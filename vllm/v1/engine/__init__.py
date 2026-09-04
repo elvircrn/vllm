@@ -266,6 +266,9 @@ class EngineCoreOutputs(
     scheduler_stats: SchedulerStats | None = None
     timestamp: float = 0.0
 
+    # Debug-only per-expert routing records from the just-completed forward.
+    eplb_stats: list[tuple[int, int, int, int]] | None = None
+
     utility_output: UtilityOutput | None = None
     finished_requests: set[str] | None = None
 

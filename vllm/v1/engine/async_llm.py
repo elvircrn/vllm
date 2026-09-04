@@ -25,6 +25,7 @@ from vllm.exceptions import VLLMClientError, VLLMValidationError
 from vllm.inputs import EngineInput, PromptType
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
+from vllm.model_executor.layers.fused_moe import eplb_diagnostics
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.outputs import STREAM_FINISHED, PoolingRequestOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
@@ -730,6 +731,9 @@ class AsyncLLM(EngineClient):
                             )
 
                     output_processor.update_scheduler_stats(outputs.scheduler_stats)
+
+                    if outputs.eplb_stats is not None:
+                        eplb_diagnostics.record_metrics(outputs.eplb_stats)
 
                     # 4) Logging.
                     # TODO(rob): make into a coroutine and launch it in

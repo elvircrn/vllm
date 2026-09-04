@@ -498,6 +498,7 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+    eplb_stats: list[tuple[int, int, int, int]] | None
 
 
 class GPUModelRunner(
@@ -4565,8 +4566,29 @@ class GPUModelRunner(
                 **model_kwargs,
             )
 
+        eplb_stats = None
         if envs.VLLM_LOG_EPLB_STATS:
-            eplb_diagnostics.drain()
+            local_eplb_stats = eplb_diagnostics.drain()
+            tp_group = get_tp_group()
+            if tp_group.world_size == 1:
+                eplb_stats = local_eplb_stats
+            else:
+                gathered_eplb_stats: list[list[tuple[int, int, int, int]] | None] = [
+                    None
+                ] * tp_group.world_size
+                torch.distributed.gather_object(
+                    local_eplb_stats,
+                    gathered_eplb_stats if tp_group.rank_in_group == 0 else None,
+                    dst=tp_group.ranks[0],
+                    group=tp_group.cpu_group,
+                )
+                if tp_group.rank_in_group == 0:
+                    eplb_stats = [
+                        record
+                        for records in gathered_eplb_stats
+                        if records is not None
+                        for record in records
+                    ]
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4637,6 +4659,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            eplb_stats,
         )
         self.kv_connector_output = kv_connector_output
 
@@ -4688,6 +4711,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            eplb_stats,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
@@ -4891,6 +4915,7 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
+                eplb_stats=eplb_stats,
             )
 
         if not self.use_async_scheduling:

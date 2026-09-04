@@ -373,6 +373,10 @@ class ModelRunnerOutput:
     # ``None`` when ``enable_return_routed_experts`` is off.
     routed_experts: RoutedExpertsLists | None = None
 
+    # Debug-only per-expert routing records, gathered from the TP workers.
+    # Each item is ``(layer, global_expert, raw_tokens, padded_tokens)``.
+    eplb_stats: list[tuple[int, int, int, int]] | None = None
+
     # ``None`` when ``return_sampling_mask`` is off.
     sampling_masks: SamplingMaskLists | None = None
 

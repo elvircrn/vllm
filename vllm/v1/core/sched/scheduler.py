@@ -2152,6 +2152,11 @@ class Scheduler(SchedulerInterface):
             for client_index, outs in outputs.items()
         }
 
+        if model_runner_output.eplb_stats is not None:
+            if (eco := next(iter(engine_core_outputs.values()), None)) is None:
+                engine_core_outputs[0] = eco = EngineCoreOutputs()
+            eco.eplb_stats = model_runner_output.eplb_stats
+
         finished_req_ids = self.finished_req_ids_dict
         if finished_req_ids:
             # Include ids of requests that finished since last outputs
