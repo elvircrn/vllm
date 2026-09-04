@@ -107,7 +107,7 @@ def test_fused_matches_reference(n, topk, block_size, local_e, rank, fill):
 
     fused_global, fused_sorted, fused_expert_ids, fused_num = (
         fused_globalize_align_block_size(
-            local_idx.clone(), psum, reo, -1, -1, gne, local_e, block_size
+            local_idx.clone(), psum, reo, gne, local_e, block_size
         )
     )
 

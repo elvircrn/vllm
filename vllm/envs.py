@@ -195,6 +195,7 @@ if TYPE_CHECKING:
     VLLM_TPU_USING_PATHWAYS: bool = False
     VLLM_USE_DEEP_GEMM: bool = True
     VLLM_USE_FUSED_GLOBALIZE_ALIGN: bool = False
+    VLLM_LOG_EPLB_STATS: bool = False
     VLLM_MOE_USE_DEEP_GEMM: bool = True
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
@@ -1548,6 +1549,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_FUSED_GLOBALIZE_ALIGN": lambda: bool(
         int(os.getenv("VLLM_USE_FUSED_GLOBALIZE_ALIGN", "0"))
     ),
+    # Print post-dispatch per-local-expert raw and padded routing counts.
+    "VLLM_LOG_EPLB_STATS": lambda: bool(int(os.getenv("VLLM_LOG_EPLB_STATS", "0"))),
     # Allow use of DeepGemm specifically for MoE fused ops (overrides only MoE).
     "VLLM_MOE_USE_DEEP_GEMM": lambda: bool(
         int(os.getenv("VLLM_MOE_USE_DEEP_GEMM", "1"))
