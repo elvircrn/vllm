@@ -54,7 +54,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_moe_C, m) {
       "                     int rank_expert_offset, int layer_index, int "
       "ep_rank,"
       "                     int global_num_experts, int local_num_experts,"
-      "                     int block_size, bool ids_are_local) -> ()");
+      "                     int block_size, bool ids_are_local,"
+      "                     Tensor! output_counts) -> ()");
 
   // Aligning the number of tokens to be processed by each expert such
   // that it is divisible by the block size, but for the batched case.

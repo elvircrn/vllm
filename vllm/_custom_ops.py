@@ -2305,6 +2305,7 @@ def log_post_dispatch_expert_load(
     local_num_experts: int,
     block_size: int,
     ids_are_local: bool,
+    output_counts: torch.Tensor,
 ) -> None:
     torch.ops._moe_C.log_post_dispatch_expert_load(
         topk_idx,
@@ -2316,6 +2317,7 @@ def log_post_dispatch_expert_load(
         local_num_experts,
         block_size,
         ids_are_local,
+        output_counts,
     )
 
 
