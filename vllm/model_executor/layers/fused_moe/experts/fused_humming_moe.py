@@ -13,6 +13,7 @@ from vllm import _custom_ops as ops
 from vllm import envs
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe import eplb_diagnostics
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
     apply_moe_activation_supported,
@@ -808,6 +809,21 @@ class HummingIndexedExperts(HummingExpertsBase):
         # valid rows are defined by psum[-1]. Thus it reports one comparable
         # post-dispatch histogram across both execution modes.
         if envs.VLLM_LOG_EPLB_STATS:
+            stats_buffer = getattr(self, "_eplb_stats_buffer", None)
+            if stats_buffer is None:
+                stats_buffer = torch.empty(
+                    self.num_experts + 2,
+                    device=topk_ids.device,
+                    dtype=torch.int32,
+                )
+                self._eplb_stats_buffer = stats_buffer
+                eplb_diagnostics.register(
+                    stats_buffer,
+                    self.moe_config.layer_index,
+                    self.moe_config.ep_rank,
+                    self.moe_config.ep_rank * self.num_experts,
+                    self.num_experts,
+                )
             ops.log_post_dispatch_expert_load(
                 topk_idx=topk_ids,
                 psum=psum,
@@ -818,6 +834,7 @@ class HummingIndexedExperts(HummingExpertsBase):
                 local_num_experts=self.num_experts,
                 block_size=moe_block_size,
                 ids_are_local=rank_expert_offset is not None and psum is not None,
+                output_counts=stats_buffer,
             )
         if rank_expert_offset is not None and psum is not None:
             _, sorted_ids, expert_ids, num_tokens_padded = (

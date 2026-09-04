@@ -54,7 +54,7 @@ void log_post_dispatch_expert_load(
     std::optional<torch::stable::Tensor> psum_recv_per_rank,
     int64_t rank_expert_offset, int64_t layer_index, int64_t ep_rank,
     int64_t global_num_experts, int64_t local_num_experts, int64_t block_size,
-    bool ids_are_local);
+    bool ids_are_local, torch::stable::Tensor output_counts);
 
 void batched_moe_align_block_size(
     int64_t max_tokens_per_batch, int64_t block_size,

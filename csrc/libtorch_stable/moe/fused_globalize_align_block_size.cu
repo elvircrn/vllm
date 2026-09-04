@@ -213,7 +213,7 @@ __global__ void post_dispatch_eplb_stats_kernel(
     const long* __restrict__ topk_idx, const int* __restrict__ psum, int P,
     int rank_expert_offset, int layer_index, int ep_rank,
     int global_num_experts, int local_num_experts, int numel, int topk,
-    int block_size, bool ids_are_local) {
+    int block_size, bool ids_are_local, int* __restrict__ output_counts) {
   extern __shared__ int counts[];
   for (int e = threadIdx.x; e < local_num_experts; e += blockDim.x)
     counts[e] = 0;
@@ -231,21 +231,9 @@ __global__ void post_dispatch_eplb_stats_kernel(
   __syncthreads();
 
   if (threadIdx.x == 0) {
-    int total_raw = 0;
-    int total_padded = 0;
-    int max_raw = 0;
-    printf("EPLB layer=%d ep_rank=%d rank_expert_offset=%d num_recv=%d:",
-           layer_index, ep_rank, rank_expert_offset, num_recv);
-    for (int e = 0; e < local_num_experts; ++e) {
-      const int raw = counts[e];
-      const int padded = ((raw + block_size - 1) / block_size) * block_size;
-      total_raw += raw;
-      total_padded += padded;
-      max_raw = max(max_raw, raw);
-      printf(" e%d(raw=%d,pad=%d)", e, raw, padded);
-    }
-    printf(" total_raw=%d total_padded=%d max_raw=%d\n", total_raw,
-           total_padded, max_raw);
+    for (int e = 0; e < local_num_experts; ++e) output_counts[e] = counts[e];
+    output_counts[local_num_experts] = num_recv;
+    output_counts[local_num_experts + 1] = block_size;
   }
 }
 
@@ -302,11 +290,16 @@ void log_post_dispatch_expert_load(
     std::optional<torch::stable::Tensor> psum_recv_per_rank,
     int64_t rank_expert_offset, int64_t layer_index, int64_t ep_rank,
     int64_t global_num_experts, int64_t local_num_experts, int64_t block_size,
-    bool ids_are_local) {
+    bool ids_are_local, torch::stable::Tensor output_counts) {
   STD_TORCH_CHECK(topk_idx.scalar_type() == torch::headeronly::ScalarType::Long,
                   "log_post_dispatch_expert_load: topk_idx must be int64");
   STD_TORCH_CHECK(local_num_experts <= 1024,
                   "log_post_dispatch_expert_load: local_num_experts <= 1024");
+  STD_TORCH_CHECK(
+      output_counts.scalar_type() == torch::headeronly::ScalarType::Int &&
+          output_counts.numel() >= local_num_experts + 2,
+      "log_post_dispatch_expert_load: output_counts must be int32 "
+      "with local_num_experts + 2 elements");
   const torch::stable::accelerator::DeviceGuard device_guard(
       topk_idx.get_device_index());
   const cudaStream_t stream =
@@ -323,6 +316,7 @@ void log_post_dispatch_expert_load(
       reinterpret_cast<const long*>(topk_idx.const_data_ptr()), psum, P,
       (int)rank_expert_offset, (int)layer_index, (int)ep_rank,
       (int)global_num_experts, local_e, (int)topk_idx.numel(),
-      (int)topk_idx.size(1), (int)block_size, ids_are_local);
+      (int)topk_idx.size(1), (int)block_size, ids_are_local,
+      reinterpret_cast<int*>(output_counts.mutable_data_ptr()));
   STD_CUDA_CHECK(cudaGetLastError());
 }
