@@ -124,7 +124,7 @@ __device__ __forceinline__ void fused_gas_body(
   // EPLB stats
   if (!threadIdx.x && !blockIdx.x) {
     int max_tokens{};
-    for (int i = 0; i < e; i++) {
+    for (int i = 0; i < local_num_experts; i++) {
       max_tokens = max(max_tokens, counts[i]);
       printf(" count[%d] = %d", i, counts[i]);
     }
