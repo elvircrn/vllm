@@ -121,14 +121,27 @@ __device__ __forceinline__ void fused_gas_body(
     topk_idx[i] = valid ? g : -1;
   }
 
-  // EPLB stats
+  // EPLB debug stats. Phase 3 uses counts as write cursors, so wait for all
+  // atomics, then subtract the padded prefix saved in block 0's shared memory.
+  // This barrier and printf are diagnostic-only and should not be benchmarked.
+  BAR();
   if (!threadIdx.x && !blockIdx.x) {
-    int max_tokens{};
-    for (int i = 0; i < local_num_experts; i++) {
-      max_tokens = max(max_tokens, counts[i]);
-      printf(" count[%d] = %d", i, counts[i]);
+    int total_raw = 0;
+    int total_padded = 0;
+    int max_raw = 0;
+    int* sh_start = sh;
+    printf("EPLB rank_expert_offset=%d num_recv=%d:", rank_expert_offset,
+           num_recv);
+    for (int e = 0; e < local_num_experts; e++) {
+      int raw = counts[e] - sh_start[e];
+      int padded = ((raw + block_size - 1) / block_size) * block_size;
+      total_raw += raw;
+      total_padded += padded;
+      max_raw = max(max_raw, raw);
+      printf(" e%d(raw=%d,pad=%d)", e, raw, padded);
     }
-    printf("\n");
+    printf(" total_raw=%d total_padded=%d max_raw=%d\n", total_raw,
+           total_padded, max_raw);
   }
 }
 
