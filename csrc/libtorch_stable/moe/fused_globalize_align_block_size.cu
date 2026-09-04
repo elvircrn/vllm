@@ -5,7 +5,8 @@
 // experts. Hybrid launch: one non-cooperative block for small decode, else a
 // cooperative multi-SM grid (launched via cudaLaunchKernelEx so grid.sync() is
 // CUDA-graph capturable). Barriers: zero+sentinel -> shared histogram
-// (distributed reduce) -> block-0 prefix + expert_ids fill -> scatter+globalize.
+// (distributed reduce) -> block-0 prefix + expert_ids fill ->
+// scatter+globalize.
 
 #include <cooperative_groups.h>
 #include <cuda_runtime.h>
@@ -49,11 +50,13 @@ __device__ __forceinline__ void fused_gas_body(
 
   // Phase 0: zero the histogram + sentinel-fill sorted_ids.
   for (int e = tid; e < local_num_experts; e += stride) counts[e] = 0;
-  for (int i = tid; i < max_num_tokens_padded; i += stride) sorted_ids[i] = numel;
+  for (int i = tid; i < max_num_tokens_padded; i += stride)
+    sorted_ids[i] = numel;
   BAR();
 
   // Phase 1: per-block shared histogram, one global atomic per (block, expert).
-  // Reduce stays distributed across blocks (centralizing it in block 0 is slower).
+  // Reduce stays distributed across blocks (centralizing it in block 0 is
+  // slower).
   for (int e = threadIdx.x; e < local_num_experts; e += blockDim.x) sh[e] = 0;
   __syncthreads();
   for (int i = tid; i < numel; i += stride) {
@@ -117,24 +120,31 @@ __device__ __forceinline__ void fused_gas_body(
     }
     topk_idx[i] = valid ? g : -1;
   }
+
+  // EPLB stats
+  if (!threadIdx.x && !blockIdx.x) {
+    int max_tokens{};
+    for (int i = 0; i < e; i++) {
+      max_tokens = max(max_tokens, counts[i]);
+      printf(" count[%d] = %d", i, counts[i]);
+    }
+    printf("\n");
+  }
 }
 
 template <bool COOP>
-__global__ void fused_gas_kernel(long* __restrict__ topk_idx,
-                                 const int* __restrict__ psum,
-                                 int* __restrict__ sorted_ids,
-                                 int* __restrict__ expert_ids,
-                                 int* __restrict__ num_tokens_post_pad,
-                                 int* __restrict__ counts, int P,
-                                 int rank_expert_offset, int global_num_experts,
-                                 int numel, int max_num_tokens_padded,
-                                 int max_num_m_blocks, int local_num_experts,
-                                 int topk, int block_size) {
+__global__ void fused_gas_kernel(
+    long* __restrict__ topk_idx, const int* __restrict__ psum,
+    int* __restrict__ sorted_ids, int* __restrict__ expert_ids,
+    int* __restrict__ num_tokens_post_pad, int* __restrict__ counts, int P,
+    int rank_expert_offset, int global_num_experts, int numel,
+    int max_num_tokens_padded, int max_num_m_blocks, int local_num_experts,
+    int topk, int block_size) {
   // num_recv read on-device (psum[P-1]) -> baked into replay, cudagraph-safe.
-  fused_gas_body<COOP>(
-      topk_idx, sorted_ids, expert_ids, num_tokens_post_pad, counts, psum[P - 1],
-      rank_expert_offset, global_num_experts, numel, max_num_tokens_padded,
-      max_num_m_blocks, local_num_experts, topk, block_size);
+  fused_gas_body<COOP>(topk_idx, sorted_ids, expert_ids, num_tokens_post_pad,
+                       counts, psum[P - 1], rank_expert_offset,
+                       global_num_experts, numel, max_num_tokens_padded,
+                       max_num_m_blocks, local_num_experts, topk, block_size);
 }
 
 static int fgas_sm_count() {
@@ -176,7 +186,8 @@ static void fgas_launch(long* p_topk, const int* p_psum, int* p_sorted,
     return;
   }
 
-  // Large decode: cooperative multi-SM. Occupancy (fixed per rank) queried once.
+  // Large decode: cooperative multi-SM. Occupancy (fixed per rank) queried
+  // once.
   static int bps = -1;
   if (bps < 0)
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(
@@ -206,7 +217,8 @@ static void fgas_launch(long* p_topk, const int* p_psum, int* p_sorted,
 }  // namespace vllm
 
 // recv_topk_idx (int64, [N, topk]) is globalized in place and the align/sort
-// outputs (int32) are filled. counts is an internal write-cursor allocated here.
+// outputs (int32) are filled. counts is an internal write-cursor allocated
+// here.
 void fused_globalize_align_block_size(
     torch::stable::Tensor topk_idx, torch::stable::Tensor psum,
     int64_t rank_expert_offset, int64_t global_num_experts,
@@ -215,8 +227,9 @@ void fused_globalize_align_block_size(
     torch::stable::Tensor num_tokens_post_pad) {
   STD_TORCH_CHECK(topk_idx.scalar_type() == torch::headeronly::ScalarType::Long,
                   "fused_globalize_align_block_size: topk_idx must be int64");
-  STD_TORCH_CHECK(local_num_experts <= 1024,
-                  "fused_globalize_align_block_size: local_num_experts <= 1024");
+  STD_TORCH_CHECK(
+      local_num_experts <= 1024,
+      "fused_globalize_align_block_size: local_num_experts <= 1024");
 
   const torch::stable::accelerator::DeviceGuard device_guard(
       topk_idx.get_device_index());
