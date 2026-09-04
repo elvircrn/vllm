@@ -807,6 +807,8 @@ class HummingIndexedExperts(HummingExpertsBase):
                     recv_topk_idx=topk_ids,
                     psum_recv_per_rank=psum,
                     rank_expert_offset=rank_expert_offset,
+                    layer_index=self.moe_config.layer_index,
+                    ep_rank=self.moe_config.ep_rank,
                     global_num_experts=self.global_num_experts,
                     local_num_experts=self.num_experts,
                     block_size=moe_block_size,

@@ -1337,6 +1337,9 @@ class FusedMoEConfig:
 
     max_capture_size: int = 0
 
+    # Numeric transformer layer index, retained for kernel diagnostics.
+    layer_index: int = -1
+
     # Set by __post_init__
     intermediate_size_per_partition: int = -1
     rocm_aiter_fmoe_enabled: bool = False

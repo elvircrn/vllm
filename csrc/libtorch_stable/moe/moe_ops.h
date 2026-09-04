@@ -42,8 +42,8 @@ void moe_align_block_size(
 
 void fused_globalize_align_block_size(
     torch::stable::Tensor topk_idx, torch::stable::Tensor psum,
-    int64_t rank_expert_offset, int64_t global_num_experts,
-    int64_t local_num_experts, int64_t block_size,
+    int64_t rank_expert_offset, int64_t layer_index, int64_t ep_rank,
+    int64_t global_num_experts, int64_t local_num_experts, int64_t block_size,
     torch::stable::Tensor sorted_ids, torch::stable::Tensor expert_ids,
     torch::stable::Tensor num_tokens_post_pad);
 
