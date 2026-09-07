@@ -93,8 +93,12 @@ def _debug_request_lengths() -> tuple[int, ...] | None:
         return None
 
     metadata = context.attn_metadata
+    if metadata is None:
+        return None
     if isinstance(metadata, list):
-        metadata_values = [item for group in metadata for item in group.values()]
+        metadata_values = [
+            item for group in metadata if group is not None for item in group.values()
+        ]
     else:
         metadata_values = list(metadata.values())
 
