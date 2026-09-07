@@ -4565,8 +4565,7 @@ class GPUModelRunner(
                 **model_kwargs,
             )
 
-        if envs.VLLM_LOG_EPLB_STATS:
-            eplb_diagnostics.drain()
+        eplb_diagnostics.drain()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
