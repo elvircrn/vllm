@@ -79,6 +79,11 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _debug_is_current_stream_capturing() -> bool:
+    is_capturing = getattr(torch.cuda, "is_current_stream_capturing", None)
+    return bool(is_capturing is not None and is_capturing())
+
+
 def _debug_tensor_digest(tensor: torch.Tensor) -> str:
     """Return a stable byte digest for a tensor snapshot."""
     raw = tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
@@ -787,6 +792,12 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
         output: torch.Tensor,
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
     ) -> None:
+        # The diagnostics take GPU->CPU snapshots and must never run while a
+        # CUDA graph is being captured.  Apart from being unsupported by
+        # PyTorch, the copy would become part of the captured graph.
+        if _debug_is_current_stream_capturing():
+            return
+
         batch_descriptor = None
         with suppress(AssertionError):
             batch_descriptor = get_forward_context().batch_descriptor
