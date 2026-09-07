@@ -1444,7 +1444,7 @@ def test_humming_global_valid_shape_m(
     assert result == expected
 
 
-def test_humming_permute_scratch_is_keyed_by_runtime_topk(
+def test_humming_permute_scratch_is_keyed_by_runtime_shape(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from types import SimpleNamespace
@@ -1452,25 +1452,44 @@ def test_humming_permute_scratch_is_keyed_by_runtime_topk(
 
     import vllm.model_executor.layers.fused_moe.experts.fused_humming_moe as humming
 
-    scratch_topk6 = Mock()
-    scratch_topk1 = Mock()
-    scratch_type = Mock(side_effect=[scratch_topk6, scratch_topk1])
+    scratch_topk6_bf16 = Mock()
+    scratch_topk1_bf16 = Mock()
+    scratch_topk6_fp16 = Mock()
+    scratch_type = Mock(
+        side_effect=[scratch_topk6_bf16, scratch_topk1_bf16, scratch_topk6_fp16]
+    )
     monkeypatch.setattr(humming, "moe_permute_unpermute_supported", lambda: True)
     monkeypatch.setattr(humming, "MoEPermuteScratch", scratch_type)
     moe_config = make_dummy_moe_config(max_num_tokens=512, experts_per_token=6)
-    moe_config.moe_parallel_config.dp_size = 2
+    moe_config.moe_parallel_config.ep_size = 2
     experts = SimpleNamespace(_permute_scratch={}, moe_config=moe_config)
 
-    assert humming.HummingExpertsBase._get_permute_scratch(experts, 6) is scratch_topk6
-    assert humming.HummingExpertsBase._get_permute_scratch(experts, 1) is scratch_topk1
-    assert humming.HummingExpertsBase._get_permute_scratch(experts, 6) is scratch_topk6
+    assert (
+        humming.HummingExpertsBase._get_permute_scratch(experts, 6, torch.bfloat16)
+        is scratch_topk6_bf16
+    )
+    assert (
+        humming.HummingExpertsBase._get_permute_scratch(experts, 1, torch.bfloat16)
+        is scratch_topk1_bf16
+    )
+    assert (
+        humming.HummingExpertsBase._get_permute_scratch(experts, 6, torch.bfloat16)
+        is scratch_topk6_bf16
+    )
+    assert (
+        humming.HummingExpertsBase._get_permute_scratch(experts, 6, torch.float16)
+        is scratch_topk6_fp16
+    )
 
-    assert scratch_type.call_count == 2
-    first_call, second_call = scratch_type.call_args_list
+    assert scratch_type.call_count == 3
+    first_call, second_call, third_call = scratch_type.call_args_list
     assert first_call.kwargs["max_num_tokens"] == 1024
     assert first_call.kwargs["topk"] == 6
+    assert first_call.kwargs["hidden_dtype"] == torch.bfloat16
     assert second_call.kwargs["max_num_tokens"] == 6144
     assert second_call.kwargs["topk"] == 1
+    assert second_call.kwargs["hidden_dtype"] == torch.bfloat16
+    assert third_call.kwargs["hidden_dtype"] == torch.float16
 
 
 def test_humming_delegates_to_instance_activation():
