@@ -56,6 +56,16 @@ void moe_lora_align_block_size(
     torch::stable::Tensor num_tokens_post_pad,
     torch::stable::Tensor adapter_enabled, torch::stable::Tensor lora_ids,
     std::optional<torch::stable::Tensor> maybe_expert_map);
+
+#ifndef USE_ROCM
+void log_post_dispatch_expert_load(
+    torch::stable::Tensor topk_idx,
+    std::optional<torch::stable::Tensor> psum_recv_per_rank,
+    int64_t rank_expert_offset, int64_t global_num_experts,
+    int64_t local_num_experts, int64_t block_size,
+    torch::stable::Tensor output_counts);
+#endif
+
 #ifndef USE_ROCM
 torch::stable::Tensor moe_wna16_gemm(
     torch::stable::Tensor input, torch::stable::Tensor output,

@@ -67,6 +67,12 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_moe_C, m) {
       "                     Tensor? maybe_expert_map) -> () ");
 #ifndef USE_ROCM
   m.def(
+      "log_post_dispatch_expert_load(Tensor topk_idx, "
+      "Tensor? psum_recv_per_rank, int rank_expert_offset, "
+      "int global_num_experts, int local_num_experts, int block_size, "
+      "Tensor! output_counts) -> ()");
+
+  m.def(
       "moe_wna16_gemm(Tensor input, Tensor! output, Tensor b_qweight, "
       "Tensor b_scales, Tensor? b_qzeros, "
       "Tensor? topk_weights, Tensor sorted_token_ids, "
@@ -140,6 +146,8 @@ STABLE_TORCH_LIBRARY_IMPL(_moe_C, CUDA, m) {
          TORCH_BOX(&batched_moe_align_block_size));
   m.impl("moe_lora_align_block_size", TORCH_BOX(&moe_lora_align_block_size));
 #ifndef USE_ROCM
+  m.impl("log_post_dispatch_expert_load",
+         TORCH_BOX(&log_post_dispatch_expert_load));
   m.impl("moe_wna16_gemm", TORCH_BOX(&moe_wna16_gemm));
   m.impl("shuffle_rows", TORCH_BOX(&shuffle_rows));
   m.impl("grouped_topk", TORCH_BOX(&grouped_topk));

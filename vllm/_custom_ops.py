@@ -2335,6 +2335,26 @@ def moe_align_block_size(
     )
 
 
+def log_post_dispatch_expert_load(
+    topk_idx: torch.Tensor,
+    psum_recv_per_rank: torch.Tensor | None,
+    rank_expert_offset: int,
+    global_num_experts: int,
+    local_num_experts: int,
+    block_size: int,
+    output_counts: torch.Tensor,
+) -> None:
+    torch.ops._moe_C.log_post_dispatch_expert_load(
+        topk_idx,
+        psum_recv_per_rank,
+        rank_expert_offset,
+        global_num_experts,
+        local_num_experts,
+        block_size,
+        output_counts,
+    )
+
+
 def batched_moe_align_block_size(
     max_tokens_per_batch: int,
     block_size: int,

@@ -9,9 +9,11 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm import _custom_ops as ops
 from vllm import envs
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe import eplb_diagnostics
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
     apply_moe_activation_supported,
@@ -756,6 +758,32 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
 
 
 class HummingIndexedExperts(HummingExpertsBase):
+    def __init__(
+        self,
+        moe_config: FusedMoEConfig,
+        quant_config: FusedMoEQuantConfig,
+        max_num_tokens: int | None = None,
+        num_dispatchers: int | None = None,
+    ):
+        super().__init__(
+            moe_config=moe_config,
+            quant_config=quant_config,
+            max_num_tokens=max_num_tokens,
+            num_dispatchers=num_dispatchers,
+        )
+        # Allocate before CUDA graph capture. The kernel writes this persistent
+        # buffer; the runner drains it after the model forward.
+        self._eplb_stats_buffer = torch.empty(
+            self.num_experts + 2, device=moe_config.device, dtype=torch.int32
+        )
+        eplb_diagnostics.register(
+            self._eplb_stats_buffer,
+            moe_config.layer_index,
+            moe_config.ep_rank,
+            moe_config.ep_rank * self.num_experts,
+            self.num_experts,
+        )
+
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
 
@@ -789,6 +817,20 @@ class HummingIndexedExperts(HummingExpertsBase):
                 valid_shape_m,
             )
             moe_block_size = 64
+
+        ops.log_post_dispatch_expert_load(
+            topk_idx=topk_ids,
+            psum_recv_per_rank=(
+                expert_tokens_meta.psum_recv_per_rank
+                if expert_tokens_meta is not None
+                else None
+            ),
+            rank_expert_offset=self.moe_config.ep_rank * self.num_experts,
+            global_num_experts=self.global_num_experts,
+            local_num_experts=self.num_experts,
+            block_size=moe_block_size,
+            output_counts=self._eplb_stats_buffer,
+        )
 
         sorted_ids, expert_ids, num_tokens_padded = moe_align_block_size(
             topk_ids=topk_ids,
