@@ -142,6 +142,12 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             use_batch_invariant=envs.VLLM_BATCH_INVARIANT,
             gemm_type=self.humming_gemm_type(),
         )
+        # Humming indexed MoE Stream-K partials accumulate through the BF16
+        # output buffer and are batch-position dependent. Keep Stream-K off
+        # until the kernel uses an FP32 reduction workspace.
+        for tuning_config in (self.w13_tuning_config, self.w2_tuning_config):
+            for entry in tuning_config:
+                entry[2]["use_stream_k"] = False
         self.compute_config_str = json.dumps(self.compute_config)
         self.w13_tuning_config_str = json.dumps(self.w13_tuning_config)
         self.w2_tuning_config_str = json.dumps(self.w2_tuning_config)
