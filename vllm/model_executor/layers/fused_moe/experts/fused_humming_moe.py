@@ -187,6 +187,11 @@ def _fixup_moe_tuning_config(tuning_config: list, max_k_block: int = 128) -> Non
     logger.info_once("Attempting to override humming GEMM config")
     for entry in tuning_config:
         config = entry[2]
+        # Stream-K's BF16 partial reduction is batch-position dependent for
+        # indexed MoE GEMMs.  Keep it disabled while this path is being fixed;
+        # this is intentionally unconditional so production E2E tests cannot
+        # re-enable the faulty scheduler through heuristics or environment.
+        config["use_stream_k"] = False
         block_shape = config.get("block_shape")
         if not (block_shape and len(block_shape) == 3):
             continue
