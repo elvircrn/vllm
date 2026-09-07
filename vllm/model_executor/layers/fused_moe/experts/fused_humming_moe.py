@@ -2,10 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Fused MoE utilities for Humming."""
 
-import hashlib
 import json
 import math
-from contextlib import suppress
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -77,55 +75,6 @@ if TYPE_CHECKING:
 
 
 logger = init_logger(__name__)
-
-
-def _debug_tensor_digest(tensor: torch.Tensor) -> str:
-    """Return a stable byte digest for a tensor snapshot."""
-    raw = tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
-    return hashlib.blake2b(raw, digest_size=8).hexdigest()
-
-
-def _debug_request_lengths() -> tuple[int, ...] | None:
-    """Find Kimi's flattened prefill request lengths from attention metadata."""
-    try:
-        context = get_forward_context()
-    except AssertionError:
-        return None
-
-    metadata = context.attn_metadata
-    if isinstance(metadata, list):
-        metadata_values = [item for group in metadata for item in group.values()]
-    else:
-        metadata_values = list(metadata.values())
-
-    for item in metadata_values:
-        query_start_loc = getattr(item, "query_start_loc_cpu", None)
-        if query_start_loc is None:
-            query_start_loc = getattr(item, "query_start_loc", None)
-        if query_start_loc is None or not torch.is_tensor(query_start_loc):
-            continue
-        query_start_loc = query_start_loc.detach().cpu().to(torch.int64)
-        if query_start_loc.numel() < 2:
-            continue
-        return tuple(
-            int(length)
-            for length in (query_start_loc[1:] - query_start_loc[:-1]).tolist()
-        )
-    return None
-
-
-def _debug_segment_digests(
-    tensor: torch.Tensor, request_lengths: tuple[int, ...] | None
-) -> tuple[str, ...] | None:
-    if request_lengths is None or sum(request_lengths) != tensor.shape[0]:
-        return None
-    segments: list[str] = []
-    start = 0
-    for length in request_lengths:
-        end = start + length
-        segments.append(_debug_tensor_digest(tensor[start:end]))
-        start = end
-    return tuple(segments)
 
 
 def _is_supported_wna16_weight_key(weight_key: QuantKey | None) -> bool:
@@ -228,9 +177,6 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             num_dispatchers=num_dispatchers,
         )
         self._permute_scratch: dict[int, MoEPermuteScratch] = {}
-        self._debug_batch_variance_seen: dict[
-            tuple[int, str, str, str], tuple[str, int]
-        ] = {}
 
     def init_humming_moe(self):
         from vllm.utils.humming import get_heuristics_config
@@ -767,113 +713,6 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             return False
         return True
 
-    def _debug_indexed_prefill_batch_variance(
-        self,
-        hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
-        output: torch.Tensor,
-        expert_tokens_meta: mk.ExpertTokensMetadata | None,
-    ) -> None:
-        request_lengths = _debug_request_lengths()
-        if not request_lengths or max(request_lengths) <= 1:
-            return
-
-        input_segments = _debug_segment_digests(hidden_states, request_lengths)
-        output_segments = _debug_segment_digests(output, request_lengths)
-        ids_segments = _debug_segment_digests(topk_ids, request_lengths)
-        weights_segments = _debug_segment_digests(topk_weights, request_lengths)
-        if input_segments is None:
-            input_segments = (_debug_tensor_digest(hidden_states),)
-        if output_segments is None:
-            output_segments = (_debug_tensor_digest(output),)
-        if ids_segments is None:
-            ids_segments = (_debug_tensor_digest(topk_ids),)
-        if weights_segments is None:
-            weights_segments = (_debug_tensor_digest(topk_weights),)
-
-        batch_descriptor = None
-        with suppress(AssertionError):
-            batch_descriptor = get_forward_context().batch_descriptor
-
-        valid_tokens = None
-        if (
-            expert_tokens_meta is not None
-            and expert_tokens_meta.psum_recv_per_rank is not None
-        ):
-            valid_tokens = int(expert_tokens_meta.psum_recv_per_rank[-1].item())
-
-        invalid_ids = int(
-            ((topk_ids < 0) | (topk_ids >= self.global_num_experts)).sum().item()
-        )
-        logger.info(
-            "HUMMING_BATCH_VARIANCE_TRACE layer=%d phase=prefill "
-            "batch_tokens=%s batch_reqs=%s request_lengths=%s "
-            "hidden_shape=%s hidden_dtype=%s expected_dtype=%s topk=%d "
-            "valid_tokens=%s invalid_expert_ids=%d input=%s ids=%s "
-            "weights=%s output=%s",
-            self.moe_config.layer_index,
-            batch_descriptor.num_tokens if batch_descriptor is not None else "?",
-            batch_descriptor.num_reqs if batch_descriptor is not None else "?",
-            request_lengths,
-            tuple(hidden_states.shape),
-            hidden_states.dtype,
-            self.moe_config.in_dtype,
-            topk_ids.shape[1],
-            valid_tokens,
-            invalid_ids,
-            _debug_tensor_digest(hidden_states),
-            _debug_tensor_digest(topk_ids),
-            _debug_tensor_digest(topk_weights),
-            _debug_tensor_digest(output),
-        )
-
-        if (
-            len(input_segments) > 1
-            and len(set(input_segments)) == 1
-            and len(set(output_segments)) > 1
-        ):
-            logger.warning(
-                "HUMMING_BATCH_VARIANCE_DETECTED layer=%d "
-                "identical_prefill_inputs=%s produced different_outputs=%s "
-                "request_lengths=%s output_segments=%s",
-                self.moe_config.layer_index,
-                input_segments[0],
-                len(set(output_segments)),
-                request_lengths,
-                output_segments,
-            )
-
-        for input_digest, ids_digest, weights_digest, output_digest in zip(
-            input_segments, ids_segments, weights_segments, output_segments
-        ):
-            key = (
-                self.moe_config.layer_index,
-                input_digest,
-                ids_digest,
-                weights_digest,
-            )
-            previous = self._debug_batch_variance_seen.get(key)
-            if previous is not None and previous[0] != output_digest:
-                logger.warning(
-                    "HUMMING_CROSS_BATCH_VARIANCE_DETECTED layer=%d "
-                    "same_input=%s previous_output=%s current_output=%s "
-                    "previous_batch_tokens=%d current_batch_tokens=%d",
-                    self.moe_config.layer_index,
-                    input_digest,
-                    previous[0],
-                    output_digest,
-                    previous[1],
-                    hidden_states.shape[0],
-                )
-            self._debug_batch_variance_seen[key] = (
-                output_digest,
-                hidden_states.shape[0],
-            )
-
-        if len(self._debug_batch_variance_seen) > 8192:
-            self._debug_batch_variance_seen.clear()
-
     def fused_situ_quant(
         self,
         gate_up_output: torch.Tensor,
@@ -1093,13 +932,6 @@ class HummingIndexedExperts(HummingExpertsBase):
             expert_map=expert_map,
             outputs=output,
             num_valid_tokens=valid_tokens,
-        )
-        self._debug_indexed_prefill_batch_variance(
-            hidden_states=hidden_states,
-            topk_ids=topk_ids,
-            topk_weights=topk_weights,
-            output=output,
-            expert_tokens_meta=expert_tokens_meta,
         )
 
 
