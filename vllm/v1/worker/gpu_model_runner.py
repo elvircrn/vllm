@@ -4530,6 +4530,13 @@ class GPUModelRunner(
                 num_tokens_unpadded,
                 ubatch_slices_padded,
             )
+        # Keep the host-known real-versus-CUDA-graph token counts alongside
+        # each EPLB drain. This is intentionally CPU metadata: reading a
+        # device padding mask here would break CUDA graph capture.
+        eplb_diagnostics.set_forward_metadata(
+            num_tokens_unpadded,
+            num_tokens_padded,
+        )
         with (
             set_forward_context(
                 attn_metadata,
