@@ -778,7 +778,23 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
         output: torch.Tensor,
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
     ) -> None:
+        batch_descriptor = None
+        with suppress(AssertionError):
+            batch_descriptor = get_forward_context().batch_descriptor
+
         request_lengths = _debug_request_lengths()
+        logger.info(
+            "HUMMING_BATCH_VARIANCE_PATH layer=%d gemm=indexed "
+            "batch_tokens=%s batch_reqs=%s request_lengths=%s "
+            "hidden_shape=%s hidden_dtype=%s topk_shape=%s",
+            self.moe_config.layer_index,
+            batch_descriptor.num_tokens if batch_descriptor is not None else "?",
+            batch_descriptor.num_reqs if batch_descriptor is not None else "?",
+            request_lengths,
+            tuple(hidden_states.shape),
+            hidden_states.dtype,
+            tuple(topk_ids.shape),
+        )
         if not request_lengths or max(request_lengths) <= 1:
             return
 
@@ -794,10 +810,6 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             ids_segments = (_debug_tensor_digest(topk_ids),)
         if weights_segments is None:
             weights_segments = (_debug_tensor_digest(topk_weights),)
-
-        batch_descriptor = None
-        with suppress(AssertionError):
-            batch_descriptor = get_forward_context().batch_descriptor
 
         valid_tokens = None
         if (
