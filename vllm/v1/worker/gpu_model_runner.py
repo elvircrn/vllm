@@ -61,6 +61,7 @@ from vllm.logger import init_logger
 from vllm.lora.layers import BaseLayerWithLoRA, LoRAMapping, LoRAMappingType
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.fused_moe import eplb_diagnostics
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
@@ -4551,6 +4552,16 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+
+        # Keep the host-known real-versus-CUDA-graph token counts alongside
+        # each EPLB drain. This is intentionally CPU metadata: reading a
+        # device padding mask here would break CUDA graph capture.
+        eplb_diagnostics.set_forward_metadata(
+            num_tokens_unpadded,
+            num_tokens_padded,
+            num_tokens_across_dp,
+        )
+        eplb_diagnostics.drain()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:

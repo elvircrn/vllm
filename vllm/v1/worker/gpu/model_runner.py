@@ -38,6 +38,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe import eplb_diagnostics
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
@@ -1753,6 +1754,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.step_timing.forward_start()
 
         # Run model.
+        # Keep host-known real-versus-CUDA-graph token counts alongside the
+        # post-forward EPLB drain. Do not read the device padding mask here:
+        # that would introduce a synchronization into CUDA graph execution.
+        eplb_diagnostics.set_forward_metadata(
+            input_batch.num_tokens,
+            input_batch.num_tokens_after_padding,
+            dp_sync.num_tokens_across_dp if dp_sync is not None else None,
+        )
+
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
@@ -1793,6 +1803,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 else:
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
+
+        eplb_diagnostics.drain()
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:

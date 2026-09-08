@@ -325,6 +325,9 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 )
             expert_tokens_meta.psum_recv_per_rank = psum_recv_per_rank
 
+        if expert_tokens_meta is not None:
+            expert_tokens_meta.num_dispatchers = self.num_dispatchers_
+
         if _quantize_before_dispatch(quant_config, defer_input_quant):
             if quant_config.quant_dtype == "mxfp8" and expert_x_scale is not None:
                 expert_x_scale = _unpack_mxfp8_scale(

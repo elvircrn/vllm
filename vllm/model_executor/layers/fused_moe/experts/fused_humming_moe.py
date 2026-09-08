@@ -9,9 +9,11 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm import _custom_ops as ops
 from vllm import envs
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe import eplb_diagnostics
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
     apply_moe_activation_supported,
@@ -756,6 +758,34 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
 
 
 class HummingIndexedExperts(HummingExpertsBase):
+    def __init__(
+        self,
+        moe_config: FusedMoEConfig,
+        quant_config: FusedMoEQuantConfig,
+        max_num_tokens: int | None = None,
+        num_dispatchers: int | None = None,
+    ):
+        super().__init__(
+            moe_config=moe_config,
+            quant_config=quant_config,
+            max_num_tokens=max_num_tokens,
+            num_dispatchers=num_dispatchers,
+        )
+        # Allocate before CUDA graph capture. The kernel writes this persistent
+        # buffer; the runner drains it after the model forward.
+        self._eplb_stats_buffer = torch.empty(
+            eplb_diagnostics.stats_buffer_size(self.num_experts),
+            device=moe_config.device,
+            dtype=torch.int32,
+        )
+        eplb_diagnostics.register(
+            self._eplb_stats_buffer,
+            moe_config.layer_index,
+            moe_config.ep_rank,
+            moe_config.ep_rank * self.num_experts,
+            self.num_experts,
+        )
+
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
 
@@ -789,6 +819,60 @@ class HummingIndexedExperts(HummingExpertsBase):
                 valid_shape_m,
             )
             moe_block_size = 64
+
+        # Store only tensor metadata and host metadata here.  The diagnostic
+        # module copies the device data after the forward, so this remains
+        # CUDA-graph safe while exposing the information needed to distinguish
+        # real distributed routing from stale receive-buffer rows.
+        ctx = get_forward_context()
+        dp_tokens = None
+        if ctx.dp_metadata is not None:
+            dp_tokens = tuple(
+                int(value) for value in ctx.dp_metadata.num_tokens_across_dp_cpu
+            )
+        dispatchers = (
+            expert_tokens_meta.num_dispatchers
+            if expert_tokens_meta is not None
+            and expert_tokens_meta.num_dispatchers is not None
+            else (
+                self.num_dispatchers
+                if self.num_dispatchers is not None
+                else self.moe_config.ep_size
+            )
+        )
+        eplb_diagnostics.update_dispatch_metadata(
+            self._eplb_stats_buffer,
+            topk_idx=topk_ids,
+            # DeepEP v2 receives this as all2all_manager.world_size.  The
+            # standard Humming expert wrapper does not carry the prepare/
+            # finalize object, so EP size is the equivalent dispatch world
+            # size for this path.
+            num_dispatchers=dispatchers,
+            router_topk=self.moe_config.experts_per_token,
+            tp_size=self.moe_config.tp_size,
+            dp_size=self.moe_config.dp_size,
+            ep_size=self.moe_config.ep_size,
+            dp_tokens=dp_tokens,
+            cudagraph_mode=(
+                ctx.cudagraph_runtime_mode.name
+                if ctx.cudagraph_runtime_mode is not None
+                else None
+            ),
+        )
+
+        ops.log_post_dispatch_expert_load(
+            topk_idx=topk_ids,
+            psum_recv_per_rank=(
+                expert_tokens_meta.psum_recv_per_rank
+                if expert_tokens_meta is not None
+                else None
+            ),
+            rank_expert_offset=self.moe_config.ep_rank * self.num_experts,
+            global_num_experts=self.global_num_experts,
+            local_num_experts=self.num_experts,
+            block_size=moe_block_size,
+            output_counts=self._eplb_stats_buffer,
+        )
 
         sorted_ids, expert_ids, num_tokens_padded = moe_align_block_size(
             topk_ids=topk_ids,
