@@ -73,17 +73,17 @@ def _combine_kernel(
         valid = token_mask & (expert >= 0)
         rank = expert // experts_per_rank
 
-        # DeepEP keeps only the first route to each EP rank in non-expanded
-        # reduction mode.  Match that rule without reading the route payload
-        # for duplicate ranks.
-        for previous_route in tl.static_range(route_idx):
-            previous_expert = tl.load(
-                combined_topk_idx_ptr + token_idx * TOPK + previous_route,
+        # DeepEP's ptx::deduplicate keeps the highest lane for each EP rank
+        # (get_master_lane_idx uses the highest set bit).  The combine buffer
+        # is populated at that master-lane slot, so preserve the same rule.
+        for later_route in tl.static_range(route_idx + 1, TOPK):
+            later_expert = tl.load(
+                combined_topk_idx_ptr + token_idx * TOPK + later_route,
                 mask=token_mask,
                 other=-1,
             )
-            previous_valid = previous_expert >= 0
-            valid &= ~(previous_valid & (previous_expert // experts_per_rank == rank))
+            later_valid = later_expert >= 0
+            valid &= ~(later_valid & (later_expert // experts_per_rank == rank))
 
         route_ptr = (
             recv_ptr
