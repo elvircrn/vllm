@@ -50,6 +50,10 @@ def _combine_kernel(
     num_combined_tokens,
     slot_stride_bf16,
     token_stride_bf16,
+    topk_idx_stride_token,
+    topk_idx_stride_route,
+    output_stride_token,
+    output_stride_hidden,
     experts_per_rank,
     BLOCK_H: tl.constexpr,
     TOPK: tl.constexpr,
@@ -66,7 +70,9 @@ def _combine_kernel(
     reduced = tl.zeros((BLOCK_H,), dtype=tl.float32)
     for route_idx in tl.static_range(TOPK):
         expert = tl.load(
-            combined_topk_idx_ptr + token_idx * TOPK + route_idx,
+            combined_topk_idx_ptr
+            + token_idx * topk_idx_stride_token
+            + route_idx * topk_idx_stride_route,
             mask=token_mask,
             other=-1,
         )
@@ -78,7 +84,9 @@ def _combine_kernel(
         # is populated at that master-lane slot, so preserve the same rule.
         for later_route in tl.static_range(route_idx + 1, TOPK):
             later_expert = tl.load(
-                combined_topk_idx_ptr + token_idx * TOPK + later_route,
+                combined_topk_idx_ptr
+                + token_idx * topk_idx_stride_token
+                + later_route * topk_idx_stride_route,
                 mask=token_mask,
                 other=-1,
             )
@@ -98,7 +106,9 @@ def _combine_kernel(
         ).to(tl.float32)
 
     tl.store(
-        output_ptr + token_idx * HIDDEN + hidden_offsets,
+        output_ptr
+        + token_idx * output_stride_token
+        + hidden_offsets * output_stride_hidden,
         reduced.to(tl.bfloat16),
         mask=token_mask & hidden_mask,
     )
@@ -122,12 +132,11 @@ def combine_kimi_k3_decode(
 
     if not reduce_buffer.is_cuda or not combined_topk_idx.is_cuda:
         raise ValueError("DeepEP Triton epilogue inputs must be CUDA tensors")
-    if not reduce_buffer.is_contiguous() or not combined_topk_idx.is_contiguous():
-        raise ValueError("DeepEP Triton epilogue inputs must be contiguous")
+    if not reduce_buffer.is_contiguous():
+        raise ValueError("DeepEP reduction buffer must be contiguous")
     if (
         output.dtype != torch.bfloat16
         or not output.is_cuda
-        or not output.is_contiguous()
         or output.shape != (num_combined_tokens, KIMI_HIDDEN)
     ):
         raise ValueError("output must be contiguous BF16 with shape [tokens, 3584]")
@@ -150,6 +159,10 @@ def combine_kimi_k3_decode(
         num_combined_tokens,
         slot_stride_bf16,
         record_bf16,
+        combined_topk_idx.stride(0),
+        combined_topk_idx.stride(1),
+        output.stride(0),
+        output.stride(1),
         num_experts // num_ranks,
         BLOCK_H=BLOCK_H,
         TOPK=KIMI_TOPK,

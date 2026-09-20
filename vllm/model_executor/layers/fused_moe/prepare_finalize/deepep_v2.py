@@ -557,7 +557,6 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         if (
             fused_expert_output.ndim != 2
             or output.ndim != 2
-            or not output.is_contiguous()
             or fused_expert_output.shape[1] != 3584
             or output.shape[1] != 3584
         ):
