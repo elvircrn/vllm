@@ -68,6 +68,74 @@ def _validate_dcp_empty_shard_args(
     return True
 
 
+@triton.jit
+def _mask_dcp_empty_shards_kernel(
+    lse,
+    seq_lens,
+    query_start_loc,
+    B: tl.constexpr,
+    H: tl.constexpr,
+    NSEQ: tl.constexpr,
+    NBOUNDARIES: tl.constexpr,
+    LSE_S0: tl.constexpr,
+    LSE_S1: tl.constexpr,
+    SEQ_STRIDE: tl.constexpr,
+    Q_STRIDE: tl.constexpr,
+    SEARCH_STEPS: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    rows = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
+    heads = tl.arange(0, BLOCK_H)
+
+    valid = rows < B
+
+    if NSEQ == 0:
+        empty = tl.full((BLOCK_R,), True, tl.int1)
+
+    else:
+        total_q = tl.load(query_start_loc + NBOUNDARIES * Q_STRIDE)
+
+        # searchsorted(query_start_loc[1:], rows, right=True)
+        lo = tl.full((BLOCK_R,), 0, tl.int32)
+        hi = tl.full((BLOCK_R,), NBOUNDARIES, tl.int32)
+
+        for _ in range(SEARCH_STEPS):
+            active = (lo < hi) & valid
+            mid = (lo + hi) // 2
+
+            boundary = tl.load(
+                query_start_loc + (mid + 1) * Q_STRIDE,
+                mask=active & (mid < NBOUNDARIES),
+                other=0,
+            )
+
+            go_right = boundary <= rows
+
+            lo = tl.where(active & go_right, mid + 1, lo)
+            hi = tl.where(active & ~go_right, mid, hi)
+
+        seq_idx = tl.minimum(lo, NSEQ - 1)
+
+        seq_len = tl.load(
+            seq_lens + seq_idx * SEQ_STRIDE,
+            mask=valid,
+            other=0,
+        )
+
+        empty = (rows >= total_q) | (seq_len == 0)
+
+    offsets = rows[:, None] * LSE_S0 + heads[None, :] * LSE_S1
+
+    mask = valid[:, None] & (heads[None, :] < H) & empty[:, None]
+
+    tl.store(
+        lse + offsets,
+        float("-inf"),
+        mask=mask,
+    )
+
+
 def mask_dcp_empty_shards_(
     lse: torch.Tensor,
     seq_lens: torch.Tensor | None,
@@ -75,25 +143,37 @@ def mask_dcp_empty_shards_(
 ) -> None:
     if not _validate_dcp_empty_shard_args(seq_lens, query_start_loc):
         return
+
     assert seq_lens is not None and query_start_loc is not None
 
-    # A DCP rank can receive no local sequences during CUDA graph warmup even
-    # though the padded LSE buffer still has rows. In that case every row is an
-    # empty shard; avoid indexing the empty seq_lens tensor below.
-    if seq_lens.shape[0] == 0:
-        lse.fill_(float("-inf"))
+    B, H = lse.shape
+
+    if B == 0 or H == 0:
         return
 
-    row_indices = torch.arange(
-        lse.shape[0], device=lse.device, dtype=query_start_loc.dtype
+    nseq = seq_lens.shape[0]
+    nboundaries = query_start_loc.numel() - 1
+
+    block_h = triton.next_power_of_2(H)
+    block_r = triton.next_power_of_2(max(1, min(32, 1024 // block_h)))
+
+    _mask_dcp_empty_shards_kernel[(triton.cdiv(B, block_r),)](
+        lse,
+        seq_lens,
+        query_start_loc,
+        B=B,
+        H=H,
+        NSEQ=nseq,
+        NBOUNDARIES=nboundaries,
+        LSE_S0=lse.stride(0),
+        LSE_S1=lse.stride(1),
+        SEQ_STRIDE=seq_lens.stride(0),
+        Q_STRIDE=query_start_loc.stride(0),
+        SEARCH_STEPS=(nboundaries + 1).bit_length(),
+        BLOCK_R=block_r,
+        BLOCK_H=block_h,
+        num_warps=4,
     )
-    sequence_indices = torch.searchsorted(
-        query_start_loc[1:], row_indices, right=True
-    ).clamp_max(seq_lens.shape[0] - 1)
-    empty_rows = (row_indices >= query_start_loc[-1]) | (
-        seq_lens[sequence_indices] == 0
-    )
-    lse.masked_fill_(empty_rows[:, None], float("-inf"))
 
 
 # AG + RS/AR implementation
@@ -453,6 +533,8 @@ def _cp_lse_common(
         ctx = CPTritonContext()
 
     cp_attn_lse = cp_attn_lse.contiguous()
+
+    # There's 8 small kernels calls coming from here!!
     mask_dcp_empty_shards_(cp_attn_lse, seq_lens, query_start_loc)
     lses = cp_group.all_gather(cp_attn_lse, dim=0).reshape(
         (cp_group.world_size,) + cp_attn_lse.shape
