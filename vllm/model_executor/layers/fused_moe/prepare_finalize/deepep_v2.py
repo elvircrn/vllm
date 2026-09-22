@@ -5,6 +5,7 @@ from collections.abc import Callable
 import deep_ep
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
@@ -22,6 +23,11 @@ from vllm.utils.math_utils import cdiv, round_up
 from vllm.v1.worker.ubatching import (
     dbo_current_ubatch_id,
     dbo_enabled,
+)
+
+from .deepep_triton_epilogue import (
+    TRITON_MAX_BATCH_SIZE,
+    combine_kimi_k3_decode,
 )
 
 
@@ -473,6 +479,43 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # DBO drives its own hook/receiver schedule; keep the combine
         # synchronous there (the receiver then only performs the copy).
         combine_async = do_async and not dbo_enabled()
+
+        if self._can_use_triton_epilogue(
+            fused_expert_output=fused_expert_output,
+            output=output,
+            handle=handle,
+        ):
+            raw_combine = self.buffer.combine(
+                x=fused_expert_output,
+                handle=handle,
+                topk_weights=None,
+                async_with_compute_stream=combine_async,
+                allocate_on_comm_stream=combine_async,
+                skip_combine_epilogue=True,
+            )
+
+            def _triton_receiver():
+                event = raw_combine["event"]
+                if event.event is not None:
+                    event.current_stream_wait()
+                combine_kimi_k3_decode(
+                    raw_combine["reduce_buffer"],
+                    raw_combine["combined_topk_idx"],
+                    output,
+                    num_combined_tokens=raw_combine["num_combined_tokens"],
+                    num_max_tokens_per_rank=raw_combine["num_max_tokens_per_rank"],
+                    num_experts=raw_combine["num_experts"],
+                    num_ranks=(
+                        raw_combine["num_scaleout_ranks"]
+                        * raw_combine["num_scaleup_ranks"]
+                    ),
+                )
+
+            if do_async:
+                return _triton_receiver
+            _triton_receiver()
+            return None
+
         combined_x, _, event = self.buffer.combine(
             x=fused_expert_output,
             handle=handle,
@@ -495,6 +538,50 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         else:
             output.copy_(combined_x, non_blocking=True)
             return None
+
+    def _can_use_triton_epilogue(
+        self,
+        fused_expert_output: torch.Tensor,
+        output: torch.Tensor,
+        handle: deep_ep.EPHandle,
+    ) -> bool:
+        """Check the exact layout supported by the Kimi Triton epilogue."""
+        # Feature flag is the first gate: when disabled, do not even consider
+        # the batch-size threshold below.
+        if not envs.VLLM_DEEPEP_V2_TRITON_EPILOGUE:
+            return False
+        if not self.use_cudagraph:
+            return False
+        if fused_expert_output.numel() == 0:
+            return False
+        if (
+            fused_expert_output.ndim != 2
+            or output.ndim != 2
+            or fused_expert_output.shape[1] != 3584
+            or output.shape[1] != 3584
+        ):
+            return False
+        if self.num_topk != 16 or self.num_experts != 896:
+            return False
+        if (
+            self.buffer.num_scaleout_ranks != 1
+            or self.buffer.num_scaleup_ranks != 32
+            or self.buffer.allow_multiple_reduction
+        ):
+            return False
+        if handle.do_expand or handle.num_max_tokens_per_rank is None:
+            return False
+        # Decide from the actual epilogue output batch.  The number of locally
+        # received expert rows can be larger and is not the relevant workload
+        # for this mapping.
+        num_combined_tokens = output.shape[0]
+        if not 0 < num_combined_tokens <= TRITON_MAX_BATCH_SIZE:
+            return False
+        if handle.topk_idx.shape != (num_combined_tokens, 16):
+            return False
+        if handle.topk_idx.device != output.device:
+            return False
+        return handle.topk_idx.dtype in (torch.int32, torch.int64)
 
     def finalize_async(
         self,
