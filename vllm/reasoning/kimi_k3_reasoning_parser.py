@@ -134,6 +134,15 @@ class KimiK3ReasoningParser(ReasoningParser):
         self._think_close_ids = tokenizer.encode(
             self._think_close, add_special_tokens=False
         )
+        self._response_open_ids = tokenizer.encode(
+            self._response_open, add_special_tokens=False
+        )
+        self._response_close_ids = tokenizer.encode(
+            self._response_close, add_special_tokens=False
+        )
+        self._message_close_ids = tokenizer.encode(
+            self._message_close, add_special_tokens=False
+        )
         self._last_streaming_delta_token_ids: tuple[int, ...] | None = None
         self._last_streaming_content_token_ids: list[int] | None = None
 
@@ -210,6 +219,37 @@ class KimiK3ReasoningParser(ReasoningParser):
         if cached_delta_ids == tuple(input_ids) and cached_content_ids is not None:
             return cached_content_ids
         return self._extract_content_ids(input_ids)
+
+    def count_reasoning_tokens(self, token_ids: Sequence[int]) -> int:
+        """Count generated tokens in the Kimi K3 think channel."""
+        if not self._thinking_enabled:
+            return 0
+
+        count = 0
+        in_reasoning = True
+        i = 0
+        markers = (
+            (self._think_open_ids, True),
+            (self._think_close_ids, False),
+            (self._response_open_ids, False),
+            (self._response_close_ids, False),
+            (self._message_close_ids, False),
+        )
+        while i < len(token_ids):
+            for marker, enters_reasoning in markers:
+                if (
+                    marker
+                    and i + len(marker) <= len(token_ids)
+                    and _match_at(token_ids, i, marker)
+                ):
+                    in_reasoning = enters_reasoning
+                    i += len(marker)
+                    break
+            else:
+                if in_reasoning:
+                    count += 1
+                i += 1
+        return count
 
     def _strip_content_wrapper(self, text: str) -> str:
         """Strip ``<|open|>response<|sep|>…<|close|>response<|sep|>`` wrapper and
