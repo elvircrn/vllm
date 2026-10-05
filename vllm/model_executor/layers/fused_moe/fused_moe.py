@@ -307,6 +307,7 @@ def fused_moe_kernel(
     sorted_token_ids_ptr,
     expert_ids_ptr,
     num_tokens_post_padded_ptr,
+    nan_seed_ptr,
     # Matrix dimensions
     N,
     K,
@@ -605,6 +606,9 @@ def fused_moe_kernel(
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    nan_seed = tl.load(nan_seed_ptr)
+    nan_mask = tl.rand(nan_seed, offs_token[:, None] * N + offs_cn[None, :]) < 0.01
+    accumulator = tl.where(nan_mask, float("nan"), accumulator)
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
@@ -861,6 +865,8 @@ def invoke_fused_moe_triton_kernel(
     if A_scale is not None and A_scale.ndim == 0:
         A_scale = A_scale.reshape(1)
 
+    nan_seed = torch.randint(0, 2**31, (), device=A.device, dtype=torch.int32)
+
     fused_moe_kernel[grid](
         A,
         B,
@@ -872,6 +878,7 @@ def invoke_fused_moe_triton_kernel(
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
+        nan_seed,
         B.size(1),
         B.size(2),
         EM,
