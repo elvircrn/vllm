@@ -607,7 +607,7 @@ def fused_moe_kernel(
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
     nan_seed = tl.load(nan_seed_ptr)
-    nan_mask = tl.rand(nan_seed, offs_token[:, None] * N + offs_cn[None, :]) < 0.0001
+    nan_mask = tl.rand(nan_seed, offs_token[:, None] * N + offs_cn[None, :]) < 0.00001
     accumulator = tl.where(nan_mask, float("nan"), accumulator)
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
