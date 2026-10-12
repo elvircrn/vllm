@@ -101,9 +101,9 @@ class OffloadingEventsTracker:
 
     The scheduler calls :meth:`record_store` from ``_build_store_jobs`` and
     :meth:`record_lookup` for ready primary-tier hits while the ``Request`` is
-    available. Deferred and missing lookups add no state. Under the connector's
-    supported success-only transfer model, entries remain until the final
-    observed residency removal or :meth:`reset`.
+    available. Deferred and missing lookups add no state. Entries remain until
+    the final observed residency removal, :meth:`discard_store` for rejected
+    stores, or :meth:`reset`.
     """
 
     def __init__(self, config: OffloadingKVEventsConfig):
@@ -263,6 +263,15 @@ class OffloadingEventsTracker:
             meta = self._pending_event_metadata.get(key)
             if meta is not None and not meta.active_residencies:
                 self._pending_event_metadata.pop(key)
+
+    def discard_store(self, keys: Iterable[OffloadKey]) -> None:
+        """Drop metadata for stores rejected before publication."""
+        for key in keys:
+            meta = self._pending_event_metadata.get(key)
+            if meta is not None:
+                meta.active_residencies.discard((Medium.CPU, None))
+                if not meta.active_residencies:
+                    del self._pending_event_metadata[key]
 
     def reset(self) -> None:
         """Drop all tracked state; pending payloads are stale after a

@@ -26,6 +26,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiConnector,
+    MultiKVConnectorMetadata,
     MultiKVConnectorPromMetrics,
     MultiKVConnectorStats,
     MultiKVConnectorWorkerMetadata,
@@ -152,6 +153,16 @@ KVConnectorFactory.register_connector(
     __name__,
     MockDivergentHMAConnector.__name__,
 )
+
+
+@pytest.mark.skip_global_cleanup
+def test_nan_validation_reaches_each_child_connector():
+    connector = object.__new__(MultiConnector)
+    connector._connectors = [MagicMock(), MagicMock()]
+    metadata = MultiKVConnectorMetadata(metadata=(MagicMock(), MagicMock()))
+    connector.validate_kv_cache(metadata, {"clean"})
+    for child, child_metadata in zip(connector._connectors, metadata.metadata):
+        child.validate_kv_cache.assert_called_once_with(child_metadata, {"clean"})
 
 
 def test_register_finished_partial_tail_notifies_every_connector():

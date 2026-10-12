@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from tests.v1.kv_connector.unit.offloading_connector.test_config import (
+    _make_kv_cache_config,
     _make_mamba_hybrid_kv_cache_config,
     _make_vllm_config,
 )
@@ -16,8 +17,10 @@ from tests.v1.kv_connector.unit.offloading_connector.utils import (
     generate_store_output,
     to_keys,
 )
-from tests.v1.kv_connector.unit.utils import EOS_TOKEN_ID
+from tests.v1.kv_connector.unit.utils import EOS_TOKEN_ID, create_model_runner_output
+from vllm import SamplingParams
 from vllm.config import KVEventsConfig
+from vllm.config.fault_tolerance import FaultToleranceConfig
 from vllm.distributed.kv_events import MEDIUM_CPU, BlockRemoved, BlockStored
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
@@ -36,16 +39,20 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     _create_req_context,
     get_sliding_window_size_in_chunks,
 )
+from vllm.utils.hashing import sha256
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
     KVCacheBlockCopy,
+    get_request_block_hasher,
+    init_none_hash,
     make_block_hash_with_group_id,
 )
 from vllm.v1.core.sched.output import (
     KVConnectorBlockState,
+    NewRequestData,
     SchedulerOutput,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
@@ -79,7 +86,7 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
-from vllm.v1.request import RequestStatus
+from vllm.v1.request import Request, RequestStatus
 
 
 @pytest.mark.parametrize(
@@ -135,7 +142,11 @@ def test_swa_offload_window_covers_unaligned_hit(
         cache_config=SimpleNamespace(
             enable_prefix_caching=True, prefix_cache_retention_interval=None
         ),
-        parallel_config=SimpleNamespace(world_size=1, decode_context_parallel_size=1),
+        parallel_config=SimpleNamespace(
+            world_size=1,
+            decode_context_parallel_size=1,
+            fault_tolerance_config=FaultToleranceConfig(),
+        ),
     )
     sched = OffloadingConnectorScheduler(
         spec,
@@ -231,6 +242,277 @@ def _make_partial_tail_request(
     request.is_finished.return_value = False
     scheduler.on_new_request(request)
     return request
+
+
+def _make_nan_offloading_case(
+    *, enabled=True, worker_count=1, prompt_tokens=32, manager=None
+):
+    config = _make_vllm_config()
+    config.speculative_config = None
+    config.parallel_config.world_size = worker_count
+    config.parallel_config.fault_tolerance_config.enable_nan_fault_tolerance = enabled
+    config.kv_events_config = KVEventsConfig(
+        enable_kv_cache_events=True, publisher="null"
+    )
+    config.kv_transfer_config.kv_connector_extra_config["self_describing_kv_events"] = (
+        True
+    )
+    kv_config = _make_kv_cache_config()
+    spec = MockOffloadingSpec(build_offloading_config(config, kv_config))
+    spec.manager = manager or CPUOffloadingManager(
+        num_chunks=prompt_tokens // 16, enable_events=True
+    )
+    scheduler = OffloadingConnectorScheduler(spec, config, kv_config)
+    init_none_hash(sha256)
+    request = Request(
+        request_id="nan-test",
+        prompt_token_ids=list(range(prompt_tokens)),
+        sampling_params=SamplingParams(max_tokens=8),
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(16, sha256),
+    )
+    request.status = RequestStatus.RUNNING
+    scheduler.on_new_request(request)
+    output = SchedulerOutput.make_empty()
+    output.num_scheduled_tokens = {request.request_id: 32}
+    output.total_num_scheduled_tokens = 32
+    output.scheduled_new_reqs = [NewRequestData.from_request(request, ([1, 2],))]
+    metadata = scheduler.build_connector_meta(output)
+    request.num_computed_tokens = 32
+    return scheduler, request, metadata
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("result", ["clean", "nan", "missing"])
+@pytest.mark.parametrize("copy_finishes_first", [False, True])
+@pytest.mark.parametrize("worker_count", [1, 2])
+def test_nan_offload_requires_validation_and_all_copy_completions(
+    result, copy_finishes_first, worker_count
+):
+    """A copied prefix is readable only after its producing step passes validation."""
+    scheduler, request, metadata = _make_nan_offloading_case(worker_count=worker_count)
+    state = scheduler._req_status[request.request_id]
+    keys = state.group_states[0].offload_keys
+    [job_id] = metadata.store_jobs
+
+    def lookups():
+        return [scheduler.manager.lookup(key, state.req_context) for key in keys]
+
+    def complete_copy():
+        for _ in range(worker_count):
+            assert lookups() == [LookupResult.HIT_PENDING] * 2
+            scheduler.update_connector_output(
+                KVConnectorOutput(
+                    kv_connector_worker_meta=OffloadingWorkerMetadata(
+                        completed_jobs={job_id: 1}
+                    )
+                )
+            )
+
+    if copy_finishes_first:
+        complete_copy()
+        assert lookups() == [LookupResult.HIT_PENDING] * 2
+        assert list(scheduler.take_events()) == []
+
+    if result == "nan":
+        request.num_nans_in_logits = 1
+        request.status = RequestStatus.FINISHED_ERROR
+        scheduler.request_finished(request)
+
+    # Workers may remove stores from metadata while flushing them.
+    metadata.store_jobs.clear()
+    scheduler.validate_kv_cache(
+        metadata, {request.request_id} if result == "clean" else set()
+    )
+    if not copy_finishes_first:
+        complete_copy()
+
+    expected = LookupResult.HIT if result == "clean" else LookupResult.MISS
+    assert lookups() == [expected] * 2
+    assert scheduler._jobs == {}
+    assert state.transfer_jobs == set()
+    assert scheduler._block_id_to_pending_jobs == {}
+    events = list(scheduler.take_events())
+    assert bool(events) == (result == "clean")
+    if result != "clean":
+        assert scheduler._events_tracker._pending_event_metadata == {}
+        # Failed stores released their reservations, so a retry can fill the pool.
+        retry = scheduler.manager.prepare_store(keys, state.req_context)
+        assert retry is not None and set(retry.keys_to_store) == set(keys)
+
+
+@pytest.mark.skip_global_cleanup
+def test_nan_offload_disabled_preserves_immediate_publication():
+    scheduler, request, metadata = _make_nan_offloading_case(enabled=False)
+    state = scheduler._req_status[request.request_id]
+    [job_id] = metadata.store_jobs
+    assert not metadata.unvalidated_store_jobs
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={job_id: 1}
+            )
+        )
+    )
+    assert all(
+        scheduler.manager.lookup(key, state.req_context) == LookupResult.HIT
+        for key in state.group_states[0].offload_keys
+    )
+
+
+@pytest.mark.skip_global_cleanup
+def test_nan_offload_does_not_create_finish_time_stores():
+    scheduler, request, metadata = _make_nan_offloading_case()
+    request.num_nans_in_logits = 1
+    request.status = RequestStatus.FINISHED_ERROR
+    scheduler.request_finished(request)
+    state = scheduler._req_status[request.request_id]
+    # A failed request must not enqueue its previously unoffered final blocks.
+    for group in state.group_states:
+        group.next_stored_chunk_idx = 0
+    output = SchedulerOutput.make_empty()
+    output.finished_req_ids = {request.request_id}
+    assert not scheduler.build_connector_meta(output).store_jobs
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={job_id: 1 for job_id in metadata.store_jobs}
+            )
+        )
+    )
+    assert not scheduler._req_status
+    assert not scheduler.has_pending_push_work()
+
+
+@pytest.mark.skip_global_cleanup
+def test_nan_offload_validates_each_async_batch_separately():
+    scheduler, request, first = _make_nan_offloading_case(prompt_tokens=64)
+    output = SchedulerOutput.make_empty()
+    output.num_scheduled_tokens = {request.request_id: 32}
+    output.total_num_scheduled_tokens = 32
+    output.scheduled_cached_reqs.req_ids = [request.request_id]
+    output.scheduled_cached_reqs.new_block_ids = [([3, 4],)]
+    second = scheduler.build_connector_meta(output)
+    state = scheduler._req_status[request.request_id]
+    keys = state.group_states[0].offload_keys
+    assert len(first.store_jobs) == len(second.store_jobs) == 1
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={
+                    job_id: 1 for job_id in first.store_jobs | second.store_jobs
+                }
+            )
+        )
+    )
+    scheduler.validate_kv_cache(first, {request.request_id})
+    assert [scheduler.manager.lookup(k, state.req_context) for k in keys] == [
+        LookupResult.HIT,
+        LookupResult.HIT,
+        LookupResult.HIT_PENDING,
+        LookupResult.HIT_PENDING,
+    ]
+    request.status = RequestStatus.FINISHED_ERROR
+    scheduler.request_finished(request)
+    scheduler.validate_kv_cache(second, set())
+    assert [scheduler.manager.lookup(k, state.req_context) for k in keys] == [
+        LookupResult.HIT,
+        LookupResult.HIT,
+        LookupResult.MISS,
+        LookupResult.MISS,
+    ]
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("valid", [False, True])
+def test_nan_offload_cascades_to_secondary_tiers_only_after_validation(valid):
+    from tests.v1.kv_offload.tiering.test_tiering_offloading import (
+        MetricsSecondaryTierManager,
+        _mock_mmap_region,
+    )
+    from vllm.v1.kv_offload.tiering.manager import (
+        CPUPrimaryTierOffloadingManager,
+        TieringOffloadingManager,
+    )
+
+    region = _mock_mmap_region(2)
+    primary = CPUPrimaryTierOffloadingManager(num_chunks=2, mmap_region=region)
+    secondary = MetricsSecondaryTierManager(
+        offloading_spec=MagicMock(),
+        primary_kv_view=region.create_kv_memoryview(),
+        tier_type="test_metrics",
+    )
+    manager = TieringOffloadingManager(primary, [secondary])
+    scheduler, request, metadata = _make_nan_offloading_case(manager=manager)
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={job_id: 1 for job_id in metadata.store_jobs}
+            )
+        )
+    )
+    assert secondary.submitted_stores == []
+    scheduler.validate_kv_cache(metadata, {request.request_id} if valid else set())
+    assert len(secondary.submitted_stores) == int(valid)
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("num_nans", [0, 1])
+def test_nan_offload_scheduler_output_controls_publication(
+    request_runner, monkeypatch, async_scheduling, num_nans
+):
+    """Exercise the engine scheduler's NaN abort with a real CPU cache manager."""
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setattr("vllm.config.vllm.HAS_TRITON", True)
+    runner = request_runner(
+        block_size=16, num_gpu_blocks=10, async_scheduling=async_scheduling
+    )
+    scheduler = runner.scheduler
+    connector = runner.connector_scheduler
+    scheduler.enable_nan_fault_tolerance = True
+    connector.enable_nan_fault_tolerance = True
+    connector.manager = CPUOffloadingManager(num_chunks=2)
+    runner.new_request(token_ids=list(range(32)))
+    output = scheduler.schedule()
+    [request] = scheduler.running
+    state = connector._req_status[request.request_id]
+    metadata = output.kv_connector_metadata
+    assert isinstance(metadata, OffloadingConnectorMetadata)
+    assert metadata.store_jobs
+    if async_scheduling:
+        scheduler.schedule()
+    model_output = create_model_runner_output(
+        scheduler.running,
+        token_id=42,
+        kv_connector_worker_meta=OffloadingWorkerMetadata(
+            completed_jobs={job_id: 1 for job_id in metadata.store_jobs}
+        ),
+    )
+    model_output.num_nans_in_logits = {request.request_id: num_nans}
+    scheduler.update_from_output(output, model_output)
+    assert (request.status == RequestStatus.FINISHED_ERROR) == bool(num_nans)
+    assert all(
+        connector.manager.lookup(key, state.req_context)
+        == (LookupResult.MISS if num_nans else LookupResult.HIT)
+        for key in state.group_states[0].offload_keys
+    )
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("boundary", [16, 28])
+def test_nan_offload_rejects_aborted_checkpoint_handoffs(boundary):
+    scheduler = _make_partial_tail_scheduler()
+    scheduler.enable_nan_fault_tolerance = True
+    request = _make_partial_tail_request(scheduler)
+    request.status = RequestStatus.FINISHED_ERROR
+    output = SchedulerOutput.make_empty()
+    output.kv_connector_block_state = KVConnectorBlockState(
+        req_ids=set(),
+        resolve_block_ids={}.__getitem__,
+        boundary_state_offloads={"req": [(1, 99, boundary)]},
+    )
+    assert not scheduler._build_partial_tail_store_jobs(output)
+    scheduler.manager.prepare_store.assert_not_called()
 
 
 def test_create_req_context_preserves_kv_hints():

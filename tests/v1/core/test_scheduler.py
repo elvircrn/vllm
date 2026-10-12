@@ -7580,11 +7580,18 @@ def test_diffusion_read_deferral_keeps_a_longer_pp_wait():
     assert read.next_decode_eligible_step == 7
 
 
-def test_nan_fault_tolerance_aborts_request(monkeypatch):
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_nan_fault_tolerance_aborts_request(monkeypatch, async_scheduling):
     """NaN fault tolerance aborts requests with NaN logits."""
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     monkeypatch.setattr("vllm.config.vllm.HAS_TRITON", True)
-    scheduler = create_scheduler(enable_nan_fault_tolerance=True)
+    scheduler = create_scheduler(
+        enable_nan_fault_tolerance=True,
+        async_scheduling=async_scheduling,
+        use_kv_connector=True,
+    )
+    validate_kv_cache = Mock()
+    monkeypatch.setattr(scheduler.connector, "validate_kv_cache", validate_kv_cache)
 
     requests = create_requests(num_requests=2)
     for req in requests:
@@ -7612,6 +7619,9 @@ def test_nan_fault_tolerance_aborts_request(monkeypatch):
     assert requests[0].status == RequestStatus.FINISHED_ERROR
     error_output = next(out for out in engine_outputs if out.finish_reason is not None)
     assert error_output.num_nans_in_logits == 3
+    validate_kv_cache.assert_called_once_with(
+        output.kv_connector_metadata, {requests[1].request_id}
+    )
 
 
 def test_nan_fault_tolerance_disabled_does_not_abort():
