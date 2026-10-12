@@ -824,18 +824,6 @@ class BlockPool:
             block = self.blocks[block_id]
             self._maybe_evict_cached_block(block)
 
-    def evict_block_hashes(
-        self, block_hashes: Sequence[BlockHash], kv_cache_group_ids: Iterable[int]
-    ) -> None:
-        """Evict all copies and checkpoint aliases of the given prefixes."""
-        for group_id in kv_cache_group_ids:
-            for block_hash in block_hashes:
-                key = make_block_hash_with_group_id(block_hash, group_id)
-                while (
-                    block := self.cached_block_hash_to_block.get_one_block(key)
-                ) is not None:
-                    self._maybe_evict_cached_block(block)
-
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
         flows to invalidate prefix caching after the weights are updated,

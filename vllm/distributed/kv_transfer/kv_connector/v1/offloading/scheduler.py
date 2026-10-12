@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import hashlib
 import time
-import uuid
 from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
@@ -85,8 +83,6 @@ class TransferJobStatus:
     deferred_fence_block_ids: list[int] | None = None
     # Store source blocks fenced when the transfer is created.
     fenced_block_ids: list[int] | None = None
-    # None until the producing step's logits have been checked.
-    validated: bool | None = True
 
 
 class GroupOffloadConfig(NamedTuple):
@@ -365,7 +361,6 @@ class RequestOffloadState:
     req: Request
     req_context: ReqContext
     offloading_context: RequestOffloadingContext
-    storage_generation: bytes = b""
     group_states: tuple[RequestGroupState, ...] = field(init=False)
     # upper bound on tokens to load for this request; None means no cap
     max_load_tokens: int | None = None
@@ -434,16 +429,7 @@ class RequestOffloadState:
                 None,
                 group_config.hashes_per_chunk,
             ):
-                key = make_offload_key(
-                    (
-                        hashlib.sha256(
-                            self.storage_generation + req_block_hash
-                        ).digest()
-                        if self.storage_generation
-                        else req_block_hash
-                    ),
-                    group_config.group_idx,
-                )
+                key = make_offload_key(req_block_hash, group_config.group_idx)
                 group_state.offload_keys.append(key)
                 self.req_context.set_offload_key_position(
                     key,
@@ -587,9 +573,6 @@ class OffloadingConnectorScheduler:
             spec, vllm_config, kv_cache_config
         )
         self.manager: OffloadingManager = spec.get_manager()
-        # Rotate once per NaN recovery so retained secondary copies cannot hit.
-        self._storage_generation = b""
-        self._nan_reset_pending = False
         fault_tolerance_config = vllm_config.parallel_config.fault_tolerance_config
         self.enable_nan_fault_tolerance = (
             fault_tolerance_config.enable_nan_fault_tolerance
@@ -680,6 +663,17 @@ class OffloadingConnectorScheduler:
             pending.remove(job_id)
             if not pending:
                 del self._block_id_to_pending_jobs[bid]
+
+    @staticmethod
+    def _num_validated_tokens(request: Request) -> int:
+        if request.status in (
+            RequestStatus.FINISHED_ERROR,
+            RequestStatus.FINISHED_ABORTED,
+        ):
+            return 0
+        # Scheduling advances num_computed_tokens before logits are checked.
+        # Preemption can reset it while stale outputs are still in flight.
+        return max(0, request.num_computed_tokens - request.num_in_flight_tokens)
 
     def _calc_num_offloadable_tokens(
         self, req_status: RequestOffloadState, num_computed_tokens: int
@@ -980,15 +974,7 @@ class OffloadingConnectorScheduler:
         req_context: ReqContext,
     ) -> OffloadKey:
         hash_idx = boundary_tokens // self.config.tokens_per_hash - 1
-        block_hash = request.block_hashes[hash_idx]
-        key = make_offload_key(
-            (
-                hashlib.sha256(self._storage_generation + block_hash).digest()
-                if self._storage_generation
-                else block_hash
-            ),
-            group_idx,
-        )
+        key = make_offload_key(request.block_hashes[hash_idx], group_idx)
         req_context.set_offload_key_position(key, boundary_tokens)
         return key
 
@@ -1062,7 +1048,6 @@ class OffloadingConnectorScheduler:
             req=request,
             req_context=req_context,
             offloading_context=offloading_context,
-            storage_generation=self._storage_generation,
         )
         self._req_status[request.request_id] = req_status
 
@@ -1102,9 +1087,6 @@ class OffloadingConnectorScheduler:
                 "Delaying request %s since it still has in-flight transfers",
                 request.request_id,
             )
-            return None, False
-
-        if self._nan_reset_pending:
             return None, False
 
         req_status.update_offload_keys()
@@ -1411,7 +1393,6 @@ class OffloadingConnectorScheduler:
                     keys={key},
                     is_store=True,
                     fenced_block_ids=[block_id],
-                    validated=None if self.enable_nan_fault_tolerance else True,
                 )
                 group_sizes = [0] * num_groups
                 group_sizes[config_idx] = 1
@@ -1445,11 +1426,15 @@ class OffloadingConnectorScheduler:
             return {}
 
         if self.enable_nan_fault_tolerance:
-            handoffs = {
-                req_id: entries
-                for req_id, entries in handoffs.items()
-                if self._can_store_request(req_id, scheduler_output)
-            }
+            validated_handoffs = {}
+            for req_id, entries in handoffs.items():
+                req_status = self._req_status.get(req_id)
+                if req_status is not None:
+                    validated_tokens = self._num_validated_tokens(req_status.req)
+                    validated_handoffs[req_id] = [
+                        entry for entry in entries if entry[2] <= validated_tokens
+                    ]
+            handoffs = validated_handoffs
 
         store_jobs = self._build_aligned_boundary_store_jobs(handoffs)
         if not self.config.supports_partial_tail:
@@ -1542,7 +1527,6 @@ class OffloadingConnectorScheduler:
                 keys=set(store_output.keys_to_store),
                 is_store=True,
                 fenced_block_ids=source_blocks,
-                validated=None if self.enable_nan_fault_tolerance else True,
             )
             store_jobs[job_id] = TransferJob(
                 req_id=req_id,
@@ -1622,10 +1606,6 @@ class OffloadingConnectorScheduler:
             req_status = self._req_status.get(req_id)
             if req_status is None:
                 continue
-            if self.enable_nan_fault_tolerance and not self._can_store_request(
-                req_id, scheduler_output
-            ):
-                continue
             req = req_status.req
 
             if req.status is RequestStatus.FINISHED_ABORTED:
@@ -1638,6 +1618,11 @@ class OffloadingConnectorScheduler:
             else:
                 num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
                 num_tokens_after_batch = req.num_computed_tokens + num_scheduled_tokens
+
+            if self.enable_nan_fault_tolerance:
+                num_tokens_after_batch = min(
+                    num_tokens_after_batch, self._num_validated_tokens(req)
+                )
 
             num_offloadable_tokens = self._calc_num_offloadable_tokens(
                 req_status, num_tokens_after_batch
@@ -1866,7 +1851,6 @@ class OffloadingConnectorScheduler:
                 is_store=True,
                 deferred_fence_block_ids=deferred_fence_block_ids,
                 fenced_block_ids=fenced_block_ids or None,
-                validated=None if self.enable_nan_fault_tolerance else True,
             )
 
             store_jobs[job_id] = TransferJob(
@@ -1890,33 +1874,10 @@ class OffloadingConnectorScheduler:
 
         return store_jobs
 
-    def _can_store_request(
-        self, req_id: str, scheduler_output: SchedulerOutput
-    ) -> bool:
-        if self._nan_reset_pending:
-            return False
-        req_status = self._req_status.get(req_id)
-        if req_status is None:
-            return False
-        request = req_status.req
-        if request.status in (
-            RequestStatus.FINISHED_ERROR,
-            RequestStatus.FINISHED_ABORTED,
-        ):
-            return False
-        # Finish-time stores and checkpoint hand-offs without a new forward
-        # must not copy state still being modified by an unchecked step.
-        return (
-            req_id in scheduler_output.num_scheduled_tokens
-            or request.num_in_flight_tokens == 0
-        )
-
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         self._update_req_states(scheduler_output)
-        if self._nan_reset_pending:
-            self._current_batch_jobs_to_flush.update(self._jobs)
         schedule_end_context = ScheduleEndContext(
             new_req_ids=[req.req_id for req in scheduler_output.scheduled_new_reqs],
             preempted_req_ids=scheduler_output.preempted_req_ids or (),
@@ -1953,15 +1914,6 @@ class OffloadingConnectorScheduler:
             store_jobs=partial_store_jobs | normal_store_jobs,
             jobs_to_flush=self._current_batch_jobs_to_flush,
         )
-        if self.enable_nan_fault_tolerance:
-            unvalidated_jobs = []
-            for job_id, job in meta.store_jobs.items():
-                if job.req_id in scheduler_output.num_scheduled_tokens:
-                    unvalidated_jobs.append(job_id)
-                else:
-                    # No new forward: these are previously validated snapshots.
-                    self._jobs[job_id].validated = True
-            meta.unvalidated_store_jobs = tuple(unvalidated_jobs)
 
         # All prepare_store calls for finished requests have been issued.
         # Signal on_request_finished and clean up state where possible.
@@ -1984,69 +1936,7 @@ class OffloadingConnectorScheduler:
         While True, build_connector_meta() and update_connector_output()
         continue to be called even when no requests are scheduled.
         """
-        return (
-            self._nan_reset_pending
-            or bool(self._jobs)
-            or self.manager.has_pending_work()
-        )
-
-    def validate_kv_cache(
-        self, metadata: OffloadingConnectorMetadata, valid_req_ids: set[str]
-    ) -> None:
-        job_ids = (
-            tuple(self._jobs)
-            if self._nan_reset_pending
-            else metadata.unvalidated_store_jobs
-        )
-        for job_id in job_ids:
-            job = self._jobs.get(job_id)
-            if job is None:
-                # A cache reset can discard jobs before their output arrives.
-                continue
-            if job.validated is None:
-                job.validated = job.req_id in valid_req_ids
-            self._complete_transfer(job_id)
-        self._maybe_finish_nan_reset()
-
-    def _maybe_finish_nan_reset(self) -> None:
-        if not self._nan_reset_pending or self._jobs:
-            return
-        # All GPU/CPU copies have acknowledged completion. reset_cache also
-        # drains secondary I/O before freeing CPU slots, preventing late writes
-        # from corrupting the replacement cache (including disk promotions).
-        self.reset_cache()
-        self._storage_generation = uuid.uuid4().bytes
-        for status in self._req_status.values():
-            status.storage_generation = self._storage_generation
-            for group in status.group_states:
-                group.offload_keys.clear()
-            status.load_key_ranges.clear()
-        self._nan_reset_pending = False
-
-    def _complete_transfer(self, job_id: int) -> None:
-        job = self._jobs[job_id]
-        if self._nan_reset_pending and job.is_store:
-            job.validated = False
-        if job.pending_count or (job.is_store and job.validated is None):
-            return
-        req_status = self._req_status[job.req_id]
-        if job.is_store:
-            if job.validated:
-                self.manager.complete_store(job.keys, req_status.req_context)
-            else:
-                self.manager.complete_store(
-                    job.keys, req_status.req_context, success=False
-                )
-                self._events_tracker.discard_store(job.keys)
-        else:
-            self.manager.complete_load(job.keys, req_status.req_context)
-            if self._chunks_being_loaded:
-                self._chunks_being_loaded.difference_update(job.keys)
-
-        del self._jobs[job_id]
-        req_status.transfer_jobs.remove(job_id)
-        if req_status.finished_signaled and not req_status.transfer_jobs:
-            del self._req_status[job.req_id]
+        return bool(self._jobs) or self.manager.has_pending_work()
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """Update KVConnector state from worker-side connectors output.
@@ -2105,18 +1995,28 @@ class OffloadingConnectorScheduler:
                 continue
             assert job_status.pending_count == 0
 
-            # The physical copy is done, so source blocks can be reused even
-            # if publication is still waiting for the logits check.
+            req_status = self._req_status[job_status.req_id]
+            if job_status.is_store:
+                self.manager.complete_store(job_status.keys, req_status.req_context)
+            else:
+                self.manager.complete_load(job_status.keys, req_status.req_context)
+                if self._chunks_being_loaded:
+                    self._chunks_being_loaded.difference_update(job_status.keys)
             if self._block_id_to_pending_jobs:
+                # Sliding window blocks are tracked from store creation
+                # and must be cleaned up unconditionally.
                 self._remove_pending_job(job_id, job_status.fenced_block_ids)
-                if self._req_status[job_status.req_id].req.is_finished():
+                # Non-sliding-window blocks are only tracked after
+                # request_finished, so only clean up for finished requests.
+                if req_status.req.is_finished():
                     self._remove_pending_job(
                         job_id, job_status.deferred_fence_block_ids
                     )
-            job_status.fenced_block_ids = None
-            job_status.deferred_fence_block_ids = None
-            self._complete_transfer(job_id)
-        self._maybe_finish_nan_reset()
+
+            del self._jobs[job_id]
+            req_status.transfer_jobs.remove(job_id)
+            if req_status.finished_signaled and not req_status.transfer_jobs:
+                del self._req_status[job_status.req_id]
 
     def get_stats(self) -> OffloadingConnectorStats | None:
         stats: OffloadingConnectorStats | None = None
@@ -2147,11 +2047,6 @@ class OffloadingConnectorScheduler:
             returned by the engine.
 
         """
-        if self.enable_nan_fault_tolerance and request.num_nans_in_logits:
-            # Stop cache reads and new stores immediately; recover after all
-            # previously scheduled GPU/CPU transfers have acknowledged.
-            self._nan_reset_pending = True
-
         req_status = self._req_status.get(request.request_id)
 
         if req_status is None:
@@ -2163,16 +2058,6 @@ class OffloadingConnectorScheduler:
             return False, None
 
         self._maybe_observe_lookup_async_delay(req_status)
-
-        if self.enable_nan_fault_tolerance and request.status in (
-            RequestStatus.FINISHED_ERROR,
-            RequestStatus.FINISHED_ABORTED,
-        ):
-            for job_id in list(req_status.transfer_jobs):
-                job = self._jobs[job_id]
-                if job.is_store:
-                    job.validated = False
-                    self._complete_transfer(job_id)
 
         # Update offload keys with final block hash so _build_store_jobs can
         # create store jobs for the last block(s) on the next schedule step.

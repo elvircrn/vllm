@@ -70,8 +70,6 @@ class OffloadingConnectorMetadata(KVConnectorMetadata):
     load_jobs: dict[int, TransferJob]
     store_jobs: dict[int, TransferJob]
     jobs_to_flush: set[int] | None = None
-    # Separate from store_jobs, which workers may mutate when flushing stores.
-    unvalidated_store_jobs: tuple[int, ...] = ()
 
 
 @dataclass

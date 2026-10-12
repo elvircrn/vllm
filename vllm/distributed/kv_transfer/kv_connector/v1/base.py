@@ -613,16 +613,6 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
-    def validate_kv_cache(
-        self, metadata: KVConnectorMetadata, valid_req_ids: set[str]
-    ) -> None:
-        """Validate this step's stores after checking its model output.
-
-        Called with NaN fault tolerance enabled. Only requests whose output
-        was successfully checked are included in ``valid_req_ids``.
-        """
-        return
-
     def request_finished(
         self,
         request: "Request",

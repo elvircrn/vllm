@@ -3132,26 +3132,6 @@ def test_cache_blocks(hash_fn):
     assert blocks[0].block_hash is not None
 
 
-def test_evict_request_hashes_removes_detached_copies_and_allows_recomputation():
-    pool = BlockPool(num_gpu_blocks=8, enable_caching=True, hash_block_size=4)
-    request = make_request("failed", list(range(8)), 4, sha256)
-    first = pool.get_new_blocks(2)
-    duplicate = pool.get_new_blocks(2)
-    for blocks in (first, duplicate):
-        pool.cache_full_blocks(request, blocks, 0, 2, 4, 0)
-    pool.free_blocks(first)
-    # Both idle cached copies and active copies must disappear from lookup.
-    pool.evict_block_hashes(request.block_hashes, [0])
-    assert all(pool.get_cached_block(h, [0]) is None for h in request.block_hashes)
-    assert all(block.block_hash is None for block in first + duplicate)
-    assert all(block.ref_cnt == 1 for block in duplicate)
-
-    # New computation of the same prefix can populate the cache again.
-    fresh = pool.get_new_blocks(2)
-    pool.cache_full_blocks(request, fresh, 0, 2, 4, 0)
-    assert all(pool.get_cached_block(h, [0]) for h in request.block_hashes)
-
-
 def test_cache_blocks_multi_group():
     """This tests that blocks are cached correctly for different kv cache groups."""
     block_size = 4

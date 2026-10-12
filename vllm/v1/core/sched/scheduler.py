@@ -2053,7 +2053,6 @@ class Scheduler(SchedulerInterface):
             num_nans,
         )
         nan_abort_req_ids.add(request.request_id)
-        self.kv_cache_manager.evict_request(request)
         for group in self.kv_cache_manager.get_block_ids(request.request_id):
             nan_block_ids_to_evict.update(group)
         return True
@@ -2111,7 +2110,6 @@ class Scheduler(SchedulerInterface):
         stopped_preempted_reqs: set[Request] = set()
         nan_abort_req_ids: set[str] = set()
         nan_block_ids_to_evict: set[int] = set()
-        valid_kv_req_ids: set[str] = set()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
@@ -2213,14 +2211,6 @@ class Scheduler(SchedulerInterface):
                 )
             ):
                 continue
-
-            if (
-                self.enable_nan_fault_tolerance
-                and not output_is_stale
-                and num_nans_in_logits is not None
-                and num_nans_in_logits.get(req_id) == 0
-            ):
-                valid_kv_req_ids.add(req_id)
 
             # Check for stop and update request status.
             if new_token_ids:
@@ -2401,15 +2391,6 @@ class Scheduler(SchedulerInterface):
                         num_nans_in_logits=request.num_nans_in_logits,
                     )
                 )
-
-        if (
-            self.enable_nan_fault_tolerance
-            and self.connector is not None
-            and scheduler_output.kv_connector_metadata is not None
-        ):
-            self.connector.validate_kv_cache(
-                scheduler_output.kv_connector_metadata, valid_kv_req_ids
-            )
 
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:

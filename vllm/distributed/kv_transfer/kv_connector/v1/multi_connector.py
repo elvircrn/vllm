@@ -493,13 +493,6 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
             self._extra_async_saves = {}
         return metadata
 
-    def validate_kv_cache(
-        self, metadata: KVConnectorMetadata, valid_req_ids: set[str]
-    ) -> None:
-        assert isinstance(metadata, MultiKVConnectorMetadata)
-        for connector, child_metadata in zip(self._connectors, metadata.metadata):
-            connector.validate_kv_cache(child_metadata, valid_req_ids)
-
     def update_connector_output(self, connector_output: KVConnectorOutput):
         multi_connector_worker_meta: MultiKVConnectorWorkerMetadata | None = None
         if connector_output.kv_connector_worker_meta is not None:
