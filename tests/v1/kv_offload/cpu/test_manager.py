@@ -238,43 +238,6 @@ def test_filter_reused_manager_reports_stores_skipped_counter():
     assert stats.reduce()[CPUOffloadingMetrics.STORES_SKIPPED] == 0
 
 
-@pytest.mark.parametrize("cache_policy", ["lru", "arc"])
-@pytest.mark.parametrize("in_flight", ["none", "load", "store"])
-def test_invalidation_hides_entries_until_transfers_release_their_slots(
-    cache_policy, in_flight
-):
-    manager = make_cpu_manager(num_chunks=3, cache_policy=cache_policy)
-    context = make_req_context("failed")
-    keys = to_keys([1, 2])
-    manager.prepare_store(keys, context)
-    manager.complete_store(keys[1:], context)
-    if in_flight != "store":
-        manager.complete_store(keys[:1], context)
-    if in_flight == "load":
-        manager.prepare_load(keys[:1], context)
-        manager.prepare_load(keys[:1], context)
-
-    manager.invalidate(keys[:1])
-    assert manager.lookup(keys[0], context) is LookupResult.MISS
-    assert manager.lookup(keys[1], context) is LookupResult.HIT
-    assert manager._get_num_free_chunks() == (2 if in_flight == "none" else 1)
-    if in_flight == "load":
-        manager.complete_load(keys[:1], context)
-        assert manager._get_num_free_chunks() == 1
-        manager.complete_load(keys[:1], context)
-    elif in_flight == "store":
-        manager.complete_store(keys[:1], context)
-    assert manager.lookup(keys[0], context) is LookupResult.MISS
-    assert manager._get_num_free_chunks() == 2
-
-    # A recomputation uses a new storage generation, which caches normally.
-    fresh = to_keys([3, 4])
-    result = manager.prepare_store(fresh, context)
-    assert result is not None and result.keys_to_store == fresh
-    manager.complete_store(fresh, context)
-    assert all(manager.lookup(k, context) is LookupResult.HIT for k in fresh)
-
-
 def test_cpu_manager_reports_cache_usage_gauge():
     def check_usage_stats(manager: CPUOffloadingManager, value: float):
         stats = manager.get_stats()

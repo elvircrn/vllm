@@ -77,7 +77,6 @@ class CPUOffloadingManager(OffloadingManager):
         self._num_evictable_cache_chunks: int = 0
         # Track chunks with an in-flight store (ref_cnt -1, not yet completed).
         self._num_write_pending_chunks: int = 0
-        self._invalidated_keys: set[OffloadKey] = set()
 
         self.store_threshold: int = store_threshold
         self.max_tracker_size: int = max_tracker_size
@@ -188,8 +187,6 @@ class CPUOffloadingManager(OffloadingManager):
 
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
-        if key in self._invalidated_keys:
-            return LookupResult.MISS
         chunk = self._policy.get(key)
         if chunk is None:
             return LookupResult.MISS
@@ -220,7 +217,6 @@ class CPUOffloadingManager(OffloadingManager):
     ) -> LoadStoreSpec:
         chunks = []
         for key in keys:
-            assert key not in self._invalidated_keys
             chunk = self._policy.get(key)
             assert chunk is not None, f"Chunk {key!r} not found in cache"
             assert chunk.is_ready, f"Chunk {key!r} is not ready for reading"
@@ -248,10 +244,6 @@ class CPUOffloadingManager(OffloadingManager):
             assert chunk.ref_cnt > 0, f"Chunk {key!r} ref_cnt is already 0"
             chunk.ref_cnt -= 1
             if chunk.ref_cnt == 0:
-                if key in self._invalidated_keys:
-                    self._policy.remove(key)
-                    self._free_chunk(chunk)
-                    continue
                 self._num_evictable_cache_chunks += 1  # ref_cnt 1 -> 0
                 self._policy.mark_evictable(key)
 
@@ -261,7 +253,7 @@ class CPUOffloadingManager(OffloadingManager):
         keys: Collection[OffloadKey],
         req_context: ReqContext,
     ) -> PrepareStoreOutput | None:
-        keys = [key for key in keys if key not in self._invalidated_keys]
+        keys = list(keys)
         if self.counts is not None:
             self._record_accesses(keys)
         # Partition the original offer before admission filtering. Ready
@@ -378,16 +370,20 @@ class CPUOffloadingManager(OffloadingManager):
     ) -> None:
         stored_keys: list[OffloadKey] = []
 
-        for key in keys:
-            chunk = self._policy.get(key)
-            if chunk is not None and not chunk.is_ready:
-                self._num_write_pending_chunks -= 1
-                if success and key not in self._invalidated_keys:
+        if success:
+            for key in keys:
+                chunk = self._policy.get(key)
+                if chunk is not None and not chunk.is_ready:
                     chunk.ref_cnt = 0
+                    self._num_write_pending_chunks -= 1
                     self._num_evictable_cache_chunks += 1
                     self._policy.mark_evictable(key)
                     stored_keys.append(key)
-                else:
+        else:
+            for key in keys:
+                chunk = self._policy.get(key)
+                if chunk is not None and not chunk.is_ready:
+                    self._num_write_pending_chunks -= 1
                     self._policy.remove(key)
                     self._free_chunk(chunk)
 
@@ -428,27 +424,6 @@ class CPUOffloadingManager(OffloadingManager):
             state.reused_keys,
             req_context,
         )
-
-    @override
-    def invalidate(self, keys: Collection[OffloadKey]) -> None:
-        removed = []
-        for key in keys:
-            if key in self._invalidated_keys:
-                continue
-            self._invalidated_keys.add(key)
-            chunk = self._policy.get(key)
-            if chunk is None:
-                continue
-            if chunk.is_ready:
-                removed.append(key)
-            if chunk.ref_cnt == 0:
-                self._num_evictable_cache_chunks -= 1
-                self._policy.remove(key)
-                self._free_chunk(chunk)
-        if removed and self.events is not None:
-            self.events.append(
-                OffloadingEvent(keys=removed, medium=self.medium, removed=True)
-            )
 
     @override
     def reset_cache(self) -> None:

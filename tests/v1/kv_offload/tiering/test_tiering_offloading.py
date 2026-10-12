@@ -319,38 +319,6 @@ class TestTieringOffloadingManager:
         if req_context.req_id not in self.manager._req_state:
             self.manager.on_new_request(req_context)
 
-    def test_invalidation_retires_old_secondary_keys_but_allows_new_generation(
-        self, manager_setup
-    ):
-        self._start_request()
-        old_keys = to_keys([1, 2])
-        self.manager.prepare_store(old_keys, _CTX)
-        self.manager.complete_store(old_keys, _CTX)
-        # Cascade acknowledgements are still outstanding when invalidated.
-        self.manager.invalidate(old_keys)
-        self._simulate_on_schedule_end()
-        assert all(
-            self.manager.lookup(key, _CTX) is LookupResult.MISS for key in old_keys
-        )
-        assert all(key in self.secondary_tier1.chunks for key in old_keys)
-        assert self.primary_tier._get_num_free_chunks() == 5
-
-        fresh_keys = to_keys([3, 4])
-        self.manager.prepare_store(fresh_keys, _CTX)
-        self.manager.complete_store(fresh_keys, _CTX)
-        self._simulate_on_schedule_end()
-        assert all(
-            self.manager.lookup(key, _CTX) is LookupResult.HIT for key in fresh_keys
-        )
-
-        # Evict CPU residency: fresh disk keys can promote, old ones cannot.
-        self.manager.reset_cache()
-        assert self.manager.lookup(old_keys[0], _CTX) is LookupResult.MISS
-        assert self.manager.lookup(fresh_keys[0], _CTX) is LookupResult.HIT_PENDING
-        self._simulate_on_schedule_end()
-        self._simulate_on_schedule_end()
-        assert self.manager.lookup(fresh_keys[0], _CTX) is LookupResult.HIT
-
     def test_failed_promotion_finalizes_primary_with_failure(self, manager_setup):
         """A failed promotion still finalizes the primary slots with
         success=False; the tier corrects its own verdict."""

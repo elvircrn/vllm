@@ -365,8 +365,7 @@ class RequestOffloadState:
     req: Request
     req_context: ReqContext
     offloading_context: RequestOffloadingContext
-    key_hash_overrides: dict[bytes, bytes] = field(default_factory=dict)
-    key_generation: int = 0
+    storage_generation: bytes = b""
     group_states: tuple[RequestGroupState, ...] = field(init=False)
     # upper bound on tokens to load for this request; None means no cap
     max_load_tokens: int | None = None
@@ -436,7 +435,13 @@ class RequestOffloadState:
                 group_config.hashes_per_chunk,
             ):
                 key = make_offload_key(
-                    self.key_hash_overrides.get(req_block_hash, req_block_hash),
+                    (
+                        hashlib.sha256(
+                            self.storage_generation + req_block_hash
+                        ).digest()
+                        if self.storage_generation
+                        else req_block_hash
+                    ),
                     group_config.group_idx,
                 )
                 group_state.offload_keys.append(key)
@@ -582,9 +587,9 @@ class OffloadingConnectorScheduler:
             spec, vllm_config, kv_cache_config
         )
         self.manager: OffloadingManager = spec.get_manager()
-        # Retire old storage generations locally; clean retries can cache again.
-        self._key_hash_overrides: dict[bytes, bytes] = {}
-        self._key_generation = 0
+        # Rotate once per NaN recovery so retained secondary copies cannot hit.
+        self._storage_generation = b""
+        self._nan_reset_pending = False
         fault_tolerance_config = vllm_config.parallel_config.fault_tolerance_config
         self.enable_nan_fault_tolerance = (
             fault_tolerance_config.enable_nan_fault_tolerance
@@ -977,7 +982,12 @@ class OffloadingConnectorScheduler:
         hash_idx = boundary_tokens // self.config.tokens_per_hash - 1
         block_hash = request.block_hashes[hash_idx]
         key = make_offload_key(
-            self._key_hash_overrides.get(block_hash, block_hash), group_idx
+            (
+                hashlib.sha256(self._storage_generation + block_hash).digest()
+                if self._storage_generation
+                else block_hash
+            ),
+            group_idx,
         )
         req_context.set_offload_key_position(key, boundary_tokens)
         return key
@@ -1052,8 +1062,7 @@ class OffloadingConnectorScheduler:
             req=request,
             req_context=req_context,
             offloading_context=offloading_context,
-            key_hash_overrides=self._key_hash_overrides,
-            key_generation=self._key_generation,
+            storage_generation=self._storage_generation,
         )
         self._req_status[request.request_id] = req_status
 
@@ -1095,11 +1104,9 @@ class OffloadingConnectorScheduler:
             )
             return None, False
 
-        # A preempted/waiting request may have observed a retired generation.
-        if req_status.key_generation != self._key_generation:
-            for group_state in req_status.group_states:
-                group_state.offload_keys.clear()
-            req_status.key_generation = self._key_generation
+        if self._nan_reset_pending:
+            return None, False
+
         req_status.update_offload_keys()
         req_status.num_locally_computed_tokens = num_computed_tokens
 
@@ -1886,6 +1893,8 @@ class OffloadingConnectorScheduler:
     def _can_store_request(
         self, req_id: str, scheduler_output: SchedulerOutput
     ) -> bool:
+        if self._nan_reset_pending:
+            return False
         req_status = self._req_status.get(req_id)
         if req_status is None:
             return False
@@ -1906,6 +1915,8 @@ class OffloadingConnectorScheduler:
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         self._update_req_states(scheduler_output)
+        if self._nan_reset_pending:
+            self._current_batch_jobs_to_flush.update(self._jobs)
         schedule_end_context = ScheduleEndContext(
             new_req_ids=[req.req_id for req in scheduler_output.scheduled_new_reqs],
             preempted_req_ids=scheduler_output.preempted_req_ids or (),
@@ -1973,12 +1984,21 @@ class OffloadingConnectorScheduler:
         While True, build_connector_meta() and update_connector_output()
         continue to be called even when no requests are scheduled.
         """
-        return bool(self._jobs) or self.manager.has_pending_work()
+        return (
+            self._nan_reset_pending
+            or bool(self._jobs)
+            or self.manager.has_pending_work()
+        )
 
     def validate_kv_cache(
         self, metadata: OffloadingConnectorMetadata, valid_req_ids: set[str]
     ) -> None:
-        for job_id in metadata.unvalidated_store_jobs:
+        job_ids = (
+            tuple(self._jobs)
+            if self._nan_reset_pending
+            else metadata.unvalidated_store_jobs
+        )
+        for job_id in job_ids:
             job = self._jobs.get(job_id)
             if job is None:
                 # A cache reset can discard jobs before their output arrives.
@@ -1986,9 +2006,27 @@ class OffloadingConnectorScheduler:
             if job.validated is None:
                 job.validated = job.req_id in valid_req_ids
             self._complete_transfer(job_id)
+        self._maybe_finish_nan_reset()
+
+    def _maybe_finish_nan_reset(self) -> None:
+        if not self._nan_reset_pending or self._jobs:
+            return
+        # All GPU/CPU copies have acknowledged completion. reset_cache also
+        # drains secondary I/O before freeing CPU slots, preventing late writes
+        # from corrupting the replacement cache (including disk promotions).
+        self.reset_cache()
+        self._storage_generation = uuid.uuid4().bytes
+        for status in self._req_status.values():
+            status.storage_generation = self._storage_generation
+            for group in status.group_states:
+                group.offload_keys.clear()
+            status.load_key_ranges.clear()
+        self._nan_reset_pending = False
 
     def _complete_transfer(self, job_id: int) -> None:
         job = self._jobs[job_id]
+        if self._nan_reset_pending and job.is_store:
+            job.validated = False
         if job.pending_count or (job.is_store and job.validated is None):
             return
         req_status = self._req_status[job.req_id]
@@ -2078,6 +2116,7 @@ class OffloadingConnectorScheduler:
             job_status.fenced_block_ids = None
             job_status.deferred_fence_block_ids = None
             self._complete_transfer(job_id)
+        self._maybe_finish_nan_reset()
 
     def get_stats(self) -> OffloadingConnectorStats | None:
         stats: OffloadingConnectorStats | None = None
@@ -2108,6 +2147,11 @@ class OffloadingConnectorScheduler:
             returned by the engine.
 
         """
+        if self.enable_nan_fault_tolerance and request.num_nans_in_logits:
+            # Stop cache reads and new stores immediately; recover after all
+            # previously scheduled GPU/CPU transfers have acknowledged.
+            self._nan_reset_pending = True
+
         req_status = self._req_status.get(request.request_id)
 
         if req_status is None:
@@ -2119,17 +2163,6 @@ class OffloadingConnectorScheduler:
             return False, None
 
         self._maybe_observe_lookup_async_delay(req_status)
-
-        if self.enable_nan_fault_tolerance and request.num_nans_in_logits:
-            # Rotate every prefix, including previously validated and loaded KV.
-            # Existing jobs keep their old keys; only fresh requests use these.
-            salt = uuid.uuid4().bytes
-            self._key_generation += 1
-            for block_hash in request.block_hashes:
-                self._key_hash_overrides[block_hash] = hashlib.sha256(
-                    salt + block_hash
-                ).digest()
-            self.manager.invalidate(tuple(req_status.req_context.get_offload_keys()))
 
         if self.enable_nan_fault_tolerance and request.status in (
             RequestStatus.FINISHED_ERROR,

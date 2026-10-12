@@ -244,6 +244,20 @@ def _make_partial_tail_request(
     return request
 
 
+def _new_nan_offloading_request(scheduler, req_id, prompt_tokens=32, token_offset=0):
+    init_none_hash(sha256)
+    request = Request(
+        request_id=req_id,
+        prompt_token_ids=list(range(token_offset, token_offset + prompt_tokens)),
+        sampling_params=SamplingParams(max_tokens=8),
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(16, sha256),
+    )
+    request.status = RequestStatus.RUNNING
+    scheduler.on_new_request(request)
+    return request
+
+
 def _make_nan_offloading_case(
     *, enabled=True, worker_count=1, prompt_tokens=32, manager=None
 ):
@@ -263,16 +277,7 @@ def _make_nan_offloading_case(
         num_chunks=prompt_tokens // 16, enable_events=True
     )
     scheduler = OffloadingConnectorScheduler(spec, config, kv_config)
-    init_none_hash(sha256)
-    request = Request(
-        request_id="nan-test",
-        prompt_token_ids=list(range(prompt_tokens)),
-        sampling_params=SamplingParams(max_tokens=8),
-        pooling_params=None,
-        block_hasher=get_request_block_hasher(16, sha256),
-    )
-    request.status = RequestStatus.RUNNING
-    scheduler.on_new_request(request)
+    request = _new_nan_offloading_request(scheduler, "nan-test", prompt_tokens)
     output = SchedulerOutput.make_empty()
     output.num_scheduled_tokens = {request.request_id: 32}
     output.total_num_scheduled_tokens = 32
@@ -300,12 +305,7 @@ def test_nan_offload_requires_validation_and_all_copy_completions(
 
     def complete_copy():
         for _ in range(worker_count):
-            expected = (
-                LookupResult.MISS
-                if request.num_nans_in_logits
-                else LookupResult.HIT_PENDING
-            )
-            assert lookups() == [expected] * 2
+            assert lookups() == [LookupResult.HIT_PENDING] * 2
             scheduler.update_connector_output(
                 KVConnectorOutput(
                     kv_connector_worker_meta=OffloadingWorkerMetadata(
@@ -392,16 +392,7 @@ def test_nan_offload_validates_each_async_batch_separately():
     scheduler, request, first = _make_nan_offloading_case(prompt_tokens=64)
 
     def new_request(req_id):
-        retry = Request(
-            request_id=req_id,
-            prompt_token_ids=list(range(64)),
-            sampling_params=SamplingParams(max_tokens=8),
-            pooling_params=None,
-            block_hasher=get_request_block_hasher(16, sha256),
-        )
-        retry.status = RequestStatus.RUNNING
-        scheduler.on_new_request(retry)
-        return retry
+        return _new_nan_offloading_request(scheduler, req_id, prompt_tokens=64)
 
     output = SchedulerOutput.make_empty()
     output.num_scheduled_tokens = {request.request_id: 32}
@@ -442,8 +433,12 @@ def test_nan_offload_validates_each_async_batch_separately():
     # The same prompt misses once, then its clean recomputation is reusable.
     assert scheduler.get_num_new_matched_tokens(retry, 0) == (0, False)
     retry_state = scheduler._req_status[retry.request_id]
-    fresh_keys = retry_state.group_states[0].offload_keys
+    fresh_keys = tuple(retry_state.group_states[0].offload_keys)
     assert set(fresh_keys).isdisjoint(keys)
+    assert (
+        scheduler._make_boundary_key(retry, 0, 16, retry_state.req_context)
+        == fresh_keys[0]
+    )
     output = SchedulerOutput.make_empty()
     output.num_scheduled_tokens = {retry.request_id: 64}
     output.total_num_scheduled_tokens = 64
@@ -476,11 +471,116 @@ def test_nan_offload_validates_each_async_batch_separately():
     reader.num_nans_in_logits = 1
     reader.status = RequestStatus.FINISHED_ERROR
     scheduler.request_finished(reader)
+    scheduler.validate_kv_cache(
+        OffloadingConnectorMetadata(load_jobs={}, store_jobs={}), set()
+    )
     assert all(
         scheduler.manager.lookup(k, retry_state.req_context) is LookupResult.MISS
         for k in fresh_keys
     )
     assert scheduler.get_num_new_matched_tokens(new_request("again"), 0) == (0, False)
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("cache_policy", ["lru", "arc"])
+def test_nan_resets_entire_cache_after_all_reads_and_writes_finish(cache_policy):
+    """Block reuse during recovery, including unrelated entries and late copies."""
+    manager = CPUOffloadingManager(num_chunks=6, cache_policy=cache_policy)
+    scheduler, request, first = _make_nan_offloading_case(
+        manager=manager, worker_count=2
+    )
+
+    def ack(jobs, count):
+        scheduler.update_connector_output(
+            KVConnectorOutput(
+                kv_connector_worker_meta=OffloadingWorkerMetadata(
+                    completed_jobs={job_id: count for job_id in jobs}
+                )
+            )
+        )
+
+    unrelated_context = ReqContext(req_id="previously-finished")
+    unrelated_keys = [
+        make_offload_key(b"unrelated-1", 0),
+        make_offload_key(b"unrelated-2", 0),
+    ]
+    manager.on_new_request(unrelated_context)
+    manager.prepare_store(unrelated_keys, unrelated_context)
+    manager.complete_store(unrelated_keys, unrelated_context)
+    manager.on_request_finished(unrelated_context)
+    assert all(
+        manager.lookup(k, unrelated_context) is LookupResult.HIT for k in unrelated_keys
+    )
+
+    scheduler.validate_kv_cache(first, {request.request_id})
+    ack(first.store_jobs, 2)
+    reader = _new_nan_offloading_request(scheduler, "reader")
+    assert scheduler.get_num_new_matched_tokens(reader, 0) == (32, True)
+    scheduler.update_state_after_alloc(
+        reader, KVCacheBlocks(([KVCacheBlock(3), KVCacheBlock(4)],)), 32
+    )
+    writer = _new_nan_offloading_request(scheduler, "unrelated", token_offset=100)
+    output = SchedulerOutput.make_empty()
+    output.num_scheduled_tokens = {writer.request_id: 32}
+    output.total_num_scheduled_tokens = 32
+    output.scheduled_new_reqs = [NewRequestData.from_request(writer, ([5, 6],))]
+    pending = scheduler.build_connector_meta(output)
+    assert pending.load_jobs and pending.store_jobs
+    scheduler.validate_kv_cache(pending, {writer.request_id})
+    old_keys = tuple(
+        scheduler._req_status[writer.request_id].group_states[0].offload_keys
+    )
+
+    # Two NaN aborts in one output coalesce into one reset.
+    for failed in (request, reader):
+        failed.num_nans_in_logits = 1
+        failed.status = RequestStatus.FINISHED_ERROR
+        scheduler.request_finished(failed)
+    scheduler.validate_kv_cache(first, set())
+    retry = _new_nan_offloading_request(scheduler, "retry")
+    assert scheduler.get_num_new_matched_tokens(retry, 0) == (None, False)
+    assert manager._get_num_free_chunks() == 0
+    assert scheduler.has_pending_push_work()
+    flush = scheduler.build_connector_meta(SchedulerOutput.make_empty())
+    assert flush.jobs_to_flush == pending.load_jobs.keys() | pending.store_jobs.keys()
+    assert not flush.store_jobs and not flush.load_jobs
+
+    # Even validated stores are discarded; pending loads keep their slots pinned.
+    ack(pending.store_jobs, 1)
+    assert manager._get_num_free_chunks() == 0
+    ack(pending.store_jobs, 1)
+    ack(pending.load_jobs, 1)
+    assert scheduler.get_num_new_matched_tokens(retry, 0) == (None, False)
+    assert manager._get_num_free_chunks() == 2
+    ack(pending.load_jobs, 1)
+    assert manager._get_num_free_chunks() == 6
+    assert scheduler.get_num_new_matched_tokens(retry, 0) == (0, False)
+    assert all(
+        manager.lookup(k, ReqContext(req_id="check")) is LookupResult.MISS
+        for k in (*old_keys, *unrelated_keys)
+    )
+
+    # Already queued output cannot republish anything after the reset.
+    scheduler.validate_kv_cache(pending, {writer.request_id})
+    ack(pending.load_jobs | pending.store_jobs, 2)
+    assert manager._get_num_free_chunks() == 6
+    assert not scheduler.has_pending_push_work()
+
+    # An already active, unaffected writer also resumes in the new namespace.
+    output = SchedulerOutput.make_empty()
+    output.num_scheduled_tokens = {writer.request_id: 32}
+    output.total_num_scheduled_tokens = 32
+    output.scheduled_cached_reqs.req_ids = [writer.request_id]
+    output.scheduled_cached_reqs.new_block_ids = [None]
+    resumed = scheduler.build_connector_meta(output)
+    assert resumed.store_jobs
+    fresh_keys = scheduler._req_status[writer.request_id].group_states[0].offload_keys
+    assert set(fresh_keys).isdisjoint(old_keys)
+    scheduler.validate_kv_cache(resumed, {writer.request_id})
+    ack(resumed.store_jobs, 2)
+    assert all(
+        manager.lookup(k, unrelated_context) is LookupResult.HIT for k in fresh_keys
+    )
 
 
 @pytest.mark.skip_global_cleanup
