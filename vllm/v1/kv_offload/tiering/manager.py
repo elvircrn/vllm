@@ -203,6 +203,7 @@ class TieringOffloadingManager(OffloadingManager):
         """
         self.primary_tier: CPUPrimaryTierOffloadingManager = primary_tier
         self.secondary_tiers = secondary_tiers or []
+        self._invalidated_keys: set[OffloadKey] = set()
 
         self._job_id_counter: int = 0
         # Job tracking: maps job_id to metadata for all in-flight transfers.
@@ -427,6 +428,8 @@ class TieringOffloadingManager(OffloadingManager):
         # so chunks freed by cascade or promotion completions are evictable
         # in time for a promotion this lookup may initiate.
         self._maybe_process_finished_jobs()
+        if key in self._invalidated_keys:
+            return LookupResult.MISS
 
         start_time = time.monotonic()
         primary_hit = self.primary_tier.lookup(key, req_context)
@@ -652,6 +655,7 @@ class TieringOffloadingManager(OffloadingManager):
         # Cascading of these newly-stored chunks to ALL secondary tiers
         # happens later in complete_store(), after the GPU→Primary transfer
         # completes.
+        keys = [key for key in keys if key not in self._invalidated_keys]
         primary_result = self.primary_tier.prepare_store(keys, req_context)
 
         if primary_result is None:
@@ -760,7 +764,8 @@ class TieringOffloadingManager(OffloadingManager):
         # Step 1: Complete store in primary tier (makes chunks loadable)
         self.primary_tier.complete_store(keys, req_context, success)
 
-        if success:
+        keys = [key for key in keys if key not in self._invalidated_keys]
+        if success and keys:
             # Step 2: Cascade to ALL secondary tiers
             # For each secondary tier, call primary.prepare_read() to get the
             # LoadStoreSpec AND to increment ref_cnt (protecting chunks from
@@ -930,6 +935,13 @@ class TieringOffloadingManager(OffloadingManager):
         yield from self.primary_tier.take_events()
         for tier in self.secondary_tiers:
             yield from tier.take_events()
+
+    @override
+    def invalidate(self, keys: Collection[OffloadKey]) -> None:
+        # Secondary storage may be shared. Retire this engine's old keys;
+        # the connector assigns new keys to recomputed prefixes.
+        self._invalidated_keys.update(keys)
+        self.primary_tier.invalidate(keys)
 
     @override
     def reset_cache(self) -> None:

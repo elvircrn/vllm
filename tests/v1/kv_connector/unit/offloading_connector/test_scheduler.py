@@ -300,7 +300,12 @@ def test_nan_offload_requires_validation_and_all_copy_completions(
 
     def complete_copy():
         for _ in range(worker_count):
-            assert lookups() == [LookupResult.HIT_PENDING] * 2
+            expected = (
+                LookupResult.MISS
+                if request.num_nans_in_logits
+                else LookupResult.HIT_PENDING
+            )
+            assert lookups() == [expected] * 2
             scheduler.update_connector_output(
                 KVConnectorOutput(
                     kv_connector_worker_meta=OffloadingWorkerMetadata(
@@ -336,9 +341,7 @@ def test_nan_offload_requires_validation_and_all_copy_completions(
     assert bool(events) == (result == "clean")
     if result != "clean":
         assert scheduler._events_tracker._pending_event_metadata == {}
-        # Failed stores released their reservations, so a retry can fill the pool.
-        retry = scheduler.manager.prepare_store(keys, state.req_context)
-        assert retry is not None and set(retry.keys_to_store) == set(keys)
+        assert scheduler.manager._get_num_free_chunks() == 2
 
 
 @pytest.mark.skip_global_cleanup
@@ -387,6 +390,19 @@ def test_nan_offload_does_not_create_finish_time_stores():
 @pytest.mark.skip_global_cleanup
 def test_nan_offload_validates_each_async_batch_separately():
     scheduler, request, first = _make_nan_offloading_case(prompt_tokens=64)
+
+    def new_request(req_id):
+        retry = Request(
+            request_id=req_id,
+            prompt_token_ids=list(range(64)),
+            sampling_params=SamplingParams(max_tokens=8),
+            pooling_params=None,
+            block_hasher=get_request_block_hasher(16, sha256),
+        )
+        retry.status = RequestStatus.RUNNING
+        scheduler.on_new_request(retry)
+        return retry
+
     output = SchedulerOutput.make_empty()
     output.num_scheduled_tokens = {request.request_id: 32}
     output.total_num_scheduled_tokens = 32
@@ -412,15 +428,59 @@ def test_nan_offload_validates_each_async_batch_separately():
         LookupResult.HIT_PENDING,
         LookupResult.HIT_PENDING,
     ]
+    retry = new_request("retry")
+    assert scheduler.get_num_new_matched_tokens(retry, 0) == (None, False)
+    request.num_nans_in_logits = 1
     request.status = RequestStatus.FINISHED_ERROR
     scheduler.request_finished(request)
     scheduler.validate_kv_cache(second, set())
-    assert [scheduler.manager.lookup(k, state.req_context) for k in keys] == [
-        LookupResult.HIT,
-        LookupResult.HIT,
-        LookupResult.MISS,
-        LookupResult.MISS,
-    ]
+    assert all(
+        scheduler.manager.lookup(k, state.req_context) is LookupResult.MISS
+        for k in keys
+    )
+
+    # The same prompt misses once, then its clean recomputation is reusable.
+    assert scheduler.get_num_new_matched_tokens(retry, 0) == (0, False)
+    retry_state = scheduler._req_status[retry.request_id]
+    fresh_keys = retry_state.group_states[0].offload_keys
+    assert set(fresh_keys).isdisjoint(keys)
+    output = SchedulerOutput.make_empty()
+    output.num_scheduled_tokens = {retry.request_id: 64}
+    output.total_num_scheduled_tokens = 64
+    output.scheduled_new_reqs = [NewRequestData.from_request(retry, ([1, 2, 3, 4],))]
+    metadata = scheduler.build_connector_meta(output)
+    assert metadata.store_jobs
+    scheduler.validate_kv_cache(metadata, {retry.request_id})
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={job_id: 1 for job_id in metadata.store_jobs}
+            )
+        )
+    )
+    reader = new_request("reader")
+    assert scheduler.get_num_new_matched_tokens(reader, 0) == (64, True)
+    scheduler.update_state_after_alloc(
+        reader, KVCacheBlocks(([KVCacheBlock(i) for i in range(1, 5)],)), 64
+    )
+    loads = scheduler.build_connector_meta(SchedulerOutput.make_empty()).load_jobs
+    assert loads
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={job_id: 1 for job_id in loads}
+            )
+        )
+    )
+    # A consumer's NaN also invalidates entries created by another request.
+    reader.num_nans_in_logits = 1
+    reader.status = RequestStatus.FINISHED_ERROR
+    scheduler.request_finished(reader)
+    assert all(
+        scheduler.manager.lookup(k, retry_state.req_context) is LookupResult.MISS
+        for k in fresh_keys
+    )
+    assert scheduler.get_num_new_matched_tokens(new_request("again"), 0) == (0, False)
 
 
 @pytest.mark.skip_global_cleanup

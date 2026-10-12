@@ -218,6 +218,54 @@ def test_lookup_empty_tier(fs_tier):
     assert results == [LookupResult.MISS, LookupResult.MISS]
 
 
+def test_local_eviction_preserves_shared_files_and_reuses_fresh_disk_entries(fs_tier):
+    from vllm.v1.kv_offload.tiering.manager import (
+        CPUPrimaryTierOffloadingManager,
+        TieringOffloadingManager,
+    )
+
+    tier, tensor = fs_tier
+    region = MagicMock()
+    region.create_kv_memoryview.return_value = memoryview(tensor.numpy())
+    primary = CPUPrimaryTierOffloadingManager(_NUM_BLOCKS, region)
+    manager = TieringOffloadingManager(primary, [tier])
+    context = ReqContext(req_id="local-eviction")
+    manager.on_new_request(context)
+    schedule_end = ScheduleEndContext(new_req_ids=[], preempted_req_ids=())
+
+    def finish_transfers():
+        tier.drain_jobs()
+        manager.on_schedule_end(schedule_end)
+
+    old_key, fresh_key = key(100), key(101)
+    manager.prepare_store([old_key], context)
+    manager.complete_store([old_key], context)
+    finish_transfers()
+    manager.invalidate([old_key])
+    assert manager.lookup(old_key, context) is LookupResult.MISS
+    assert os.path.exists(tier.file_mapper.get_file_name(old_key))
+
+    # The connector supplies a new generation key after recomputation.
+    store = manager.prepare_store([fresh_key], context)
+    assert store is not None
+    tensor[store.store_spec.chunk_ids[0]].fill_(42)
+    manager.complete_store([fresh_key], context)
+    finish_transfers()
+    assert manager.lookup(fresh_key, context) is LookupResult.HIT
+
+    manager.reset_cache()
+    tensor.zero_()
+    assert manager.lookup(old_key, context) is LookupResult.MISS
+    assert lookup_and_wait(tier, [fresh_key], context) == [LookupResult.HIT]
+    assert manager.lookup(fresh_key, context) is LookupResult.HIT_PENDING
+    manager.on_schedule_end(schedule_end)
+    finish_transfers()
+    assert manager.lookup(fresh_key, context) is LookupResult.HIT
+    loaded = manager.prepare_load([fresh_key], context)
+    assert torch.all(tensor[loaded.chunk_ids[0]] == 42)
+    manager.complete_load([fresh_key], context)
+
+
 def test_store_creates_file_and_lookup_succeeds(fs_tier):
     tier, _ = fs_tier
     job = make_job(1, [key(1)], [0])

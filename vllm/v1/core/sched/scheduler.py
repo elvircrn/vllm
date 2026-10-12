@@ -2053,6 +2053,7 @@ class Scheduler(SchedulerInterface):
             num_nans,
         )
         nan_abort_req_ids.add(request.request_id)
+        self.kv_cache_manager.evict_request(request)
         for group in self.kv_cache_manager.get_block_ids(request.request_id):
             nan_block_ids_to_evict.update(group)
         return True

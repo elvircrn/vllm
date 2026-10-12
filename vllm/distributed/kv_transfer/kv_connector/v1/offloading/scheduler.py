@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import hashlib
 import time
+import uuid
 from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
@@ -363,6 +365,8 @@ class RequestOffloadState:
     req: Request
     req_context: ReqContext
     offloading_context: RequestOffloadingContext
+    key_hash_overrides: dict[bytes, bytes] = field(default_factory=dict)
+    key_generation: int = 0
     group_states: tuple[RequestGroupState, ...] = field(init=False)
     # upper bound on tokens to load for this request; None means no cap
     max_load_tokens: int | None = None
@@ -431,7 +435,10 @@ class RequestOffloadState:
                 None,
                 group_config.hashes_per_chunk,
             ):
-                key = make_offload_key(req_block_hash, group_config.group_idx)
+                key = make_offload_key(
+                    self.key_hash_overrides.get(req_block_hash, req_block_hash),
+                    group_config.group_idx,
+                )
                 group_state.offload_keys.append(key)
                 self.req_context.set_offload_key_position(
                     key,
@@ -575,6 +582,9 @@ class OffloadingConnectorScheduler:
             spec, vllm_config, kv_cache_config
         )
         self.manager: OffloadingManager = spec.get_manager()
+        # Retire old storage generations locally; clean retries can cache again.
+        self._key_hash_overrides: dict[bytes, bytes] = {}
+        self._key_generation = 0
         fault_tolerance_config = vllm_config.parallel_config.fault_tolerance_config
         self.enable_nan_fault_tolerance = (
             fault_tolerance_config.enable_nan_fault_tolerance
@@ -965,7 +975,10 @@ class OffloadingConnectorScheduler:
         req_context: ReqContext,
     ) -> OffloadKey:
         hash_idx = boundary_tokens // self.config.tokens_per_hash - 1
-        key = make_offload_key(request.block_hashes[hash_idx], group_idx)
+        block_hash = request.block_hashes[hash_idx]
+        key = make_offload_key(
+            self._key_hash_overrides.get(block_hash, block_hash), group_idx
+        )
         req_context.set_offload_key_position(key, boundary_tokens)
         return key
 
@@ -1039,6 +1052,8 @@ class OffloadingConnectorScheduler:
             req=request,
             req_context=req_context,
             offloading_context=offloading_context,
+            key_hash_overrides=self._key_hash_overrides,
+            key_generation=self._key_generation,
         )
         self._req_status[request.request_id] = req_status
 
@@ -1080,6 +1095,11 @@ class OffloadingConnectorScheduler:
             )
             return None, False
 
+        # A preempted/waiting request may have observed a retired generation.
+        if req_status.key_generation != self._key_generation:
+            for group_state in req_status.group_states:
+                group_state.offload_keys.clear()
+            req_status.key_generation = self._key_generation
         req_status.update_offload_keys()
         req_status.num_locally_computed_tokens = num_computed_tokens
 
@@ -2099,6 +2119,17 @@ class OffloadingConnectorScheduler:
             return False, None
 
         self._maybe_observe_lookup_async_delay(req_status)
+
+        if self.enable_nan_fault_tolerance and request.num_nans_in_logits:
+            # Rotate every prefix, including previously validated and loaded KV.
+            # Existing jobs keep their old keys; only fresh requests use these.
+            salt = uuid.uuid4().bytes
+            self._key_generation += 1
+            for block_hash in request.block_hashes:
+                self._key_hash_overrides[block_hash] = hashlib.sha256(
+                    salt + block_hash
+                ).digest()
+            self.manager.invalidate(tuple(req_status.req_context.get_offload_keys()))
 
         if self.enable_nan_fault_tolerance and request.status in (
             RequestStatus.FINISHED_ERROR,

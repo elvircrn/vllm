@@ -116,6 +116,9 @@ class ReqContext:
     def get_offload_key_position(self, key: OffloadKey) -> int | None:
         return self._offload_key_positions.get(key)
 
+    def get_offload_keys(self) -> Collection[OffloadKey]:
+        return self._offload_key_positions.keys()
+
 
 class LookupResult(Enum):
     """Result of OffloadingManager.lookup()."""
@@ -410,6 +413,14 @@ class OffloadingManager(ABC):
 
     def reset_cache(self) -> None:
         """Evict all tracked blocks and reset internal state."""
+        return
+
+    def invalidate(self, keys: Collection[OffloadKey]) -> None:
+        """Retire local entries without releasing memory used by active transfers.
+
+        The connector switches future requests to new keys independently.
+        Backends may override this hook to reclaim the retired entries early.
+        """
         return
 
     def get_stats(self) -> "OffloadingConnectorStats | None":
