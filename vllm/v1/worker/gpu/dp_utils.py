@@ -37,6 +37,9 @@ class DPSyncState:
     eager: bool
     # Largest real request count scheduled on any rank before graph padding.
     num_reqs: int
+    # Whether every rank's scheduler found that none of its requests can use this
+    # step's drafts, so all ranks skip drafting together.
+    skip_drafts: bool = False
 
 
 def sync_cudagraph_and_dp_padding(
@@ -53,6 +56,7 @@ def sync_cudagraph_and_dp_padding(
     allow_ubatching: bool = False,
     uniform_decode: bool = False,
     profiler_sync: DPProfilerSync | None = None,
+    allow_skip_drafts: bool = False,
 ) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
     """Coordinates the batch descriptor and DP padding across all ranks.
 
@@ -63,7 +67,7 @@ def sync_cudagraph_and_dp_padding(
     """
     assert dp_size > 1, "DP size must be greater than 1"
     tensor = torch.zeros(
-        8 if profiler_sync is not None else 6,
+        9 if profiler_sync is not None else 7,
         dp_size,
         dtype=torch.int32,
         device="cpu",
@@ -74,9 +78,10 @@ def sync_cudagraph_and_dp_padding(
     tensor[3][dp_rank] = max_query_len or -1  # (-1 means None)
     tensor[4][dp_rank] = int(allow_ubatching)
     tensor[5][dp_rank] = num_reqs
+    tensor[6][dp_rank] = int(allow_skip_drafts)
     if profiler_sync is not None:
-        tensor[6][dp_rank] = int(profiler_sync.pending_start)
-        tensor[7][dp_rank] = int(profiler_sync.pending_stop)
+        tensor[7][dp_rank] = int(profiler_sync.pending_start)
+        tensor[8][dp_rank] = int(profiler_sync.pending_stop)
     skip_coordination = should_skip_dp_coordination()
     if skip_coordination:
         tensor[:] = tensor[:, dp_rank, None].clone()
@@ -84,7 +89,7 @@ def sync_cudagraph_and_dp_padding(
         get_dp_group().cpu_all_reduce_(tensor)
 
     if profiler_sync is not None and not skip_coordination:
-        profiler_sync.observe(tensor[6].tolist(), tensor[7].tolist(), get_dp_group())
+        profiler_sync.observe(tensor[7].tolist(), tensor[8].tolist(), get_dp_group())
 
     num_tokens_across_dp = tensor[0]
     cg_mode_across_dp = tensor[1]
@@ -92,6 +97,8 @@ def sync_cudagraph_and_dp_padding(
     max_query_lens_across_dp = tensor[3]
     allow_ubatching_across_dp = tensor[4]
     num_reqs_across_dp = tensor[5]
+    allow_skip_drafts_across_dp = tensor[6]
+    skip_drafts = bool(torch.all(allow_skip_drafts_across_dp == 1))
 
     # If ranks disagree on the uniform token count, or its 0 (means None) set to None
     synced_uniform_token_count: int | None = int(uniform_token_counts_across_dp[0])
@@ -156,6 +163,7 @@ def sync_cudagraph_and_dp_padding(
                 uniform_token_count=synced_uniform_token_count,
                 eager=ubatch_desc.cg_mode == CUDAGraphMode.NONE,
                 num_reqs=int(num_reqs_across_dp.max()),
+                skip_drafts=skip_drafts,
             )
 
     synced_cg_mode = CUDAGraphMode(int(cg_mode_across_dp.min()))
@@ -174,6 +182,7 @@ def sync_cudagraph_and_dp_padding(
                 uniform_token_count=synced_uniform_token_count,
                 eager=True,
                 num_reqs=int(num_reqs_across_dp.max()),
+                skip_drafts=skip_drafts,
             ),
         )
 
@@ -208,6 +217,7 @@ def sync_cudagraph_and_dp_padding(
         uniform_token_count=synced_uniform_token_count,
         eager=False,
         num_reqs=int(num_reqs_across_dp.max()),
+        skip_drafts=skip_drafts,
     )
 
 
@@ -224,6 +234,7 @@ def dispatch_cg_and_sync_dp(
     parallel_config: ParallelConfig | None = None,
     allow_ubatching: bool = False,
     uniform_decode: bool = False,
+    allow_skip_drafts: bool = False,
     dp_sync_state: DPSyncState | None = None,
     profiler_sync: DPProfilerSync | None = None,
 ) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
@@ -256,6 +267,9 @@ def dispatch_cg_and_sync_dp(
             microbatches. Agreed across ranks before it takes effect.
         uniform_decode: Whether this rank's batch is a uniform decode, used
             to pick the microbatching split.
+        allow_skip_drafts: Whether this rank allows skipping drafts, because
+            none of its requests can use this step's drafts. Agreed across ranks
+            (all must allow it) into `DPSyncState.skip_drafts`.
         dp_sync_state: Agreement from a prior dispatch over this same batch, to reuse.
             Must come from a batch with this same padded `num_tokens` and the
             same `uniform_token_count`; `num_reqs` may differ, as neither
@@ -327,4 +341,5 @@ def dispatch_cg_and_sync_dp(
         allow_ubatching=allow_ubatching,
         uniform_decode=uniform_decode,
         profiler_sync=profiler_sync,
+        allow_skip_drafts=allow_skip_drafts,
     )
