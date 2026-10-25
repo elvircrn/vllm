@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, cast
 
+import numpy as np
 import torch
 from transformers import DeepseekV4Config
 
@@ -22,7 +23,6 @@ from vllm.platforms import current_platform
 from vllm.transformers_utils.deepseek_v4_utils import get_compress_ratios
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv, next_power_of_2
-from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -502,6 +502,18 @@ class DeepseekSparseSWAIndexBatch:
         self._groups: list[tuple[torch.Tensor, ...]] = []
         self._shared: tuple[Any, ...] | None = None
         self._open = False
+        # Staging for the batched launch's parameter table, sized to the
+        # largest group count seen. The host side must be pinned: a pageable
+        # H2D copy serializes on the stream through a driver staging buffer
+        # (measured as a uniform per-step stall), while a pinned copy is a
+        # true async DMA. Refilling a pinned source is only safe once the
+        # previous copy retired, so an event guards the refill; while it is
+        # pending the launch falls back to a fresh table, whose lifetime the
+        # caching allocator already guards.
+        self._params_host: torch.Tensor | None = None
+        self._params_host_rows: np.ndarray | None = None
+        self._params_device: torch.Tensor | None = None
+        self._params_copied: torch.cuda.Event | None = None
 
     @property
     def open(self) -> bool:
@@ -644,33 +656,45 @@ class DeepseekSparseSWAIndexBatch:
             num_valid_tokens,
         ) = shared
         num_groups = len(self._groups)
-        # A fresh table per step: the addresses it holds are only valid for
-        # this step's buffers, and async_tensor_h2d stages through a pinned
-        # tensor the caching allocator recycles only after the copy retires.
-        params = async_tensor_h2d(
+        rows = [
             [
-                [
-                    swa_indices.data_ptr(),
-                    swa_lens.data_ptr(),
-                    is_valid_token.data_ptr(),
-                    slot_mapping.data_ptr(),
-                    block_table.data_ptr(),
-                    replay_start.data_ptr(),
-                    swa_indices.stride(0),
-                    block_table.stride(0),
-                ]
-                for (
-                    swa_indices,
-                    swa_lens,
-                    is_valid_token,
-                    slot_mapping,
-                    block_table,
-                    replay_start,
-                ) in self._groups
-            ],
-            dtype=torch.int64,
-            device=self._device,
-        )
+                swa_indices.data_ptr(),
+                swa_lens.data_ptr(),
+                is_valid_token.data_ptr(),
+                slot_mapping.data_ptr(),
+                block_table.data_ptr(),
+                replay_start.data_ptr(),
+                swa_indices.stride(0),
+                block_table.stride(0),
+            ]
+            for (
+                swa_indices,
+                swa_lens,
+                is_valid_token,
+                slot_mapping,
+                block_table,
+                replay_start,
+            ) in self._groups
+        ]
+        if (
+            self._params_host is None
+            or self._params_host.shape[0] < num_groups
+            or (self._params_copied is not None and not self._params_copied.query())
+        ):
+            self._params_host = torch.empty(
+                num_groups, 8, dtype=torch.int64, pin_memory=True
+            )
+            self._params_host_rows = self._params_host.numpy()
+            self._params_device = torch.empty(
+                num_groups, 8, dtype=torch.int64, device=self._device
+            )
+            self._params_copied = None
+        self._params_host_rows[:num_groups] = rows
+        params = self._params_device[:num_groups]
+        params.copy_(self._params_host[:num_groups], non_blocking=True)
+        if self._params_copied is None:
+            self._params_copied = torch.cuda.Event()
+        self._params_copied.record()
         _COMPUTE_SWA_INDICES_AND_LENS_BATCHED_KERNEL(
             params,
             query_start_loc,
