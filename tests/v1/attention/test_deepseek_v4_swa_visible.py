@@ -25,6 +25,7 @@ from vllm.models.deepseek_v4.common.ops.cache_utils import (
 )
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.mla.sparse_swa import (
+    DeepseekSparseSWAIndexBatch,
     DeepseekSparseSWAMetadataBuilder,
     _compute_image_visibility_kernel,
     _compute_swa_indices_and_lens_kernel,
@@ -148,7 +149,7 @@ def run_swa_kernel(
     width = window + (max_image_tokens if with_image else 0)
     swa_indices = torch.zeros(num_tokens, 1, width, dtype=torch.int32, device=device)
     swa_lens = torch.zeros(num_tokens, dtype=torch.int32, device=device)
-    is_valid = slot_mapping >= 0
+    is_valid = torch.empty(num_tokens, dtype=torch.bool, device=device)
     replay_start_t = torch.zeros(len(seq_lens), dtype=torch.int32, device=device)
 
     if with_image:
@@ -171,15 +172,18 @@ def run_swa_kernel(
         query_start_loc,
         seq_lens_t,
         token_to_req,
+        slot_mapping,
         is_valid,
         block_table,
         block_table.stride(0),
         BLOCK_SIZE,
         replay_start_t,
         token_offset=0,
+        num_valid_tokens=num_tokens,
         HAS_IMAGE=with_image,
         TRITON_BLOCK_SIZE=1024,
     )
+    assert torch.equal(is_valid, slot_mapping >= 0)
     return swa_indices[:, 0], swa_lens
 
 
@@ -885,105 +889,164 @@ def test_dspark_noncausal_draft_decode_update_matches_build():
     torch.testing.assert_close(md.decode_swa_indices, expected.decode_swa_indices)
 
 
-class _StubLinear(torch.nn.Module):
-    def __init__(self, *args, **kwargs):
-        super().__init__()
-        self.weight_block_size = None
+def run_step_builds(
+    builders: list[DeepseekSparseSWAMetadataBuilder],
+    seq_lens: list[int],
+    query_lens: list[int],
+):
+    """Build every group's metadata for one step.
 
-
-def _prefix_replay_attention_cls():
-    from vllm.models.deepseek_v41.attention import DeepseekV4Attention
-
-    class _Backend:
-        @staticmethod
-        def get_name() -> str:
-            return "STUB"
-
-    class Layer(DeepseekV4Attention):
-        backend_cls = _Backend
-
-        @classmethod
-        def get_padded_num_q_heads(cls, num_heads: int) -> int:
-            return num_heads
-
-        def forward_mqa(
-            self,
-            q: torch.Tensor,
-            kv: torch.Tensor,
-            positions: torch.Tensor,
-            output: torch.Tensor,
-        ) -> None:
-            return None
-
-        def _o_proj(self, attn_out: torch.Tensor, positions: torch.Tensor):
-            return attn_out
-
-    return Layer
+    Mirrors ``build_attn_metadata``: the query and seq-len tensors are shared
+    across groups, the token-to-request cache threads from group to group,
+    and each group has its own slot mapping and block table. The first token
+    is padded (slot -1) so the invalid-token path of the decode kernel runs.
+    """
+    device = torch.device("cuda")
+    query_start_loc, seq_lens_t, _, _, _ = make_batch(seq_lens, query_lens, device)
+    t2r_cache = None
+    for g, builder in enumerate(builders):
+        _, _, _, slot_mapping, block_table = make_batch(seq_lens, query_lens, device)
+        slot_mapping = slot_mapping.clone()
+        slot_mapping[0] = -1
+        cm = CommonAttentionMetadata(
+            query_start_loc=query_start_loc,
+            query_start_loc_cpu=query_start_loc.cpu(),
+            seq_lens=seq_lens_t,
+            seq_lens_cpu_upper_bound=seq_lens_t.cpu(),
+            num_reqs=len(seq_lens),
+            num_actual_tokens=int(query_start_loc[-1]),
+            max_query_len=max(query_lens),
+            max_seq_len=max(seq_lens),
+            block_table_tensor=block_table + 1000 * g,
+            slot_mapping=slot_mapping,
+            causal=True,
+            _token_to_req_indices_cache=t2r_cache,
+        )
+        builder.build(0, cm)
+        t2r_cache = cm._token_to_req_indices_cache
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize(
-    "is_rocm,cdna,flag,replays_window",
-    [
-        (False, 0, True, True),
-        (True, 4, True, True),
-        (True, 3, True, False),
-        (True, 4, False, False),
-    ],
-)
-def test_prefix_cache_replays_the_swa_window(
-    monkeypatch, is_rocm, cdna, flag, replays_window
-):
-    """Prefix caching stays on, and the window is replayed only on CDNA4.
+@pytest.mark.parametrize("mix_prefill", [False, True])
+def test_batched_decode_indices_match_per_group_builds(mix_prefill):
+    """One staged launch fills each group's decode buffers exactly as the
+    per-group launches do."""
+    seq_lens = [30, 12, 45]
+    query_lens = [1, 1, 20] if mix_prefill else [1, 1, 1]
+    num_tokens = sum(query_lens)
+    builders = [make_builder(vision=False) for _ in range(3)]
 
-    tests/v1/core/test_prefix_replay.py already checks that a
-    bounded-replay SWA spec makes a prefix hit recompute the window.
-    This is the spec the attention layer actually publishes. Forcing
-    the window back into the prefix cache, on CDNA4 or off it, fails here.
-    The replay_start clamp used by the gather kernels is covered by
-    test_builder_replay_start_bounds_prefill_window_and_gather.
-    """
-    from vllm.config import set_current_vllm_config
-    from vllm.models.deepseek_v41 import attention as attn
-    from vllm.platforms import current_platform
+    run_step_builds(builders, seq_lens, query_lens)
+    expected = [
+        (
+            b.decode_swa_indices[:num_tokens].clone(),
+            b.decode_swa_lens[:num_tokens].clone(),
+            b.is_valid_token[:num_tokens].clone(),
+            b.prefill_swa_indices[:num_tokens].clone(),
+            b.prefill_swa_lens[:num_tokens].clone(),
+        )
+        for b in builders
+    ]
 
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
-    monkeypatch.setattr(attn, "MergedColumnParallelLinear", _StubLinear)
-    monkeypatch.setattr(attn, "ColumnParallelLinear", _StubLinear)
-    monkeypatch.setattr(attn, "DeepseekV4GroupedWoA", _StubLinear)
-    monkeypatch.setattr(attn, "RowParallelLinear", _StubLinear)
-    monkeypatch.setattr(attn, "RMSNorm", _StubLinear)
-    monkeypatch.setattr(attn, "build_deepseek_v4_rope", lambda *a, **k: None)
-    monkeypatch.setattr(attn, "get_tensor_model_parallel_world_size", lambda: 1)
-    monkeypatch.setattr(torch.cuda, "Event", lambda *a, **k: object())
-    monkeypatch.setattr(current_platform, "is_rocm", lambda: is_rocm)
-    if is_rocm:
-        import vllm.platforms.rocm as rocm_platform
+    for b in builders:
+        b.decode_swa_indices[:num_tokens].fill_(-12345)
+        b.decode_swa_lens[:num_tokens].fill_(-7)
+        b.is_valid_token[:num_tokens].fill_(True)
 
-        monkeypatch.setattr(rocm_platform, "get_cdna_version", lambda: cdna)
+    batch = DeepseekSparseSWAIndexBatch(torch.device("cuda"))
+    for b in builders:
+        b.arm_index_batch(batch)
+    batch.begin()
+    run_step_builds(builders, seq_lens, query_lens)
+    batch.flush()
 
-    window = 128
-    vllm_config = create_vllm_config(
-        max_model_len=256, max_num_seqs=4, max_num_batched_tokens=64
+    assert not batch.open
+    for b, (indices, lens, valid, prefill_indices, prefill_lens) in zip(
+        builders, expected
+    ):
+        assert torch.equal(b.decode_swa_indices[:num_tokens], indices)
+        assert torch.equal(b.decode_swa_lens[:num_tokens], lens)
+        assert torch.equal(b.is_valid_token[:num_tokens], valid)
+        assert torch.equal(b.prefill_swa_indices[:num_tokens], prefill_indices)
+        assert torch.equal(b.prefill_swa_lens[:num_tokens], prefill_lens)
+
+
+def make_stage_args(
+    device: torch.device, seq_lens: list[int], query_lens: list[int]
+) -> dict:
+    """Direct ``DeepseekSparseSWAIndexBatch.stage`` arguments for one group."""
+    query_start_loc, seq_lens_t, token_to_req, slot_mapping, block_table = make_batch(
+        seq_lens, query_lens, device
     )
-    vllm_config.cache_config.swa_bounded_replay = flag
-    assert vllm_config.cache_config.enable_prefix_caching
-    vllm_config.model_config.hf_config = DeepseekV4Config(
-        num_hidden_layers=1,
-        hidden_size=128,
-        num_attention_heads=8,
-        q_lora_rank=32,
-        o_lora_rank=32,
-        head_dim=64,
-        qk_rope_head_dim=16,
-        o_groups=8,
-        sliding_window=window,
-        compress_ratios=[0],
+    num_tokens = int(query_start_loc[-1])
+    return dict(
+        swa_indices=torch.zeros(
+            num_tokens, 1, WINDOW, dtype=torch.int32, device=device
+        ),
+        swa_lens=torch.zeros(num_tokens, dtype=torch.int32, device=device),
+        is_valid_token=torch.empty(num_tokens, dtype=torch.bool, device=device),
+        slot_mapping=slot_mapping,
+        block_table=block_table,
+        replay_start=torch.zeros(len(seq_lens), dtype=torch.int32, device=device),
+        query_start_loc=query_start_loc,
+        seq_lens=seq_lens_t,
+        token_to_req_indices=token_to_req,
+        window_size=WINDOW,
+        block_size=BLOCK_SIZE,
+        num_tokens=num_tokens,
+        num_valid_tokens=num_tokens,
     )
-    layer_cls = _prefix_replay_attention_cls()
-    with set_current_vllm_config(vllm_config):
-        layer = layer_cls(vllm_config, prefix="model.layers.0.self_attn")
-    spec = layer.swa_cache_layer.get_kv_cache_spec(vllm_config)
-    assert spec.bounded_replay is replays_window
-    assert spec.prefix_cacheable is not replays_window
-    assert spec.prefix_replay_tokens == (window if replays_window else 0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_index_batch_flush_launches_and_refuses_divergent_shared_args():
+    """A staged group's flush matches the reference rows, and a group whose
+    shared arguments diverge refuses to stage."""
+    device = torch.device("cuda")
+    seq_lens = [30, 12]
+    query_lens = [1, 1]
+    batch = DeepseekSparseSWAIndexBatch(device)
+    batch.begin()
+    first = make_stage_args(device, seq_lens, query_lens)
+    batch.stage(**first)
+
+    with pytest.raises(ValueError, match="disagree on window_size"):
+        batch.stage(**{**first, "window_size": WINDOW + 1})
+
+    second = make_stage_args(device, seq_lens, query_lens)
+    second["query_start_loc"] = first["query_start_loc"]
+    second["token_to_req_indices"] = first["token_to_req_indices"]
+    with pytest.raises(ValueError, match="disagree on seq_lens"):
+        batch.stage(**second)
+
+    batch.flush()
+    assert not batch.open
+
+    rows, lens = ref_swa_slot_rows(
+        seq_lens,
+        query_lens,
+        [[], []],
+        first["block_table"],
+        WINDOW,
+        MAX_IMG,
+        WINDOW,
+    )
+    assert first["swa_lens"].cpu().tolist() == lens
+    assert first["swa_indices"][:, 0].cpu().tolist() == rows
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_armed_builder_launches_directly_outside_open_batch():
+    """An armed builder whose batch is closed keeps launching its own kernel."""
+    seq_lens = [30, 12]
+    query_lens = [1, 1]
+    armed = make_builder(vision=False)
+    reference = make_builder(vision=False)
+    armed.arm_index_batch(DeepseekSparseSWAIndexBatch(torch.device("cuda")))
+
+    md = build_metadata(armed, seq_lens, query_lens, None)
+    ref_md = build_metadata(reference, seq_lens, query_lens, None)
+
+    assert torch.equal(md.decode_swa_indices, ref_md.decode_swa_indices)
+    assert torch.equal(md.decode_swa_lens, ref_md.decode_swa_lens)
+    assert torch.equal(armed.is_valid_token, reference.is_valid_token)
