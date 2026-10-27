@@ -19,7 +19,6 @@ from vllm.models.deepseek_v41.common.ops.fused_compress_quant_cache import (
     save_ring_rows,
 )
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -27,6 +26,10 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
     max_decode_query_len,
+)
+from vllm.v1.attention.backends.mla.decode_prologue import (
+    UNARMED_PROLOGUE_BATCH,
+    DecodePrologueBatch,
 )
 from vllm.v1.kv_cache_interface import CircularBufferSpec, KVCacheSpec
 
@@ -70,33 +73,6 @@ class CompressorMetadata:
     prev_row_indices: torch.Tensor | None = None
 
 
-@triton.jit(do_not_specialize=["block_table_stride", "num_actual_tokens", "num_tokens"])
-def _ring_slot_mapping_kernel(
-    slot_mapping_ptr,
-    block_table_ptr,
-    block_table_stride,
-    token_to_req_ptr,
-    positions_ptr,
-    num_actual_tokens,
-    num_tokens,
-    CAPACITY: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    valid = offsets < num_actual_tokens
-    req = tl.load(token_to_req_ptr + offsets, mask=valid, other=0).to(tl.int64)
-    block = tl.load(block_table_ptr + req * block_table_stride, mask=valid, other=0)
-    pos = tl.load(positions_ptr + offsets, mask=valid, other=0)
-    slot = block.to(tl.int64) * CAPACITY + pos % CAPACITY
-    # Block 0 is the null block. A request without a ring block (dummy or padding
-    # rows, which the runners fill with the null block) must not write.
-    tl.store(
-        slot_mapping_ptr + offsets,
-        tl.where(valid & (block != 0), slot, -1),
-        mask=offsets < num_tokens,
-    )
-
-
 class CompressorMetadataBuilder(AttentionMetadataBuilder):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
 
@@ -128,6 +104,15 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         # every PCP rank needs the full ring tail. Ordinary decode only needs
         # the latest open row to complete the next ratio-2 pair.
         self.tail_size = self.capacity if self.vllm_config.speculative_config else 1
+        self._prologue_batch: DecodePrologueBatch = UNARMED_PROLOGUE_BATCH
+
+    def arm_prologue_batch(self, batch: DecodePrologueBatch) -> None:
+        """Receive the batch that stages this builder's decode builds.
+
+        Staging only happens while the batch is open; a build outside an open
+        batch launches its own kernel as before.
+        """
+        self._prologue_batch = batch
 
     def build(
         self,
@@ -138,21 +123,22 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         num_tokens = common_attn_metadata.slot_mapping.numel() // self.pcp_size
         positions = common_attn_metadata.positions
         assert positions is not None
-        token_to_req_indices = common_attn_metadata.token_to_req_indices(
-            self.token_to_req_indices
+        token_to_req_indices = self._prologue_batch.token_to_req_indices(
+            common_attn_metadata, self.token_to_req_indices
         )
         slot_mapping = self.slot_mapping_buffer[:num_tokens]
         block_table = common_attn_metadata.block_table_tensor
-        _ring_slot_mapping_kernel[(triton.cdiv(num_tokens, 256),)](
-            slot_mapping,
-            block_table,
-            block_table.stride(0),
-            token_to_req_indices,
-            positions,
-            common_attn_metadata.num_actual_tokens,
-            num_tokens,
-            CAPACITY=self.capacity,
-            BLOCK=256,
+        self._prologue_batch.stage_ring_slot_mapping(
+            fuse=self.pcp_size == 1,
+            slot_mapping=slot_mapping,
+            block_table=block_table,
+            positions=positions,
+            query_start_loc=common_attn_metadata.query_start_loc,
+            num_reqs=common_attn_metadata.query_start_loc.shape[0] - 1,
+            num_mapped_tokens=int(common_attn_metadata.query_start_loc_cpu[-1]),
+            num_actual_tokens=common_attn_metadata.num_actual_tokens,
+            num_tokens=num_tokens,
+            capacity=self.capacity,
         )
         metadata = CompressorMetadata(
             slot_mapping=slot_mapping,
