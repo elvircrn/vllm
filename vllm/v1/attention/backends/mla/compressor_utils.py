@@ -15,6 +15,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 from vllm.transformers_utils.deepseek_v4_utils import get_compress_ratios
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backends.mla.decode_prologue import _compressed_slot_body
 
 _DSPARK_SWA_INDEX_ALIGNMENT = 64
 
@@ -42,9 +43,16 @@ class CompressedSlotMappingKernel(
         cp_interleave: int
 
     @staticmethod
-    @triton.jit(do_not_specialize=["block_table_stride"])
+    @triton.jit(
+        do_not_specialize=[
+            "block_table_stride",
+            "num_tokens",
+            "out_len",
+            "num_rows",
+        ]
+    )
     def kernel(
-        # [num_tokens]
+        # [out_len]
         compressed_slot_mapping_ptr,
         # [num_tokens] the tokens' own slots
         slot_mapping_ptr,
@@ -52,59 +60,36 @@ class CompressedSlotMappingKernel(
         query_start_loc_ptr,
         # [num_reqs]
         seq_lens_ptr,
-        # [num_reqs, max_num_blocks]
+        # [num_rows, max_num_blocks]
         block_table_ptr,
         block_table_stride,
         block_size,
         dcp_world_size,
         cp_interleave,
+        num_tokens,
+        out_len,
+        num_rows,
         COMPRESS_RATIO: tl.constexpr,
         PAD_ID: tl.constexpr,
         TRITON_BLOCK_SIZE: tl.constexpr,
     ):
-        batch_idx = tl.program_id(0)
-
-        query_start = tl.load(query_start_loc_ptr + batch_idx)
-        query_end = tl.load(query_start_loc_ptr + batch_idx + 1)
-        query_len = query_end - query_start
-
-        seq_len = tl.load(seq_lens_ptr + batch_idx)
-        start_pos = seq_len - query_len
-
-        for i in range(0, query_len, TRITON_BLOCK_SIZE):
-            offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
-            mask = offset < query_len
-
-            pos = start_pos + i + tl.arange(0, TRITON_BLOCK_SIZE)
-            # A replayed token has a PAD slot (SWA bounded replay: its KV is
-            # cached already); its compressed KV is cached too, so PAD here.
-            slot = tl.load(
-                slot_mapping_ptr + query_start + offset, mask=mask, other=PAD_ID
-            )
-            is_valid = ((pos + 1) % COMPRESS_RATIO == 0) & (slot != PAD_ID)
-            # Under DCP a PAD slot also marks tokens owned by other ranks; the
-            # interleave is a multiple of COMPRESS_RATIO, so a state lives
-            # entirely on the rank owning its last token.
-            local_pos = (
-                pos // (cp_interleave * dcp_world_size) * cp_interleave
-                + pos % cp_interleave
-            )
-            pos_after_compress = local_pos // COMPRESS_RATIO
-
-            block_ids = pos_after_compress // block_size
-            block_numbers = tl.load(
-                block_table_ptr + batch_idx * block_table_stride + block_ids,
-                mask=mask & is_valid,
-            )
-            slot_ids = block_numbers.to(tl.int64) * block_size + (
-                pos_after_compress % block_size
-            )
-
-            # NOTE
-            slot_ids = tl.where(is_valid, slot_ids, PAD_ID)
-            tl.store(
-                compressed_slot_mapping_ptr + query_start + offset, slot_ids, mask=mask
-            )
+        _compressed_slot_body(
+            compressed_slot_mapping_ptr,
+            slot_mapping_ptr,
+            query_start_loc_ptr,
+            seq_lens_ptr,
+            block_table_ptr,
+            block_table_stride,
+            block_size,
+            COMPRESS_RATIO,
+            dcp_world_size,
+            cp_interleave,
+            num_tokens,
+            out_len,
+            num_rows,
+            PAD_ID=PAD_ID,
+            TRITON_BLOCK_SIZE=TRITON_BLOCK_SIZE,
+        )
 
     def dispatch(  # type: ignore[override]
         self,
@@ -160,6 +145,8 @@ class CompressedSlotMappingKernel(
             compress_ratio=compile_key.compress_ratio,
             dcp_world_size=compile_key.dcp_world_size,
             cp_interleave=compile_key.cp_interleave,
+            num_tokens=1,
+            out_len=1,
         )
 
     @kernel_launcher
@@ -174,9 +161,16 @@ class CompressedSlotMappingKernel(
         compress_ratio: int,
         dcp_world_size: int,
         cp_interleave: int,
+        num_tokens: int,
+        out_len: int,
     ) -> LaunchSpec:
-        return (block_table.shape[0],), dict(
+        num_rows = block_table.shape[0]
+        tail_blocks = cdiv(max(out_len - num_tokens, 0), self.TRITON_BLOCK_SIZE)
+        return (num_rows + tail_blocks,), dict(
             block_table_stride=block_table.stride(0),
+            num_tokens=num_tokens,
+            out_len=out_len,
+            num_rows=num_rows,
             COMPRESS_RATIO=compress_ratio,
             PAD_ID=-1,
             TRITON_BLOCK_SIZE=self.TRITON_BLOCK_SIZE,
@@ -204,16 +198,15 @@ def get_compressed_slot_mapping(
     states must not be rewritten either.
     """
     if out is not None:
-        # Guard: for padded / invalid sequences.
-        # Negative positions produce bogus block indices that lead to illegal memory
-        # accesses inside the block_table load.
-        # NOTE: Fill -1 to the whole tensor, not just the first `num_tokens`.
-        out.fill_(-1)
-        compressed_slot_mapping = out[:num_tokens]
+        # The kernel clears its own padding tail; callers must size ``out``
+        # to the padded width the captured graphs read.
+        compressed_slot_mapping = out
+        out_len = out.numel()
     else:
         compressed_slot_mapping = torch.full(
             (num_tokens,), -1, dtype=torch.int64, device=query_start_loc.device
         )
+        out_len = num_tokens
 
     _COMPRESSED_SLOT_MAPPING_KERNEL(
         compressed_slot_mapping,
@@ -225,8 +218,10 @@ def get_compressed_slot_mapping(
         compress_ratio,
         dcp_world_size,
         cp_interleave,
+        num_tokens,
+        out_len,
     )
-    return compressed_slot_mapping
+    return compressed_slot_mapping[:num_tokens]
 
 
 _COMPRESSED_SLOT_MAPPING_KERNEL = CompressedSlotMappingKernel()

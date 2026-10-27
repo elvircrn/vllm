@@ -22,6 +22,7 @@ from vllm.platforms import current_platform
 from vllm.transformers_utils.deepseek_v4_utils import get_compress_ratios
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
+    _paged_mqa_logits_schedule_slots,
     get_paged_mqa_logits_metadata,
     get_paged_mqa_page_sizes,
     has_deep_gemm,
@@ -38,6 +39,11 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
+from vllm.v1.attention.backends.mla.decode_prologue import (
+    UNARMED_PROLOGUE_BATCH,
+    DecodePrologueBatch,
+    _native_decode_lens_body,
+)
 from vllm.v1.attention.backends.mla.sparse_utils import request_row_bounds
 from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
@@ -214,6 +220,7 @@ class PrepareNativeDecodeLensKernel(
     @dataclass(frozen=True)
     class CompileKey:
         max_decode_len: int
+        compress_ratio: int
 
     BLOCK_SIZE = 256
 
@@ -222,33 +229,41 @@ class PrepareNativeDecodeLensKernel(
     def kernel(
         seq_lens_ptr,
         decode_seq_lens_ptr,
+        query_start_loc_ptr,
+        decode_lens_ptr,
+        per_req_decode_lens_ptr,
         num_decodes,
         max_decode_len,
+        compress_ratio,
         BLOCK_SIZE: tl.constexpr,
     ):
-        idx = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        mask = idx < num_decodes * max_decode_len
-        req_id = idx // max_decode_len
-        local_idx = idx % max_decode_len
-        # Clamp at 0: padding requests have seq_len == 0, which would
-        # otherwise make token 0 negative (next_n=2 gives 0-2+1+0 = -1).
-        # Downstream kernels read these as uint32, turning -1 into ~4e9.
-        seq_len = tl.load(seq_lens_ptr + req_id, mask=mask, other=0)
-        per_token_seq_len = tl.maximum(seq_len - max_decode_len + local_idx + 1, 0)
-        tl.store(decode_seq_lens_ptr + idx, per_token_seq_len, mask=mask)
+        _native_decode_lens_body(
+            seq_lens_ptr,
+            decode_seq_lens_ptr,
+            query_start_loc_ptr,
+            decode_lens_ptr,
+            per_req_decode_lens_ptr,
+            num_decodes,
+            max_decode_len,
+            compress_ratio,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
 
     def dispatch(  # type: ignore[override]
         self,
         *,
         max_decode_len: int,
+        compress_ratio: int,
     ) -> CompileKey:
         return self.CompileKey(
             max_decode_len=triton_scalar_specialization_rep(max_decode_len),
+            compress_ratio=triton_scalar_specialization_rep(compress_ratio),
         )
 
     def get_warmup_keys(self) -> list[CompileKey]:
         return self._trace_dispatch(self.dispatch)(
             max_decode_len=(1, 2, 16),
+            compress_ratio=(1, 2),
         )
 
     def warmup_inputs(self, compile_key: CompileKey) -> dict[str, Any]:
@@ -256,8 +271,12 @@ class PrepareNativeDecodeLensKernel(
         return dict(
             seq_lens=int32_ptr,
             decode_seq_lens=int32_ptr,
+            query_start_loc=int32_ptr,
+            decode_lens=int32_ptr,
+            per_req_decode_lens=int32_ptr,
             num_decodes=1,
             max_decode_len=compile_key.max_decode_len,
+            compress_ratio=compile_key.compress_ratio,
         )
 
     @kernel_launcher
@@ -265,8 +284,12 @@ class PrepareNativeDecodeLensKernel(
         self,
         seq_lens: torch.Tensor,
         decode_seq_lens: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        decode_lens: torch.Tensor,
+        per_req_decode_lens: torch.Tensor,
         num_decodes: int,
         max_decode_len: int,
+        compress_ratio: int,
     ) -> LaunchSpec:
         return (triton.cdiv(num_decodes * max_decode_len, self.BLOCK_SIZE),), dict(
             BLOCK_SIZE=self.BLOCK_SIZE
@@ -1206,6 +1229,15 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             )
         # DCP not supported yet
         self.supports_draft_decode_metadata_update = self.dcp_world_size == 1
+        self._prologue_batch: DecodePrologueBatch = UNARMED_PROLOGUE_BATCH
+
+    def arm_prologue_batch(self, batch: DecodePrologueBatch) -> None:
+        """Receive the batch that stages this builder's decode builds.
+
+        Staging only happens while the batch is open; a build outside an open
+        batch launches its own kernel as before.
+        """
+        self._prologue_batch = batch
 
     def _dcp_localize_decode_seq_lens(
         self,
@@ -1239,6 +1271,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         use_native: bool,
         next_n: int,
         max_decode_len: int,
+        compress_divisor: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, bool]:
         """Prepare native or per-token flattened decode tensors."""
         spec_config = self.vllm_config.speculative_config
@@ -1326,12 +1359,20 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             if use_native and next_n > 1:
                 assert self.decode_seq_lens_buffer.dim() == 1
                 # (B, max_decode_len): token j attends to
-                # L - max_decode_len + j + 1 KV tokens.
-                _PREPARE_NATIVE_DECODE_LENS_KERNEL(
-                    seq_lens,
-                    self.decode_seq_lens_buffer,
-                    num_decodes,
-                    max_decode_len,
+                # L - max_decode_len + j + 1 KV tokens. The kernel also
+                # publishes the per-request decode lens and applies
+                # compress_divisor, which build() sets to the compress ratio
+                # unless DCP must localize the bounds before dividing.
+                self._prologue_batch.stage_native_decode_lens(
+                    fuse=not self.use_pcp,
+                    seq_lens=seq_lens,
+                    decode_seq_lens=self.decode_seq_lens_buffer,
+                    query_start_loc=query_start_loc,
+                    decode_lens=self.decode_lens_buffer,
+                    per_req_decode_lens=self.per_req_decode_lens_buffer,
+                    num_decodes=num_decodes,
+                    max_decode_len=max_decode_len,
+                    compress_ratio=compress_divisor,
                 )
                 seq_lens = self.decode_seq_lens_buffer[
                     : num_decodes * max_decode_len
@@ -1497,17 +1538,20 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     self.pcp_rank * padded_num_tokens : (self.pcp_rank + 1)
                     * padded_num_tokens
                 ]
-            compressed_slot_mapping = get_compressed_slot_mapping(
-                num_tokens,
-                local_slot_mapping,
-                query_start_loc,
-                seq_lens,
-                block_table,
-                self.kv_cache_spec.num_states,
-                self.compress_ratio,
-                out=self.compressed_slot_mapping_buffer,
-                dcp_world_size=self.dcp_world_size,
-                cp_interleave=self.cp_kv_cache_interleave_size,
+            compressed_slot_mapping = (
+                self._prologue_batch.stage_compressed_slot_mapping(
+                    fuse=not self.use_pcp,
+                    num_tokens=num_tokens,
+                    slot_mapping=local_slot_mapping,
+                    query_start_loc=query_start_loc,
+                    seq_lens=seq_lens,
+                    block_table=block_table,
+                    block_size=self.kv_cache_spec.num_states,
+                    compress_ratio=self.compress_ratio,
+                    out=self.compressed_slot_mapping_buffer,
+                    dcp_world_size=self.dcp_world_size,
+                    cp_interleave=self.cp_kv_cache_interleave_size,
+                )
             )
             if self.pcp_world_size > 1:
                 compressed_slot_mapping = get_pcp_group().all_gather(
@@ -1656,14 +1700,6 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
         decode_metadata = None
         if num_decodes > 0:
-            if not self.supports_varlen:
-                torch.diff(
-                    common_attn_metadata.query_start_loc[: num_decodes + 1],
-                    out=self.decode_lens_buffer[:num_decodes],
-                )
-                self.per_req_decode_lens_buffer[:num_decodes].copy_(
-                    self.decode_lens_buffer[:num_decodes]
-                )
             decode_lens = self.decode_lens_buffer[:num_decodes]
             decode_lens_cpu = torch.diff(
                 common_attn_metadata.query_start_loc_cpu[: num_decodes + 1]
@@ -1698,6 +1734,21 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 and max_decode_len <= next_n
                 and step_next_n_ok
             )
+
+            # The native per-token kernel also publishes the per-request
+            # decode lens and the compressed seq lens, so those batches skip
+            # the eager diff/copy/divide below. DCP reads the decode lens
+            # before the kernel runs and localizes the bounds before
+            # dividing, so it keeps the eager path.
+            native_kernel_writes_lens = (
+                use_native and next_n > 1 and dcp_local_seq_lens is None
+            )
+            if not self.supports_varlen and not native_kernel_writes_lens:
+                torch.diff(
+                    common_attn_metadata.query_start_loc[: num_decodes + 1],
+                    out=decode_lens,
+                )
+                self.per_req_decode_lens_buffer[:num_decodes].copy_(decode_lens)
 
             if not self.supports_varlen:
                 global_seq_lens_for_decode = self._prepare_global_decode_seq_lens(
@@ -1765,6 +1816,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                         use_native=use_native,
                         next_n=next_n,
                         max_decode_len=max_decode_len,
+                        compress_divisor=(
+                            self.compress_ratio
+                            if native_kernel_writes_lens and self.compress_ratio > 1
+                            else 1
+                        ),
                     )
                 )
 
@@ -1784,7 +1840,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # compressed tokens. Convert uncompressed seq_lens to compressed.
             if self.compress_ratio > 1:
                 if seq_lens_is_buffer_view:
-                    seq_lens //= self.compress_ratio
+                    # The native kernel divided its own output; flattening
+                    # builds and DCP localization divide here instead.
+                    if not native_kernel_writes_lens:
+                        seq_lens //= self.compress_ratio
                 else:
                     # Copy to avoid mutating shared state; keeps CG address stable.
                     self.expanded_seq_lens_buffer[:num_decodes] = (
@@ -1802,14 +1861,28 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # DeepGEMM is required for the paged MQA logits on CUDA devices
             schedule_metadata = self.scheduler_metadata_buffer
             if current_platform.is_cuda() and has_deep_gemm():
-                metadata = get_paged_mqa_logits_metadata(
-                    seq_lens,
-                    self.kv_cache_spec.num_states,
-                    self.num_sms,
+                # The metadata helper allocates, so its result lands in the
+                # persistent buffer through a copy either way; the prologue
+                # batch defers that copy behind its own launch when fusing.
+                # get_paged_mqa_logits_metadata returns [slots + 1, 2].
+                next_n_rows = seq_lens.shape[-1] if seq_lens.dim() == 2 else 1
+                num_slots = _paged_mqa_logits_schedule_slots(self.num_sms, next_n_rows)
+                schedule_metadata = self.scheduler_metadata_buffer[: num_slots + 1]
+                if not self._prologue_batch.defer_paged_mqa_schedule(
+                    fuse=not self.use_pcp,
+                    context_lens=seq_lens,
+                    block_size=self.kv_cache_spec.num_states,
+                    num_sms=self.num_sms,
                     indices=decode_indices,
-                )
-                schedule_metadata = self.scheduler_metadata_buffer[: metadata.shape[0]]
-                schedule_metadata[:] = metadata
+                    out=schedule_metadata,
+                ):
+                    metadata = get_paged_mqa_logits_metadata(
+                        seq_lens,
+                        self.kv_cache_spec.num_states,
+                        self.num_sms,
+                        indices=decode_indices,
+                    )
+                    schedule_metadata[:] = metadata
 
             decode_metadata = DeepSeekV32IndexerDecodeMetadata(
                 block_table=block_table,
