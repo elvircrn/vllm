@@ -38,6 +38,15 @@ from vllm.model_executor.kernels.attention.dsa.fused_mqa_topk import (
     get_fused_mqa_topk_workspaces,
     use_fused_mqa_topk,
 )
+from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
+    select_candidate_blocks_cooperative as _select_candidate_blocks_cooperative,
+)
+from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
+    supports_cooperative_candidates,
+)
+from vllm.model_executor.kernels.attention.dsa.sparse_mqa_logits import (
+    has_deep_select,
+)
 from vllm.model_executor.layers.indexer_topk import (
     RADIX_TOPK_WORKSPACE_SIZE,
     deep_select_topk,
@@ -1184,20 +1193,36 @@ def sparse_attn_indexer(
             vis = vis[:num_rows]
             decode_candidates = candidate_blocks[:num_rows]
             if candidate_write:
-                _select_candidate_blocks(
-                    logits,
-                    None,
-                    vis,
-                    decode_candidates.shape[1],
-                    candidate_block_size,
-                    decode_candidates,
-                    row_repeat,
-                    score_dtype=(
-                        torch.float32
-                        if topk_backend in ("auto", "persistent")
-                        else None
-                    ),
-                )
+                # cooperative_topk takes per-row ends on fp32 rows only;
+                # DeepSelect GPUs keep the reference kernel's fast path.
+                if (
+                    row_repeat == 1
+                    and logits.dtype == torch.float32
+                    and not has_deep_select()
+                    and supports_cooperative_candidates(
+                        num_rows,
+                        triton.cdiv(logits.shape[1], candidate_block_size),
+                        decode_candidates.shape[1],
+                    )
+                ):
+                    _select_candidate_blocks_cooperative(
+                        logits, vis, candidate_block_size, decode_candidates
+                    )
+                else:
+                    _select_candidate_blocks(
+                        logits,
+                        None,
+                        vis,
+                        decode_candidates.shape[1],
+                        candidate_block_size,
+                        decode_candidates,
+                        row_repeat,
+                        score_dtype=(
+                            torch.float32
+                            if topk_backend in ("auto", "persistent")
+                            else None
+                        ),
+                    )
             else:
                 _apply_candidate_mask(
                     logits,
