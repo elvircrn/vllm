@@ -150,6 +150,7 @@ async def build_and_serve(
         # no access log will be output.
         access_log=not args.disable_uvicorn_access_log,
         timeout_keep_alive=envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE,
+        backlog=envs.VLLM_HTTP_BACKLOG,
         ssl_keyfile=args.ssl_keyfile,
         ssl_certfile=args.ssl_certfile,
         ssl_ca_certs=args.ssl_ca_certs,
