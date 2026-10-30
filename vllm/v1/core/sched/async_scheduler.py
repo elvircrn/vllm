@@ -6,6 +6,7 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
 
@@ -54,3 +55,23 @@ class AsyncScheduler(Scheduler):
                 request.next_decode_eligible_step = (
                     self.current_step + self.decode_stagger
                 )
+
+    def _update_request_with_output(
+        self, request: Request, new_token_ids: list[int], is_stale: bool = False
+    ) -> tuple[list[int], bool]:
+        status_before_update = request.status
+        new_token_ids, stopped = super()._update_request_with_output(
+            request, new_token_ids, is_stale
+        )
+
+        # Cache the new tokens. Preempted requests should be skipped.
+        # If NaN fault tolerance is enabled, we delay this step until
+        # logits are checked for NaNs.
+        if (
+            status_before_update == RequestStatus.RUNNING
+            and not self.enable_nan_fault_tolerance
+        ):
+            self.kv_cache_manager.cache_blocks(
+                request, request.num_computed_tokens - request.num_output_placeholders
+            )
+        return new_token_ids, stopped
