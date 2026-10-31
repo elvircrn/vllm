@@ -8,10 +8,12 @@ import torch
 import torch.nn as nn
 
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
+from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.models.deepseek_v4.nvidia import dspark as dsv4_dspark
+from vllm.models.deepseek_v41.nvidia import dspark as dsv41_dspark
 from vllm.models.kimi_k3.nvidia import dspark_mla
 from vllm.models.kimi_k3.nvidia.dspark_mla import K3DSparkForCausalLM, K3DSparkModel
 
@@ -226,24 +228,22 @@ def test_v41_dspark_loads_linear_scales(
     raw = torch.tensor([[120, 127], [128, 130]], dtype=torch.uint8)
     checkpoint_scale = raw.view(scale_dtype) if mxfp8 else raw.float()
     param = nn.Parameter(torch.empty_like(checkpoint_scale), requires_grad=False)
-    context_param = nn.Parameter(
-        torch.empty_like(checkpoint_scale), requires_grad=False
-    )
     shards = []
-    context_shards = []
 
     def load_scale(param, weight, *args):
         shards.append(args)
         assert weight.dtype == checkpoint_scale.dtype
         param.copy_(weight)
 
-    def load_context_scale(param, weight, *args):
-        context_shards.append(args)
-        assert weight.dtype == checkpoint_scale.dtype
-        param.copy_(weight)
-
     param.weight_loader = load_scale
-    context_param.weight_loader = load_context_scale
+    params = {runtime_name: param}
+    context_param = None
+    if ".attn.wkv." in checkpoint_name:
+        context_param = nn.Parameter(
+            torch.empty_like(checkpoint_scale), requires_grad=False
+        )
+        context_param.weight_loader = load_scale
+        params[f"model.context_wkv_proj.{scale_name}"] = context_param
     draft = SimpleNamespace(
         config=SimpleNamespace(num_attention_heads=4, n_routed_experts=1),
         quant_config=SimpleNamespace(
@@ -262,10 +262,7 @@ def test_v41_dspark_loads_linear_scales(
             ],
             confidence_head=None,
         ),
-        named_parameters=lambda: [
-            (runtime_name, param),
-            (f"model.context_wkv_proj.{scale_name}", context_param),
-        ],
+        named_parameters=lambda: params.items(),
         process_weights_after_loading=lambda: None,
     )
     draft._remap_dspark_name = lambda name: (
@@ -279,19 +276,13 @@ def test_v41_dspark_loads_linear_scales(
         draft, [(checkpoint_name, checkpoint_scale)]
     )
 
-    # WKV scales are also duplicated into the merged context projection as
-    # shard 0 (the draft-layer index).
-    duplicated_into_context = "attn.wkv." in checkpoint_name
-    expected_loaded = {runtime_name}
-    if duplicated_into_context:
-        expected_loaded.add(f"model.context_wkv_proj.{scale_name}")
-
-    assert loaded == expected_loaded
-    assert shards == [() if shard_id is None else (shard_id,)]
-    assert context_shards == ([(0,)] if duplicated_into_context else [])
-    torch.testing.assert_close(param, checkpoint_scale)
-    if duplicated_into_context:
+    assert loaded == set(params)
+    expected_shards = [() if shard_id is None else (shard_id,)]
+    if context_param is not None:
+        expected_shards.append((0,))
         torch.testing.assert_close(context_param, checkpoint_scale)
+    assert shards == expected_shards
+    torch.testing.assert_close(param, checkpoint_scale)
 
 
 def test_dsv4_dspark_fused_moe_expert_mapping_includes_redundant_experts(
@@ -367,6 +358,57 @@ def test_dsv4_context_wkv_weights_are_duplicated_by_draft_layer():
     assert duplicated[3][1].data_ptr() == duplicated[4][1].data_ptr()
 
 
+@pytest.mark.cpu_test
+def test_v41_context_wkv_loads_each_layer_into_both_projections(monkeypatch):
+    """Duplicating context weights must preserve query WKV and layer order."""
+    from vllm.model_executor import parameter
+
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 3)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 4)
+    projections = [
+        MergedColumnParallelLinear(
+            5, sizes, bias=False, disable_tp=True, params_dtype=torch.float32
+        )
+        for sizes in ([2, 4], [2, 4], [2, 4], [4, 4, 4])
+    ]
+    for projection in projections:
+        projection.weight.data.fill_(-1)
+    params = {
+        f"model.layers.{i}.attn.fused_wqa_wkv.weight": projection.weight
+        for i, projection in enumerate(projections[:3])
+    }
+    params["model.context_wkv_proj.weight"] = projections[3].weight
+    draft = SimpleNamespace(
+        config=SimpleNamespace(n_routed_experts=1),
+        linear_scale_name="weight_scale",
+        pad_shared_expert=False,
+        model=SimpleNamespace(
+            layers=[
+                SimpleNamespace(ffn=SimpleNamespace(use_native_mega_moe=False))
+                for _ in range(3)
+            ],
+            confidence_head=None,
+        ),
+        named_parameters=lambda: params.items(),
+    )
+    draft._remap_dspark_name = lambda name: (
+        dsv41_dspark.DSparkDeepseekV4ForCausalLM._remap_dspark_name(draft, name)
+    )
+    monkeypatch.setattr(
+        dsv41_dspark, "fused_moe_make_expert_params_mapping", lambda *a, **kw: []
+    )
+    weights = [torch.arange(20).view(4, 5).float() + i * 20 for i in range(3)]
+    loaded = dsv41_dspark.DSparkDeepseekV4ForCausalLM.load_weights(
+        draft, ((f"mtp.{i}.attn.wkv.weight", weights[i]) for i in (2, 0, 1))
+    )
+
+    assert loaded == set(params)
+    torch.testing.assert_close(projections[3].weight, torch.cat(weights))
+    for i, projection in enumerate(projections[:3]):
+        torch.testing.assert_close(projection.weight[2:], weights[i])
+        assert torch.all(projection.weight[:2] == -1)
+
+
 def test_dsv4_context_kv_uses_one_stacked_wkv_projection(monkeypatch):
     calls = []
     stacked_output = torch.arange(24, dtype=torch.float32).view(2, 12)
@@ -415,31 +457,6 @@ def test_dsv4_context_kv_uses_one_stacked_wkv_projection(monkeypatch):
     assert calls[1][3] is slot_mappings[2]
 
 
-def test_dsv41_context_wkv_weights_are_duplicated_by_draft_layer():
-    from vllm.models.deepseek_v41.nvidia import dspark as dsv41_dspark
-
-    weights = [
-        ("mtp.0.attn.wkv.weight", torch.arange(4)),
-        ("mtp.1.attn.wq_a.weight", torch.arange(3)),
-        ("mtp.2.attn.wkv.scale", torch.tensor(0.5)),
-        ("mtp.3.attn.wkv.weight", torch.arange(2)),
-    ]
-
-    duplicated = list(dsv41_dspark._duplicate_context_wkv_weights(weights, 3))
-
-    assert [name for name, _ in duplicated] == [
-        "mtp.0.attn.wkv.weight",
-        "context_wkv_proj.weight",
-        "mtp.1.attn.wq_a.weight",
-        "mtp.2.attn.wkv.scale",
-        "context_wkv_proj.scale",
-        "mtp.3.attn.wkv.weight",
-    ]
-    assert duplicated[1][1].shard_id == 0
-    assert duplicated[4][1].shard_id == 2
-    assert duplicated[0][1].data_ptr() == duplicated[1][1].data_ptr()
-    assert duplicated[3][1].data_ptr() == duplicated[4][1].data_ptr()
-
 
 def test_dsv41_context_kv_uses_one_stacked_wkv_projection(monkeypatch):
     from vllm.models.deepseek_v41.nvidia import dspark as dsv41_dspark
@@ -486,6 +503,32 @@ def test_dsv41_context_kv_uses_one_stacked_wkv_projection(monkeypatch):
     assert torch.equal(calls[1][1], stacked_output.view(2, 3, 4)[:, 2])
     assert calls[0][3] is slot_mappings[0]
     assert calls[1][3] is slot_mappings[2]
+
+
+def test_dsv41_context_wkv_weights_are_duplicated_by_draft_layer():
+    from vllm.models.deepseek_v41.nvidia import dspark as dsv41_dspark
+
+    weights = [
+        ("mtp.0.attn.wkv.weight", torch.arange(4)),
+        ("mtp.1.attn.wq_a.weight", torch.arange(3)),
+        ("mtp.2.attn.wkv.scale", torch.tensor(0.5)),
+        ("mtp.3.attn.wkv.weight", torch.arange(2)),
+    ]
+
+    duplicated = list(dsv41_dspark._duplicate_context_wkv_weights(weights, 3))
+
+    assert [name for name, _ in duplicated] == [
+        "mtp.0.attn.wkv.weight",
+        "context_wkv_proj.weight",
+        "mtp.1.attn.wq_a.weight",
+        "mtp.2.attn.wkv.scale",
+        "context_wkv_proj.scale",
+        "mtp.3.attn.wkv.weight",
+    ]
+    assert duplicated[1][1].shard_id == 0
+    assert duplicated[4][1].shard_id == 2
+    assert duplicated[0][1].data_ptr() == duplicated[1][1].data_ptr()
+    assert duplicated[3][1].data_ptr() == duplicated[4][1].data_ptr()
 
 
 def test_dsv41_draft_entry_finalizes_broadcast_mhc_weights():

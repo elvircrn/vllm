@@ -38,6 +38,9 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.mtp_validation import (
+    is_mtp_completeness_check_enabled,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3_dspark import (
     DSparkConfidenceHead,
@@ -49,6 +52,7 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_padding_mask,
     sp_shard,
 )
+from vllm.models.deepseek_v4.nvidia.dspark import _duplicate_context_wkv_weights
 
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID
 from .model import (
@@ -66,26 +70,6 @@ logger = init_logger(__name__)
 # MoE expert scale suffix differs by expert dtype (mirrors deepseek_v4 loaders):
 # fp4 experts register ``.weight_scale``; block-fp8 experts ``.weight_scale_inv``.
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
-_CONTEXT_WKV_RE = re.compile(r"^mtp\.(\d+)\.attn\.wkv\.(.+)$")
-
-
-def _duplicate_context_wkv_weights(
-    weights: Iterable[tuple[str, torch.Tensor]], num_layers: int
-) -> Iterable[tuple[str, torch.Tensor]]:
-    """Load every draft layer's WKV into the cross-layer projection."""
-    for name, weight in weights:
-        yield name, weight
-        match = _CONTEXT_WKV_RE.fullmatch(name)
-        if match is None:
-            continue
-        layer_idx = int(match.group(1))
-        if layer_idx >= num_layers:
-            continue
-        stacked_weight = weight.detach()
-        stacked_weight.shard_id = layer_idx
-        yield f"context_wkv_proj.{match.group(2)}", stacked_weight
-
-
 class DSparkDeepseekV4Model(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -148,6 +132,15 @@ class DSparkDeepseekV4Model(nn.Module):
                 )
                 for i in range(self.num_dspark_layers)
             ]
+        )
+        self.context_wkv_proj = MergedColumnParallelLinear(
+            config.hidden_size,
+            [config.head_dim] * self.num_dspark_layers,
+            bias=False,
+            return_bias=False,
+            quant_config=vllm_config.quant_config,
+            prefix=maybe_prefix(prefix, "context_wkv_proj"),
+            disable_tp=True,
         )
 
         self.context_wkv_proj = MergedColumnParallelLinear(
@@ -405,6 +398,12 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         # Full-vocab draft: base logits, no d2t scatter.
         return self.compute_logits(hidden_states)
 
+    def compute_draft_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """This TP rank's vocab shard of compute_draft_logits, not gathered."""
+        return self.logits_processor(
+            self.lm_head, self.model.norm(hidden_states), skip_gather=True
+        )
+
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
         return draft_ids  # full-vocab: draft ids are target ids
 
@@ -553,7 +552,11 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
 
-        if self.model.confidence_head is not None and not loaded_confidence_head:
+        if (
+            self.model.confidence_head is not None
+            and not loaded_confidence_head
+            and is_mtp_completeness_check_enabled()
+        ):
             self.model.confidence_head = None
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
         return loaded_params
