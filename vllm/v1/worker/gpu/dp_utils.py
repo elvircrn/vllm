@@ -11,7 +11,7 @@ from vllm.config import ParallelConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.config.fault_tolerance import ft_tp_barrier_required
 from vllm.distributed.parallel_state import get_dp_group, get_tp_group
-from vllm.v1.worker.dp_utils import should_skip_dp_coordination
+from vllm.v1.worker.dp_utils import DPProfilerSync, should_skip_dp_coordination
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     CudaGraphManager,
@@ -60,13 +60,19 @@ def sync_cudagraph_and_dp_padding(
     allow_ubatching: bool = False,
     uniform_decode: bool = False,
     allow_skip_drafts: bool = False,
+    profiler_sync: DPProfilerSync | None = None,
 ) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
     """Coordinates the batch descriptor and DP padding across all ranks.
 
     Returns (synced_batch_desc, sync). `sync` is None when no rank has work.
     """
     assert dp_size > 1, "DP size must be greater than 1"
-    tensor = torch.zeros(7, dp_size, dtype=torch.int32, device="cpu")
+    tensor = torch.zeros(
+        9 if profiler_sync is not None else 7,
+        dp_size,
+        dtype=torch.int32,
+        device="cpu",
+    )
     # The numpy view shares the tensor's memory: field writes and every read
     # below run without a torch dispatch, and the torch views handed to
     # DPSyncState stay coherent with them.
@@ -78,10 +84,17 @@ def sync_cudagraph_and_dp_padding(
     agreed[4, dp_rank] = int(allow_ubatching)
     agreed[5, dp_rank] = num_reqs
     agreed[6, dp_rank] = int(allow_skip_drafts)
-    if should_skip_dp_coordination():
+    if profiler_sync is not None:
+        agreed[7, dp_rank] = int(profiler_sync.pending_start)
+        agreed[8, dp_rank] = int(profiler_sync.pending_stop)
+    skip_coordination = should_skip_dp_coordination()
+    if skip_coordination:
         agreed[:] = agreed[:, dp_rank, None]
     else:
         get_dp_group().cpu_all_reduce_(tensor)
+
+    if profiler_sync is not None and not skip_coordination:
+        profiler_sync.observe(tensor[7].tolist(), tensor[8].tolist(), get_dp_group())
 
     # Full width, dead slots included: returned in DPSyncState, whose
     # consumers index it by original dp_rank.
@@ -244,6 +257,7 @@ def dispatch_cg_and_sync_dp(
     uniform_decode: bool = False,
     allow_skip_drafts: bool = False,
     dp_sync_state: DPSyncState | None = None,
+    profiler_sync: DPProfilerSync | None = None,
 ) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
     """Pick a cudagraph descriptor for this batch, agreeing it across DP ranks.
 
@@ -283,6 +297,8 @@ def dispatch_cg_and_sync_dp(
             same `uniform_token_count`; `num_reqs` may differ, as neither
             depends on it. Passing a sync from a different batch is a caller
             error and trips an assert.
+        profiler_sync: Optional synchronized profiler-start state to propagate
+            through the DP coordination collective.
 
     Returns:
         (batch_desc, sync), where `sync` is this batch's agreement for a later
@@ -349,4 +365,5 @@ def dispatch_cg_and_sync_dp(
         allow_ubatching=allow_ubatching,
         uniform_decode=uniform_decode,
         allow_skip_drafts=allow_skip_drafts,
+        profiler_sync=profiler_sync,
     )
