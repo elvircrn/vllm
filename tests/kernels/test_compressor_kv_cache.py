@@ -91,7 +91,7 @@ def test_dspark_context_kv_matches_query_insert(
     )
 
     def legacy_insert():
-        from vllm.model_executor.kernels.attention.fused_deepseek_v4_qnorm_rope_kv_insert import (  # noqa: E501
+        from vllm.model_executor.kernels.attention.fused_deepseek_v4_qnorm_rope_kv_insert_dispatch import (  # noqa: E501
             fused_deepseek_v4_kv_rope_insert,
         )
 
@@ -179,7 +179,7 @@ def test_v41_pcp_swa_cache_matches_non_pcp_writer(kv_mxfp8, monkeypatch):
         device="cuda",
     )
 
-    from vllm.model_executor.kernels.attention.fused_deepseek_v4_qnorm_rope_kv_insert import (  # noqa: E501
+    from vllm.model_executor.kernels.attention.fused_deepseek_v4_qnorm_rope_kv_insert_dispatch import (  # noqa: E501
         fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
     )
 
@@ -941,7 +941,7 @@ def test_v41_cache_writers_match_flashmla_decode(record: str):
     """FlashMLA and vLLM's gathers read back the token a V4.1 writer put mid
     page in a padded block, so all agree on the interleaved record layout."""
     import vllm.v1.attention.ops.flashmla as fm
-    from vllm.model_executor.kernels.attention.fused_deepseek_v4_qnorm_rope_kv_insert import (  # noqa: E501
+    from vllm.model_executor.kernels.attention.fused_deepseek_v4_qnorm_rope_kv_insert_dispatch import (  # noqa: E501
         fused_deepseek_v4_kv_rope_insert,
     )
     from vllm.models.deepseek_v41.common.ops.cache_utils import (

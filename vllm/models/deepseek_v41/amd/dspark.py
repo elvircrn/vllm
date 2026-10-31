@@ -21,6 +21,11 @@ import vllm.envs as envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.attention.fused_deepseek_v4_qnorm_rope_kv_insert_dispatch import (  # noqa: E501
+    fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert,
+    fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert,
+    fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
+)
 from vllm.model_executor.kernels.mhc.torch import mhc_post_torch
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
@@ -240,19 +245,6 @@ def _insert_context_kv(
     query and discard it, since context tokens have no query). Mirrors
     ``DeepseekV4Attention._fused_qnorm_rope_kv_insert``.
     """
-    from vllm.utils.import_utils import has_cutedsl
-
-    if not has_cutedsl():
-        raise RuntimeError(
-            "DeepseekV4 fused KV insert runs as a CuTe DSL kernel and "
-            "needs CUDA with nvidia-cutlass-dsl installed"
-        )
-    from vllm.model_executor.kernels.attention.fused_deepseek_v4_qnorm_rope_kv_insert import (  # noqa: E501
-        fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert,
-        fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert,
-        fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
-    )
-
     swa_cache = attn.swa_cache_layer.kv_cache
     block_size = attn.swa_cache_layer.block_size
     cos_sin_cache = attn.rotary_emb.cos_sin_cache

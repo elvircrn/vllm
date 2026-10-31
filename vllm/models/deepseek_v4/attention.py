@@ -13,6 +13,11 @@ from transformers import DeepseekV2Config, DeepseekV3Config
 
 import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.model_executor.kernels.attention.fused_deepseek_v4_qnorm_rope_kv_insert_dispatch import (  # noqa: E501
+    fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert,
+    fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert,
+    fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
+)
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -787,19 +792,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             attn_metadata.get(self.swa_cache_layer.prefix),
         )
         assert swa_metadata is not None
-
-        from vllm.utils.import_utils import has_cutedsl
-
-        if not has_cutedsl():
-            raise RuntimeError(
-                "DeepseekV4 fused KV insert runs as a CuTe DSL kernel and "
-                "needs CUDA with nvidia-cutlass-dsl installed"
-            )
-        from vllm.model_executor.kernels.attention.fused_deepseek_v4_qnorm_rope_kv_insert import (  # noqa: E501
-            fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert,
-            fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert,
-            fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
-        )
 
         swa_kv_cache = self.swa_cache_layer.kv_cache
         # The fused insert ops require int64 position_ids; the runner's positions

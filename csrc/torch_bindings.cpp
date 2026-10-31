@@ -413,6 +413,46 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "bool is_neox, Tensor position_ids, "
       "int forced_token_heads_per_warp=-1) -> ()");
 
+// DeepseekV4 fused qnorm/RoPE KV-insert: on CUDA these run as CuTe DSL
+// kernels (vllm/model_executor/kernels/attention/
+// fused_deepseek_v4_qnorm_rope_kv_insert.py, jitted at first use), so the
+// extension ops are registered only for ROCm, which builds the kernel.
+#ifdef USE_ROCM
+  // q_head_padded is the padded Q head count of the returned tensor, or 0 to
+  // do the KV insert alone and return an empty tensor.  The Q knobs are
+  // independent: apply_q_norm and apply_q_rope each drop that step for Q
+  // alone (KV is always rotated), and is_q_interleaved reads and writes Q in
+  // FlashMLA's mega-attention chunk-interleaved layout, which moves the
+  // padding heads to the tail of every head-dim chunk.
+  ops.def(
+      "fused_deepseek_v4_kv_rope_insert("
+      "Tensor kv, Tensor! k_cache, Tensor slot_mapping, Tensor position_ids, "
+      "Tensor cos_sin_cache, int cache_block_size, Tensor? fp8_scale=None, "
+      "bool kv_mxfp8=False) -> "
+      "()");
+  ops.def(
+      "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert("
+      "Tensor q_in, Tensor kv, Tensor! k_cache, "
+      "Tensor slot_mapping, Tensor position_ids, Tensor cos_sin_cache, "
+      "int q_head_padded, float eps, int cache_block_size, "
+      "bool apply_q_norm=True, bool kv_mxfp8=False, bool apply_q_rope=True, "
+      "bool is_q_interleaved=False) -> Tensor");
+
+  // FlashInfer V4 full-cache variants: write Q in place (bf16) or to a separate
+  // FP8 tensor, and KV into a contiguous 512-wide token-strided cache.
+  ops.def(
+      "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert("
+      "Tensor! q, Tensor kv, Tensor! k_cache, Tensor slot_mapping, "
+      "Tensor position_ids, Tensor cos_sin_cache, float eps, "
+      "int cache_block_size, bool apply_q_norm=True) -> ()");
+  ops.def(
+      "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert("
+      "Tensor q, Tensor kv, Tensor! q_fp8, Tensor! k_cache, "
+      "Tensor slot_mapping, Tensor position_ids, Tensor cos_sin_cache, "
+      "Tensor fp8_scale, Tensor q_fp8_scale_inv, float eps, "
+      "int cache_block_size, bool apply_q_norm=True) -> ()");
+#endif
+
   // Kimi-K3 MLA epilogues: optional RoPE followed by concat/cache insertion.
   ops.def(
       "fused_kimi_k3_mla_key_concat_kv_cache_insert("
@@ -820,6 +860,21 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   // Positional encoding kernels (shared CUDA/ROCm)
   ops.impl("rotary_embedding", TORCH_BOX(&rotary_embedding));
   ops.impl("fused_qk_norm_rope", TORCH_BOX(&fused_qk_norm_rope));
+// DeepseekV4 fused qnorm/RoPE KV-insert impls: CUDA runs the CuTe DSL
+// kernels instead, so these are registered only for ROCm, which builds
+// the extension kernel (matching the #ifdef USE_ROCM schema defs above).
+#ifdef USE_ROCM
+  ops.impl("fused_deepseek_v4_kv_rope_insert",
+           TORCH_BOX(&fused_deepseek_v4_kv_rope_insert));
+  ops.impl("fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
+           TORCH_BOX(&fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert));
+  ops.impl(
+      "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert",
+      TORCH_BOX(&fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert));
+  ops.impl(
+      "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert",
+      TORCH_BOX(&fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert));
+#endif
   ops.impl("fused_kimi_k3_mla_key_concat_kv_cache_insert",
            TORCH_BOX(&fused_kimi_k3_mla_key_concat_kv_cache_insert));
   ops.impl("fused_kimi_k3_mla_key_concat_ds_mla_insert",
