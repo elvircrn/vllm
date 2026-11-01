@@ -15,7 +15,7 @@ def _run_sync(local_allow_skip: bool, other_allow_skip: bool) -> bool:
     """Run sync_cudagraph_and_dp_padding as dp rank 0 of 2, with rank 1's
     all_reduce contribution simulated."""
 
-    def fake_all_reduce(tensor):
+    def fake_submit(tensor, group, timeout=None):
         tensor[0][1] = 8  # rank 1 num_tokens
         tensor[1][1] = CUDAGraphMode.NONE.value
         tensor[2][1] = 0  # uniform_token_count (0 means None)
@@ -27,8 +27,15 @@ def _run_sync(local_allow_skip: bool, other_allow_skip: bool) -> bool:
     desc = BatchExecutionDescriptor(
         cg_mode=CUDAGraphMode.NONE, num_tokens=4, num_reqs=2
     )
-    with mock.patch.object(dp_utils, "get_dp_group") as mock_group:
-        mock_group.return_value.cpu_all_reduce_ = fake_all_reduce
+    with (
+        mock.patch.object(dp_utils, "get_dp_group"),
+        mock.patch.object(dp_utils, "DeferredCpuAllReduce") as mock_reducer_cls,
+    ):
+        # The agreement ring runs on a background thread in production; here
+        # submit applies the peer's contribution synchronously and wait is a
+        # no-op.
+        reducer = mock_reducer_cls.for_group.return_value
+        reducer.submit.side_effect = fake_submit
         _, sync = dp_utils.sync_cudagraph_and_dp_padding(
             cudagraph_manager=None,
             desired_batch_desc=desc,
