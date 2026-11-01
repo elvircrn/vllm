@@ -488,7 +488,7 @@ def test_draft_prefill_matches_shared_target_metadata_shape(
     )
     collective_calls = 0
 
-    def all_reduce(tensor):
+    def all_reduce(tensor, group, timeout=None):
         nonlocal collective_calls
         collective_calls += 1
         assert collective_calls == 1, "Draft prefill must reuse the target's DP sync"
@@ -506,8 +506,18 @@ def test_draft_prefill_matches_shared_target_metadata_shape(
             ]
         )
 
+    # The DP agreement runs on a background thread in production; here submit
+    # applies the peer's contribution synchronously and wait is a no-op.
+    fake_ring = SimpleNamespace(submit=all_reduce, wait=lambda: None)
     monkeypatch.setattr(
-        dp_utils, "get_dp_group", lambda: SimpleNamespace(cpu_all_reduce_=all_reduce)
+        dp_utils,
+        "get_dp_group",
+        lambda: SimpleNamespace(cpu_group=object(), cpu_timeout=None),
+    )
+    monkeypatch.setattr(
+        dp_utils,
+        "DeferredCpuAllReduce",
+        SimpleNamespace(for_group=lambda group: fake_ring),
     )
     max_query_len = num_tokens // 4
     target_desc, target_sync = dispatch_cg_and_sync_dp(

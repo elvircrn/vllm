@@ -12,6 +12,7 @@ import pickle
 import socket
 import struct
 import sys
+import threading
 import time
 import uuid
 from collections import deque
@@ -126,6 +127,83 @@ def cpu_all_reduce_(
             total.add_(buf)
         tensor.copy_(total)
     return tensor
+
+
+class DeferredCpuAllReduce:
+    """Runs `cpu_all_reduce_` on a persistent worker thread.
+
+    The recursive-doubling ring cannot be issued as one non-blocking batch
+    (each round's `add_` feeds the next round's send), so overlapping it with
+    caller work needs a thread. One worker per group, one reduce in flight:
+    `submit` hands the ring off and returns, `wait` blocks until the ring
+    finished or failed, re-raising the worker's exception on the caller.
+
+    `tensor` must be a normal (non-inference) tensor: the worker mutates it
+    outside any inference-mode region of the caller's thread.
+    """
+
+    # One reducer per process group: rings over the same group must stay
+    # ordered, and a shared worker would serialize unrelated groups.
+    _by_group: dict[int, "DeferredCpuAllReduce"] = {}
+
+    def __init__(self) -> None:
+        self._thread: threading.Thread | None = None
+        self._submitted = threading.Event()
+        self._done = threading.Event()
+        self._error: BaseException | None = None
+        self._tensor: torch.Tensor | None = None
+        self._group: ProcessGroup | None = None
+        self._timeout: timedelta | None = None
+        self._in_flight = False
+
+    @classmethod
+    def for_group(cls, group: ProcessGroup) -> "DeferredCpuAllReduce":
+        reducer = cls._by_group.get(id(group))
+        if reducer is None:
+            reducer = cls._by_group[id(group)] = cls()
+        return reducer
+
+    def _worker(self) -> None:
+        while True:
+            self._submitted.wait()
+            self._submitted.clear()
+            try:
+                cpu_all_reduce_(self._tensor, self._group, self._timeout)
+                self._error = None
+            except BaseException as e:  # noqa: BLE001
+                self._error = e
+            finally:
+                self._done.set()
+
+    def submit(
+        self,
+        tensor: torch.Tensor,
+        group: ProcessGroup,
+        timeout: timedelta | None = None,
+    ) -> None:
+        if self._in_flight:
+            # A previous reduce was submitted but never waited on (its caller
+            # failed in between); drain it rather than fail, so one bad step
+            # does not poison every later one.
+            self.wait()
+        self._in_flight = True
+        if self._thread is None:
+            self._thread = threading.Thread(
+                target=self._worker, name="DeferredCpuAllReduce", daemon=True
+            )
+            self._thread.start()
+        self._tensor = tensor
+        self._group = group
+        self._timeout = timeout
+        self._error = None
+        self._done.clear()
+        self._submitted.set()
+
+    def wait(self) -> None:
+        self._done.wait()
+        self._in_flight = False
+        if self._error is not None:
+            raise self._error
 
 
 def divide(numerator, denominator):

@@ -120,7 +120,8 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 from vllm.v1.worker.gpu.dp_utils import (
     DPProfilerSync,
     DPSyncState,
-    dispatch_cg_and_sync_dp,
+    begin_dispatch_cg_and_sync_dp,
+    end_dispatch_cg_and_sync_dp,
 )
 from vllm.v1.worker.gpu.ec_connector import get_ec_connector
 from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
@@ -200,7 +201,36 @@ from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 logger = init_logger(__name__)
 
 
+class _InputFrontMatter(NamedTuple):
+    """The parts of prepare_inputs that need no DP agreement.
+
+    Every value depends only on this rank's batch, so they may be computed
+    while the DP coordination ring is still in flight (prestage_inputs).
+    """
+
+    idx_mapping: torch.Tensor
+    num_reqs: int
+    # None for the no-draft common case, where expanded_idx_mapping aliases
+    # idx_mapping and expanded_local_pos is a zero tensor.
+    num_draft_tokens_per_req: np.ndarray | None
+    total_num_draft_tokens: int
+    total_num_logits: int
+    cu_num_logits_np: np.ndarray
+    cu_num_logits: torch.Tensor
+    # The pre-compact scheduled tokens: adaptive verification only shrinks.
+    num_scheduled_tokens_upper_bound: np.ndarray
+    # Full-width (unsliced) cumsum; prepare_inputs slices to num_reqs_padded.
+    query_start_loc_np: np.ndarray
+    query_start_loc: torch.Tensor
+    expanded_idx_mapping: torch.Tensor | None
+    expanded_local_pos: torch.Tensor | None
+
+
 class GPUModelRunner(LoRAModelRunnerMixin):
+    # Front matter staged by prestage_inputs while the DP agreement ring runs
+    # on a background thread; prepare_inputs consumes it in the same step.
+    _prestaged: _InputFrontMatter | None = None
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
@@ -1427,29 +1457,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_reqs, num_toks, max_query_len, decode_graph_eligible
         )
 
-    def prepare_inputs(
+    def prestage_inputs(
         self,
         scheduler_output: SchedulerOutput,
         batch_req_state: "BatchReqState",
-        batch_desc: BatchExecutionDescriptor,
-        num_active_loras: int,
-    ) -> InputBatch:
-        num_tokens = batch_req_state.num_tokens
-        num_tokens_after_padding = max(num_tokens, batch_desc.num_tokens)
-        assert num_tokens > 0
-        is_padding = self.input_buffers.is_padding[:num_tokens_after_padding]
-        if envs.VLLM_MOE_SKIP_PADDING:
-            if is_padding.is_cuda:
-                _fill_is_padding_kernel[(cdiv(num_tokens_after_padding, 1024),)](
-                    is_padding,
-                    num_tokens,
-                    num_tokens_after_padding,
-                    BLOCK_SIZE=1024,  # type: ignore
-                )
-            else:
-                is_padding[:num_tokens].fill_(False)
-                is_padding[num_tokens:].fill_(True)
+    ) -> None:
+        """Run prepare_inputs' front matter while the DP ring is in flight.
 
+        Call only when prepare_inputs will run for the same batch this step
+        (it is the consumer); end_dispatch_cg_and_sync_dp joins the ring
+        between the two.
+        """
+        self._prestaged = self._prepare_input_front_matter(
+            scheduler_output, batch_req_state
+        )
+
+    def _prepare_input_front_matter(
+        self,
+        scheduler_output: SchedulerOutput,
+        batch_req_state: "BatchReqState",
+    ) -> _InputFrontMatter:
+        """The part of prepare_inputs that needs no DP agreement.
+
+        Every value here depends only on this rank's batch, so it may run
+        while the DP coordination ring is still in flight (prestage_inputs).
+        """
         req_ids = batch_req_state.req_ids
         num_scheduled_tokens_np = batch_req_state.num_scheduled_tokens
         idx_mapping_np = batch_req_state.idx_mapping_np
@@ -1461,6 +1493,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Get the number of draft tokens for each request.
         draft_tokens = scheduler_output.scheduled_spec_decode_tokens
         num_draft_tokens_per_req = None
+        expanded_idx_mapping = None
+        expanded_local_pos = None
         if not draft_tokens and self.model_state.num_new_sampled_tokens_per_step == 1:
             # No draft token scheduled (common case).
             total_num_draft_tokens = 0
@@ -1494,7 +1528,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # compact_batch's budget is only primed when drafts are scheduled.
         adaptive_verification = self.adaptive_verification if draft_tokens else None
         num_scheduled_tokens_upper_bound = num_scheduled_tokens_np
-        num_admitted_draft_tokens = None
         if adaptive_verification is not None:
             # num_scheduled_tokens represents the draft budget evenly distributed across
             # all verification requests, `reallocate_drafts` will unevenly assign the
@@ -1507,17 +1540,83 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
             )
 
-        # Get query_start_loc.
-        # num_reqs_padded is None for PIECEWISE graphs (no request padding needed)
-        num_reqs_padded = batch_desc.num_reqs or num_reqs
+        # Get query_start_loc. Full width here; prepare_inputs slices to
+        # num_reqs_padded once the DP agreement fixes it.
         query_start_loc_np = np.empty(self.max_num_reqs + 1, dtype=np.int32)
         query_start_loc_np[0] = 0
         np.cumsum(num_scheduled_tokens_np, out=query_start_loc_np[1 : num_reqs + 1])
         # Pad for full CUDA graph mode.
         # Some attention backends like FA3 require query_start_loc to be non-decreasing.
-        query_start_loc_np[num_reqs + 1 :] = num_tokens
+        query_start_loc_np[num_reqs + 1 :] = batch_req_state.num_tokens
         query_start_loc = self.input_buffers.query_start_loc
         async_tensor_h2d(query_start_loc_np, out=query_start_loc)
+
+        return _InputFrontMatter(
+            idx_mapping=idx_mapping,
+            num_reqs=num_reqs,
+            num_draft_tokens_per_req=num_draft_tokens_per_req,
+            total_num_draft_tokens=total_num_draft_tokens,
+            total_num_logits=total_num_logits,
+            cu_num_logits_np=cu_num_logits_np,
+            cu_num_logits=cu_num_logits,
+            num_scheduled_tokens_upper_bound=num_scheduled_tokens_upper_bound,
+            query_start_loc_np=query_start_loc_np,
+            query_start_loc=query_start_loc,
+            expanded_idx_mapping=expanded_idx_mapping,
+            expanded_local_pos=expanded_local_pos,
+        )
+
+    def prepare_inputs(
+        self,
+        scheduler_output: SchedulerOutput,
+        batch_req_state: "BatchReqState",
+        batch_desc: BatchExecutionDescriptor,
+        num_active_loras: int,
+    ) -> InputBatch:
+        num_tokens = batch_req_state.num_tokens
+        num_tokens_after_padding = max(num_tokens, batch_desc.num_tokens)
+        assert num_tokens > 0
+        is_padding = self.input_buffers.is_padding[:num_tokens_after_padding]
+        if envs.VLLM_MOE_SKIP_PADDING:
+            if is_padding.is_cuda:
+                _fill_is_padding_kernel[(cdiv(num_tokens_after_padding, 1024),)](
+                    is_padding,
+                    num_tokens,
+                    num_tokens_after_padding,
+                    BLOCK_SIZE=1024,  # type: ignore
+                )
+            else:
+                is_padding[:num_tokens].fill_(False)
+                is_padding[num_tokens:].fill_(True)
+
+        req_ids = batch_req_state.req_ids
+        idx_mapping_np = batch_req_state.idx_mapping_np
+
+        # Everything in the front matter depends only on this rank's batch,
+        # so it may already have run while the DP agreement ring was in
+        # flight; see prestage_inputs.
+        fm = self._prestaged
+        self._prestaged = None
+        if fm is None:
+            fm = self._prepare_input_front_matter(scheduler_output, batch_req_state)
+        idx_mapping = fm.idx_mapping
+        num_reqs = fm.num_reqs
+        num_draft_tokens_per_req = fm.num_draft_tokens_per_req
+        total_num_draft_tokens = fm.total_num_draft_tokens
+        total_num_logits = fm.total_num_logits
+        cu_num_logits_np = fm.cu_num_logits_np
+        cu_num_logits = fm.cu_num_logits
+        num_scheduled_tokens_upper_bound = fm.num_scheduled_tokens_upper_bound
+        query_start_loc = fm.query_start_loc
+
+        # The general branch also serves a no-draft batch with k != 1, and
+        # compact_batch's budget is only primed when drafts are scheduled.
+        adaptive_verification = (
+            self.adaptive_verification
+            if scheduler_output.scheduled_spec_decode_tokens
+            else None
+        )
+        num_admitted_draft_tokens = None
         if adaptive_verification is not None:
             (
                 cu_num_logits,
@@ -1525,12 +1624,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 total_num_draft_tokens,
                 num_admitted_draft_tokens,
             ) = adaptive_verification.reallocate_drafts(req_ids, idx_mapping)
-            total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
+            total_num_logits = (
+                num_reqs * self.model_state.num_new_sampled_tokens_per_step
+                + total_num_draft_tokens
+            )
         if num_draft_tokens_per_req is not None:
             expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
                 idx_mapping, total_num_logits, cu_num_logits, self.decode_query_len
             )
-        query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
+        else:
+            expanded_idx_mapping = fm.expanded_idx_mapping
+            expanded_local_pos = fm.expanded_local_pos
+
+        # Get query_start_loc.
+        # num_reqs_padded is None for PIECEWISE graphs (no request padding needed)
+        num_reqs_padded = batch_desc.num_reqs or num_reqs
+        query_start_loc_np = fm.query_start_loc_np[: num_reqs_padded + 1]
         query_start_loc = query_start_loc[: num_reqs_padded + 1]
 
         # Get prefill tokens if any.
@@ -1891,7 +2000,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
 
-        batch_desc, dp_sync_state = dispatch_cg_and_sync_dp(
+        dp_dispatch = begin_dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
             num_reqs,
             num_toks,
@@ -1901,7 +2010,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_query_len=max_query_len,
             need_eager=is_profile or skip_compiled,
             num_active_loras=num_active_loras,
-            parallel_config=self.parallel_config,
             allow_ubatching=(
                 self.ubatch_runner is not None and not skip_attn_for_dummy_run
             ),
@@ -1909,9 +2017,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             allow_skip_drafts=scheduler_output.skip_drafts,
             profiler_sync=self.dp_profiler_sync,
         )
+        if batch_req_state is not None and not dummy_run:
+            # The DP agreement ring runs on a background thread until
+            # end_dispatch_cg_and_sync_dp joins it; stage the parts of
+            # prepare_inputs that need no agreement in the meantime.
+            self.prestage_inputs(scheduler_output, batch_req_state)
+        batch_desc, dp_sync_state = end_dispatch_cg_and_sync_dp(
+            dp_dispatch, self.parallel_config
+        )
 
         if batch_desc.num_tokens == 0:
-            # All DP ranks have zero tokens to run.
+            # All DP ranks have zero tokens to run. prepare_inputs will not
+            # consume the staged front matter this step; drop it.
+            self._prestaged = None
             empty_output = self.kv_connector.no_forward(scheduler_output)
             return self._merge_ec_connector_no_forward(scheduler_output, empty_output)
 
