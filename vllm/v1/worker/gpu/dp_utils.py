@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
+import numpy as np
 import torch
 import torch.distributed as dist
 
@@ -11,6 +12,7 @@ from vllm.config import ParallelConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.config.fault_tolerance import ft_tp_barrier_required
 from vllm.distributed.parallel_state import get_dp_group, get_tp_group
+from vllm.distributed.utils import DeferredCpuAllReduce
 from vllm.v1.worker.dp_utils import DPProfilerSync, should_skip_dp_coordination
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
@@ -46,7 +48,64 @@ class DPSyncState:
     skip_drafts: bool = False
 
 
-def sync_cudagraph_and_dp_padding(
+@dataclass
+class DPDispatch:
+    """A batch-descriptor dispatch whose DP agreement ring may be in flight.
+
+    `begin_dispatch_cg_and_sync_dp` dispatches locally, starts the agreement
+    ring on a background thread, and returns this handle. The caller may run
+    host work that needs no agreement, then calls
+    `end_dispatch_cg_and_sync_dp` to join the ring and compute the agreed
+    descriptor. `ring` is None when the agreement resolved without a
+    collective (single rank, a reused sync, or skipped coordination), in
+    which case `result` already holds it. Nothing between begin and end may
+    issue gloo traffic over the DP cpu group: the ring owns it.
+    """
+
+    ring: DeferredCpuAllReduce | None
+    tensor: torch.Tensor | None
+    agreed: np.ndarray | None
+    skip_coordination: bool
+    profiler_sync: DPProfilerSync | None
+    # Completion-phase inputs, mirroring sync_cudagraph_and_dp_padding.
+    cudagraph_manager: CudaGraphManager | None
+    desired_batch_desc: BatchExecutionDescriptor
+    num_tokens: int
+    num_reqs: int
+    uniform_token_count: int | None
+    dp_size: int
+    dp_rank: int
+    num_active_loras: int
+    uniform_decode: bool
+    result: tuple[BatchExecutionDescriptor, DPSyncState | None] | None = None
+
+    @classmethod
+    def resolved(
+        cls,
+        batch_desc: BatchExecutionDescriptor,
+        sync: DPSyncState | None,
+        dp_rank: int,
+    ) -> DPDispatch:
+        return cls(
+            ring=None,
+            tensor=None,
+            agreed=None,
+            skip_coordination=True,
+            profiler_sync=None,
+            cudagraph_manager=None,
+            desired_batch_desc=batch_desc,
+            num_tokens=0,
+            num_reqs=0,
+            uniform_token_count=None,
+            dp_size=1,
+            dp_rank=dp_rank,
+            num_active_loras=0,
+            uniform_decode=False,
+            result=(batch_desc, sync),
+        )
+
+
+def _begin_dp_agreement(
     cudagraph_manager: CudaGraphManager | None,
     desired_batch_desc: BatchExecutionDescriptor,
     num_tokens: int,
@@ -56,26 +115,30 @@ def sync_cudagraph_and_dp_padding(
     dp_rank: int,
     max_query_len: int | None = None,
     num_active_loras: int = 0,
-    parallel_config: ParallelConfig | None = None,
     allow_ubatching: bool = False,
     uniform_decode: bool = False,
     allow_skip_drafts: bool = False,
     profiler_sync: DPProfilerSync | None = None,
-) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
-    """Coordinates the batch descriptor and DP padding across all ranks.
+) -> DPDispatch:
+    """Fill the agreement tensor and start the DP coordination ring.
 
-    Returns (synced_batch_desc, sync). `sync` is None when no rank has work.
+    Unless coordination is skipped, the gloo ring runs on a background thread
+    (see DeferredCpuAllReduce) instead of blocking the caller; join it with
+    end_dispatch_cg_and_sync_dp. The ring owns the DP cpu group until then.
     """
     assert dp_size > 1, "DP size must be greater than 1"
-    tensor = torch.zeros(
-        9 if profiler_sync is not None else 7,
-        dp_size,
-        dtype=torch.int32,
-        device="cpu",
-    )
+    # A normal (non-inference) tensor: the ring thread reduces into it
+    # outside the caller's inference-mode region.
+    with torch.inference_mode(False):
+        tensor = torch.zeros(
+            9 if profiler_sync is not None else 7,
+            dp_size,
+            dtype=torch.int32,
+            device="cpu",
+        )
     # The numpy view shares the tensor's memory: field writes and every read
-    # below run without a torch dispatch, and the torch views handed to
-    # DPSyncState stay coherent with them.
+    # in the completion run without a torch dispatch, and the torch views
+    # handed to DPSyncState stay coherent with them.
     agreed = tensor.numpy()
     agreed[0, dp_rank] = num_tokens
     agreed[1, dp_rank] = desired_batch_desc.cg_mode.value
@@ -87,12 +150,52 @@ def sync_cudagraph_and_dp_padding(
     if profiler_sync is not None:
         agreed[7, dp_rank] = int(profiler_sync.pending_start)
         agreed[8, dp_rank] = int(profiler_sync.pending_stop)
+    ring = None
     skip_coordination = should_skip_dp_coordination()
     if skip_coordination:
         agreed[:] = agreed[:, dp_rank, None]
     else:
-        get_dp_group().cpu_all_reduce_(tensor)
+        dp_group = get_dp_group()
+        ring = DeferredCpuAllReduce.for_group(dp_group.cpu_group)
+        ring.submit(tensor, dp_group.cpu_group, dp_group.cpu_timeout)
+    return DPDispatch(
+        ring=ring,
+        tensor=tensor,
+        agreed=agreed,
+        skip_coordination=skip_coordination,
+        profiler_sync=profiler_sync,
+        cudagraph_manager=cudagraph_manager,
+        desired_batch_desc=desired_batch_desc,
+        num_tokens=num_tokens,
+        num_reqs=num_reqs,
+        uniform_token_count=uniform_token_count,
+        dp_size=dp_size,
+        dp_rank=dp_rank,
+        num_active_loras=num_active_loras,
+        uniform_decode=uniform_decode,
+    )
 
+
+
+def _complete_dp_agreement(
+    tensor: torch.Tensor,
+    agreed: np.ndarray,
+    skip_coordination: bool,
+    profiler_sync: DPProfilerSync | None,
+    cudagraph_manager: CudaGraphManager | None,
+    parallel_config: ParallelConfig | None,
+    desired_batch_desc: BatchExecutionDescriptor,
+    num_tokens: int,
+    num_reqs: int,
+    uniform_token_count: int | None,
+    dp_size: int,
+    num_active_loras: int,
+    uniform_decode: bool,
+) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
+    """Reduce the agreed fields into a descriptor. The ring must be done.
+
+    Returns (synced_batch_desc, sync). `sync` is None when no rank has work.
+    """
     # observe runs on the full-width tensor: its rank indices are
     # broadcast_object sources, so FT column drops must not shift them.
     if profiler_sync is not None and not skip_coordination:
@@ -244,6 +347,79 @@ def sync_cudagraph_and_dp_padding(
     )
 
 
+def end_dispatch_cg_and_sync_dp(
+    dispatch: DPDispatch,
+    parallel_config: ParallelConfig | None = None,
+) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
+    """Join the DP agreement ring started by begin_dispatch_cg_and_sync_dp
+    and return the agreed (batch_desc, sync).
+
+    Re-raises the ring's exception if it failed. Also accepts a dispatch that
+    resolved without a collective.
+    """
+    if dispatch.result is not None:
+        return dispatch.result
+    if dispatch.ring is not None:
+        dispatch.ring.wait()
+    assert dispatch.tensor is not None and dispatch.agreed is not None
+    return _complete_dp_agreement(
+        dispatch.tensor,
+        dispatch.agreed,
+        dispatch.skip_coordination,
+        dispatch.profiler_sync,
+        dispatch.cudagraph_manager,
+        parallel_config,
+        dispatch.desired_batch_desc,
+        dispatch.num_tokens,
+        dispatch.num_reqs,
+        dispatch.uniform_token_count,
+        dispatch.dp_size,
+        dispatch.num_active_loras,
+        dispatch.uniform_decode,
+    )
+
+
+def sync_cudagraph_and_dp_padding(
+    cudagraph_manager: CudaGraphManager | None,
+    desired_batch_desc: BatchExecutionDescriptor,
+    num_tokens: int,
+    num_reqs: int,
+    uniform_token_count: int | None,
+    dp_size: int,
+    dp_rank: int,
+    max_query_len: int | None = None,
+    num_active_loras: int = 0,
+    parallel_config: ParallelConfig | None = None,
+    allow_ubatching: bool = False,
+    uniform_decode: bool = False,
+    allow_skip_drafts: bool = False,
+    profiler_sync: DPProfilerSync | None = None,
+) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
+    """Coordinates the batch descriptor and DP padding across all ranks.
+
+    Blocking form of the dispatch split: starts the agreement ring and joins
+    it immediately. See _begin_dp_agreement for the deferred form.
+    """
+    return end_dispatch_cg_and_sync_dp(
+        _begin_dp_agreement(
+            cudagraph_manager,
+            desired_batch_desc,
+            num_tokens,
+            num_reqs,
+            uniform_token_count,
+            dp_size,
+            dp_rank,
+            max_query_len=max_query_len,
+            num_active_loras=num_active_loras,
+            allow_ubatching=allow_ubatching,
+            uniform_decode=uniform_decode,
+            allow_skip_drafts=allow_skip_drafts,
+            profiler_sync=profiler_sync,
+        ),
+        parallel_config=parallel_config,
+    )
+
+
 def dispatch_cg_and_sync_dp(
     cudagraph_manager: CudaGraphManager | None,
     num_reqs: int,
@@ -307,6 +483,52 @@ def dispatch_cg_and_sync_dp(
         dispatch to reuse. It is None when `dp_size` is 1 or no rank has work.
 
     """
+    return end_dispatch_cg_and_sync_dp(
+        begin_dispatch_cg_and_sync_dp(
+            cudagraph_manager,
+            num_reqs,
+            num_tokens,
+            uniform_token_count,
+            dp_size,
+            dp_rank,
+            max_query_len=max_query_len,
+            need_eager=need_eager,
+            num_active_loras=num_active_loras,
+            allow_ubatching=allow_ubatching,
+            uniform_decode=uniform_decode,
+            allow_skip_drafts=allow_skip_drafts,
+            dp_sync_state=dp_sync_state,
+            profiler_sync=profiler_sync,
+        ),
+        parallel_config,
+    )
+
+
+def begin_dispatch_cg_and_sync_dp(
+    cudagraph_manager: CudaGraphManager | None,
+    num_reqs: int,
+    num_tokens: int,
+    uniform_token_count: int | None,
+    dp_size: int,
+    dp_rank: int,
+    max_query_len: int | None = None,
+    need_eager: bool = False,
+    num_active_loras: int = 0,
+    allow_ubatching: bool = False,
+    uniform_decode: bool = False,
+    allow_skip_drafts: bool = False,
+    dp_sync_state: DPSyncState | None = None,
+    profiler_sync: DPProfilerSync | None = None,
+) -> DPDispatch:
+    """Start a dispatch_cg_and_sync_dp, deferring its DP agreement.
+
+    Dispatches locally, then starts the agreement ring on a background thread
+    instead of blocking on it. Arguments and semantics match
+    dispatch_cg_and_sync_dp; between this call and
+    end_dispatch_cg_and_sync_dp the caller may run host work that needs no
+    agreement, but nothing may issue gloo traffic over the DP cpu group,
+    since the ring owns it.
+    """
     reuse_eager = dp_sync_state is not None and dp_sync_state.eager
 
     if need_eager or reuse_eager:
@@ -332,7 +554,7 @@ def dispatch_cg_and_sync_dp(
         )
 
     if dp_size == 1:
-        return batch_desc, None
+        return DPDispatch.resolved(batch_desc, None, dp_rank)
 
     if dp_sync_state is not None:
         assert dp_sync_state.num_tokens_across_dp[dp_rank] == num_tokens, (
@@ -351,9 +573,9 @@ def dispatch_cg_and_sync_dp(
                     dp_sync_state.num_tokens_across_dp, batch_desc.num_tokens
                 ),
             )
-        return batch_desc, dp_sync_state
+        return DPDispatch.resolved(batch_desc, dp_sync_state, dp_rank)
 
-    return sync_cudagraph_and_dp_padding(
+    return _begin_dp_agreement(
         cudagraph_manager,
         batch_desc,
         num_tokens,
@@ -362,7 +584,6 @@ def dispatch_cg_and_sync_dp(
         dp_size,
         dp_rank,
         max_query_len=max_query_len,
-        parallel_config=parallel_config,
         num_active_loras=num_active_loras,
         allow_ubatching=allow_ubatching,
         uniform_decode=uniform_decode,

@@ -40,7 +40,7 @@ NUM_REDUNDANT_EXPERTS = 64
 SCALE_DOWN_DEADLINE_S = 20
 
 
-# Patches ``gpu.dp_utils.sync_cudagraph_and_dp_padding`` to raise on ``rank``
+# Patches ``gpu.dp_utils.end_dispatch_cg_and_sync_dp`` to raise on ``rank``
 # once armed (via /collective_rpc). Gated on VLLM_FT_TEST_INJECT_FAULT.
 _FAULT_INJECT_SITECUSTOMIZE = """\
 import builtins
@@ -49,7 +49,7 @@ import sys
 
 _SPEC = os.environ.get("VLLM_FT_TEST_INJECT_FAULT")
 _MODULE = "vllm.v1.worker.gpu.dp_utils"
-_ATTR = "sync_cudagraph_and_dp_padding"
+_ATTR = "end_dispatch_cg_and_sync_dp"
 _WORKER_MODULE = "vllm.v1.worker.gpu_worker"
 
 if _SPEC:
@@ -61,14 +61,12 @@ if _SPEC:
         _ARMED[0] = True
 
     def _patch(m):
-        import inspect
         _orig = getattr(m, _ATTR)
-        _sig = inspect.signature(_orig)
         def _wrapped(*args, **kwargs):
             result = _orig(*args, **kwargs)
-            bound = _sig.bind(*args, **kwargs)
-            bound.apply_defaults()
-            dp_rank = bound.arguments.get("dp_rank")
+            # The DPDispatch handle carries the rank; resolved (no-ring)
+            # dispatches keep their real rank too.
+            dp_rank = getattr(args[0], "dp_rank", None) if args else None
             if dp_rank == _RANK:
                 # One-shot: disarm before raising so post-retry steps pass.
                 if not _ARMED[0]:
@@ -379,7 +377,7 @@ def _drive_to_faulted(
 def test_injected_fault_retry_recovers_all_ranks(monkeypatch, tmp_path):
     """An exception injected into the inference path drives full retry recovery.
 
-    The fault is patched into ``sync_cudagraph_and_dp_padding`` on rank 1 via
+    The fault is patched into ``end_dispatch_cg_and_sync_dp`` on rank 1 via
     a generated ``sitecustomize``; it raises on the engine's first DP-sync
     step after arming, so rank 1 goes UNHEALTHY and rank 0 times out on the
     DP allreduce. Both UNHEALTHY is the precondition for ``retry``.

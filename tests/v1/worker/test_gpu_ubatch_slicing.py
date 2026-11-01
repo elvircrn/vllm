@@ -311,8 +311,20 @@ def _sync_dp(
     reduced[5] = 8  # num_reqs
     reduced[6] = 0  # allow_skip_drafts
 
-    dp_group = SimpleNamespace(cpu_all_reduce_=lambda t: t.copy_(reduced))
-    with patch.object(dp_utils, "get_dp_group", lambda: dp_group):
+    # The DP agreement runs on a background thread in production; here submit
+    # applies the reduction synchronously and wait is a no-op.
+    dp_group = SimpleNamespace(cpu_group=object(), cpu_timeout=None)
+    fake_ring = SimpleNamespace(
+        submit=lambda t, group, timeout=None: t.copy_(reduced), wait=lambda: None
+    )
+    with (
+        patch.object(dp_utils, "get_dp_group", lambda: dp_group),
+        patch.object(
+            dp_utils,
+            "DeferredCpuAllReduce",
+            SimpleNamespace(for_group=lambda g: fake_ring),
+        ),
+    ):
         return dp_utils.sync_cudagraph_and_dp_padding(
             cudagraph_manager=cudagraph_manager,
             desired_batch_desc=BatchExecutionDescriptor(
