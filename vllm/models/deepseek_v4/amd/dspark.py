@@ -27,6 +27,11 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.attention.fused_deepseek_v4_qnorm_rope_kv_insert_dispatch import (  # noqa: E501
+    fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert,
+    fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert,
+    fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
+)
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )

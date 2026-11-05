@@ -16,6 +16,12 @@ from transformers import DeepseekV2Config, DeepseekV3Config
 
 import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.model_executor.kernels.attention.fused_deepseek_v4_qnorm_rope_kv_insert_dispatch import (  # noqa: E501
+    fused_deepseek_v4_kv_rope_insert,
+    fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert,
+    fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert,
+    fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
+)
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,

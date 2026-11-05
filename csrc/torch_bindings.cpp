@@ -8,17 +8,6 @@
 // Note: We register under namespace "_C" so ops are accessible as
 // torch.ops._C.<op_name> for compatibility with existing code.
 STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
-#ifdef VLLM_ENABLE_FUSED_MQA_TOPK
-  // Single-launch fused FP8 MQA-logits + top-k (512/1024/2048) prefill
-  // selection (SM100 family). Workspace tensors are caller-owned; counter must
-  // be zero.
-  ops.def(
-      "fused_mqa_topk_prefill(Tensor q, Tensor k, Tensor scales, "
-      "Tensor weights, Tensor starts, Tensor ends, Tensor! out, "
-      "Tensor! counter, Tensor! values, Tensor! indices, Tensor! retained, "
-      "Tensor! retained_indices, Tensor! counts, Tensor! defer) -> ()");
-#endif
-
   // Compute per-token-group FP8 quantized tensor and scaling factor.
   // The dummy arguments are here so we can correctly fuse with RMSNorm.
   ops.def(
@@ -424,6 +413,46 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "bool is_neox, Tensor position_ids, "
       "int forced_token_heads_per_warp=-1) -> ()");
 
+// DeepseekV4 fused qnorm/RoPE KV-insert: on CUDA these run as CuTe DSL
+// kernels (vllm/model_executor/kernels/attention/
+// fused_deepseek_v4_qnorm_rope_kv_insert.py, jitted at first use), so the
+// extension ops are registered only for ROCm, which builds the kernel.
+#ifdef USE_ROCM
+  // q_head_padded is the padded Q head count of the returned tensor, or 0 to
+  // do the KV insert alone and return an empty tensor.  The Q knobs are
+  // independent: apply_q_norm and apply_q_rope each drop that step for Q
+  // alone (KV is always rotated), and is_q_interleaved reads and writes Q in
+  // FlashMLA's mega-attention chunk-interleaved layout, which moves the
+  // padding heads to the tail of every head-dim chunk.
+  ops.def(
+      "fused_deepseek_v4_kv_rope_insert("
+      "Tensor kv, Tensor! k_cache, Tensor slot_mapping, Tensor position_ids, "
+      "Tensor cos_sin_cache, int cache_block_size, Tensor? fp8_scale=None, "
+      "bool kv_mxfp8=False) -> "
+      "()");
+  ops.def(
+      "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert("
+      "Tensor q_in, Tensor kv, Tensor! k_cache, "
+      "Tensor slot_mapping, Tensor position_ids, Tensor cos_sin_cache, "
+      "int q_head_padded, float eps, int cache_block_size, "
+      "bool apply_q_norm=True, bool kv_mxfp8=False, bool apply_q_rope=True, "
+      "bool is_q_interleaved=False) -> Tensor");
+
+  // FlashInfer V4 full-cache variants: write Q in place (bf16) or to a separate
+  // FP8 tensor, and KV into a contiguous 512-wide token-strided cache.
+  ops.def(
+      "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert("
+      "Tensor! q, Tensor kv, Tensor! k_cache, Tensor slot_mapping, "
+      "Tensor position_ids, Tensor cos_sin_cache, float eps, "
+      "int cache_block_size, bool apply_q_norm=True) -> ()");
+  ops.def(
+      "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert("
+      "Tensor q, Tensor kv, Tensor! q_fp8, Tensor! k_cache, "
+      "Tensor slot_mapping, Tensor position_ids, Tensor cos_sin_cache, "
+      "Tensor fp8_scale, Tensor q_fp8_scale_inv, float eps, "
+      "int cache_block_size, bool apply_q_norm=True) -> ()");
+#endif
+
   // Kimi-K3 MLA epilogues: optional RoPE followed by concat/cache insertion.
   ops.def(
       "fused_kimi_k3_mla_key_concat_kv_cache_insert("
@@ -769,10 +798,6 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
-#ifdef VLLM_ENABLE_FUSED_MQA_TOPK
-  ops.impl("fused_mqa_topk_prefill", TORCH_BOX(&fused_mqa_topk_prefill));
-#endif
-
   // LongCat n-gram embedding index kernel.
   ops.impl("ngram_compute_n_gram_ids", TORCH_BOX(&ngram_compute_n_gram_ids));
   ops.impl("vocab_parallel_embedding", TORCH_BOX(&vocab_parallel_embedding));
@@ -835,6 +860,21 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   // Positional encoding kernels (shared CUDA/ROCm)
   ops.impl("rotary_embedding", TORCH_BOX(&rotary_embedding));
   ops.impl("fused_qk_norm_rope", TORCH_BOX(&fused_qk_norm_rope));
+// DeepseekV4 fused qnorm/RoPE KV-insert impls: CUDA runs the CuTe DSL
+// kernels instead, so these are registered only for ROCm, which builds
+// the extension kernel (matching the #ifdef USE_ROCM schema defs above).
+#ifdef USE_ROCM
+  ops.impl("fused_deepseek_v4_kv_rope_insert",
+           TORCH_BOX(&fused_deepseek_v4_kv_rope_insert));
+  ops.impl("fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
+           TORCH_BOX(&fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert));
+  ops.impl(
+      "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert",
+      TORCH_BOX(&fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert));
+  ops.impl(
+      "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert",
+      TORCH_BOX(&fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert));
+#endif
   ops.impl("fused_kimi_k3_mla_key_concat_kv_cache_insert",
            TORCH_BOX(&fused_kimi_k3_mla_key_concat_kv_cache_insert));
   ops.impl("fused_kimi_k3_mla_key_concat_ds_mla_insert",
@@ -1033,18 +1073,21 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                 Tensor? request_state_indices,"
       "                 int region_stride,"
       "                 int max_union_rows,"
-      "                 Tensor(a!)? stats=None,"
-      "                 Tensor(b!)? attention_indices=None,"
+      "                 Tensor(a!)? miss_mask=None,"
+      "                 Tensor(b!)? stats=None,"
+      "                 Tensor(c!)? attention_indices=None,"
       "                 int attention_block_stride=0,"
       "                 Tensor? request_ids=None,"
       "                 Tensor? source_block_table=None,"
       "                 int source_block_size=0,"
-      "                 Tensor(c!)? valid_counts=None,"
-      "                 Tensor(d!)? swap_host_physical_rows=None,"
-      "                 Tensor(e!)? swap_device_physical_rows=None,"
-      "                 Tensor(f!)? swap_counts=None,"
+      "                 Tensor(d!)? resolved_global_indices=None,"
+      "                 Tensor(e!)? valid_counts=None,"
+      "                 Tensor(f!)? swap_host_physical_rows=None,"
+      "                 Tensor(g!)? swap_device_physical_rows=None,"
+      "                 Tensor(h!)? swap_counts=None,"
       "                 Tensor? resident_block_table=None,"
       "                 int resident_block_size=0,"
+      "                 int resident_null_block=0,"
       "                 Tensor? num_valid_rows=None) -> ()");
 
   ops.def(
@@ -1060,7 +1103,10 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                     Tensor! hot_cache,"
       "                     Tensor global_indices,"
       "                     Tensor hot_indices,"
-      "                     Tensor miss_mask) -> ()");
+      "                     Tensor miss_mask,"
+      "                     Tensor? request_state_indices,"
+      "                     Tensor(a!)? attention_indices=None,"
+      "                     int attention_block_stride=0) -> ()");
 
   ops.def(
       "hisparse_gather_compact(Tensor host_cache,"
