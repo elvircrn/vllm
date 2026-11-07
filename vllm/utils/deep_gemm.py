@@ -720,7 +720,7 @@ def fp8_fp4_mqa_logits(
         cu_seqlen_ks,
         cu_seqlen_ke,
         max_seqlen_k,
-        logits_dtype=logits_dtype,
+        logits_dtype,
     )
 
 
@@ -840,7 +840,7 @@ def fp8_fp4_paged_mqa_logits(
         block_tables,
         schedule_metadata,
         max_model_len,
-        logits_dtype=logits_dtype,
+        logits_dtype,
         **kwargs,
     )
 
