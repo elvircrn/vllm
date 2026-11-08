@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -32,7 +33,7 @@ from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
-    MEGA_MOE_MXFP4,
+    MEGA_MOE_WEIGHT_FORMATS,
     DeepGemmMegaMoEExperts,
     MegaMoEActivation,
 )
@@ -379,6 +380,12 @@ class DeepseekV4MoE(nn.Module):
             and (self.use_sequence_parallel or self.tp_size == 1)
         )
 
+        megamoe_format = os.getenv("VLLM_DSV4_MEGAMOE_WEIGHT_FORMAT", "mxfp4")
+        if megamoe_format not in MEGA_MOE_WEIGHT_FORMATS:
+            raise ValueError(
+                f"VLLM_DSV4_MEGAMOE_WEIGHT_FORMAT {megamoe_format!r} is not one "
+                f"of {sorted(MEGA_MOE_WEIGHT_FORMATS)}"
+            )
         self.experts = DeepGemmMegaMoEExperts(
             vllm_config,
             num_experts=self.n_physical_experts,
@@ -388,7 +395,7 @@ class DeepseekV4MoE(nn.Module):
             top_k=self.n_activated_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
-            weight_format=MEGA_MOE_MXFP4,
+            weight_format=MEGA_MOE_WEIGHT_FORMATS[megamoe_format],
             activation=MegaMoEActivation(
                 "swiglu",
                 clamp=None if self.swiglu_limit is None else float(self.swiglu_limit),
