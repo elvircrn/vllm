@@ -1051,6 +1051,7 @@ class _PagedInsertKernel(VllmCuTeDSLJitKernel[PagedCompileKey]):
         is_q_interleaved: bool,
         kv_mxfp8: bool,
         has_kv_norm: bool,
+        input_fp16: bool,
         eps: float,
     ) -> CuTeDSLLaunchSpec[PagedCompileKey]:
         compile_key = self.dispatch(
@@ -1061,6 +1062,7 @@ class _PagedInsertKernel(VllmCuTeDSLJitKernel[PagedCompileKey]):
             is_q_interleaved=is_q_interleaved,
             kv_mxfp8=kv_mxfp8,
             has_kv_norm=has_kv_norm,
+            input_fp16=input_fp16,
             eps=eps,
         )
         return compile_key, (
@@ -1388,6 +1390,7 @@ class _FullCacheInsertKernel(VllmCuTeDSLJitKernel[FullCacheCompileKey]):
         has_kv_norm: bool,
         store_q_fp8: bool,
         store_kv_fp8: bool,
+        input_fp16: bool,
         eps: float,
         block_size: int = FULL_CACHE_BLOCK_SIZE,
     ) -> CuTeDSLLaunchSpec[FullCacheCompileKey]:
@@ -1397,6 +1400,7 @@ class _FullCacheInsertKernel(VllmCuTeDSLJitKernel[FullCacheCompileKey]):
             has_kv_norm=has_kv_norm,
             store_q_fp8=store_q_fp8,
             store_kv_fp8=store_kv_fp8,
+            input_fp16=input_fp16,
             eps=eps,
             block_size=block_size,
         )
