@@ -225,6 +225,7 @@ class SimpleCPUOffloadScheduler:
             allow_partial_hash_hits=not lazy_offload,
             num_prefill_lookahead=vllm_config.num_prefill_lookahead_tokens,
             num_hash_lookahead_tokens=num_hash_lookahead_tokens,
+            contiguous_allocation=False,
         )
         self.group_block_sizes = self.cpu_coordinator.group_block_sizes
         # FA group's own resolved block_size; divides scheduler_block_size (the
