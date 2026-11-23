@@ -1,4 +1,3 @@
-#include <cstdio>
 #include "torch_utils.h"
 #include "dispatch_utils.h"
 
@@ -263,7 +262,7 @@ struct CopyWithScaleOp {
   }
 };
 
-__device__ int vllm_smoke_cache_marker = 0;
+__device__ int vllm_smoke_marker = 0;
 
 template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
 __global__ void reshape_and_cache_kernel(
@@ -278,7 +277,7 @@ __global__ void reshape_and_cache_kernel(
     const int head_size, const int block_size, const int x,
     const float* k_scale, const float* v_scale, const bool interleaved_v) {
   if (threadIdx.x == 0 && blockIdx.x == 0 &&
-      atomicExch(&vllm_smoke_cache_marker, 1) == 0) {
+      atomicExch(&vllm_smoke_marker, 1) == 0) {
     printf("VLLM_SMOKE_MARKER reshape_and_cache_kernel executed\n");
   }
   const int64_t token_idx = blockIdx.x;
@@ -878,12 +877,6 @@ void reshape_and_cache(
     torch::stable::Tensor& slot_mapping,  // [num_tokens]
     const std::string& kv_cache_dtype, torch::stable::Tensor& k_scale,
     torch::stable::Tensor& v_scale, bool interleaved_v) {
-  static bool vllm_cache_marker = false;
-  if (!vllm_cache_marker) {
-    vllm_cache_marker = true;
-    std::printf("VLLM_SMOKE_MARKER_HOST reshape_and_cache host function called\n");
-    std::fflush(stdout);
-  }
   int num_tokens = slot_mapping.size(0);
   int num_heads = key.size(1);
   int head_size = key.size(2);
