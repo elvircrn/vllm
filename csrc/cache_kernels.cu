@@ -262,6 +262,8 @@ struct CopyWithScaleOp {
   }
 };
 
+__device__ int vllm_smoke_cache_marker = 0;
+
 template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
 __global__ void reshape_and_cache_kernel(
     const scalar_t* __restrict__ key,    // [num_tokens, num_heads, head_size]
@@ -274,6 +276,10 @@ __global__ void reshape_and_cache_kernel(
     const int key_stride, const int value_stride, const int num_heads,
     const int head_size, const int block_size, const int x,
     const float* k_scale, const float* v_scale, const bool interleaved_v) {
+  if (threadIdx.x == 0 && blockIdx.x == 0 &&
+      atomicExch(&vllm_smoke_cache_marker, 1) == 0) {
+    printf("VLLM_SMOKE_MARKER reshape_and_cache_kernel executed\n");
+  }
   const int64_t token_idx = blockIdx.x;
   const int64_t slot_idx = slot_mapping[token_idx];
   if (slot_idx < 0) {
