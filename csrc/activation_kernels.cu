@@ -1,3 +1,4 @@
+#include <cstdio>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <torch/csrc/stable/tensor.h>
@@ -305,6 +306,12 @@ packed_gelu_tanh_kernel(const packed_t& val, const float /*alpha*/) {
 void silu_and_mul(torch::stable::Tensor& out,    // [..., d]
                   torch::stable::Tensor& input)  // [..., 2 * d]
 {
+  static bool host_marker = false;
+  if (!host_marker) {
+    host_marker = true;
+    std::printf("VLLM_SMOKE_MARKER_HOST silu_and_mul launcher entered\n");
+    std::fflush(stdout);
+  }
   LAUNCH_ACTIVATION_GATE_KERNEL(vllm::silu_kernel, vllm::packed_silu_kernel,
                                 true, false, 0.0f, 1.0f, 0.0f);
 }
