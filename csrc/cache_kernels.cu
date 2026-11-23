@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "torch_utils.h"
 #include "dispatch_utils.h"
 
@@ -872,6 +873,18 @@ void reshape_and_cache(
         key_cache,  // [num_blocks, num_heads, head_size/x, block_size, x]
     torch::stable::Tensor&
         value_cache,  // [num_blocks, num_heads, head_size, block_size], or the
+                      // interleaved [.., block_size/x, head_size, x] when
+                      // interleaved_v is set
+    torch::stable::Tensor& slot_mapping,  // [num_tokens]
+    const std::string& kv_cache_dtype, torch::stable::Tensor& k_scale,
+    torch::stable::Tensor& v_scale, bool interleaved_v) {
+  static bool vllm_cache_marker = false;
+  if (!vllm_cache_marker) {
+    vllm_cache_marker = true;
+    std::printf("VLLM_SMOKE_MARKER_HOST reshape_and_cache host function called\n");
+    std::fflush(stdout);
+  }
+  int num_tokens = slot_mapping.size(0);
                       // interleaved [.., block_size/x, head_size, x] when
                       // interleaved_v is set
     torch::stable::Tensor& slot_mapping,  // [num_tokens]
