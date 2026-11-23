@@ -885,12 +885,6 @@ void reshape_and_cache(
     std::fflush(stdout);
   }
   int num_tokens = slot_mapping.size(0);
-                      // interleaved [.., block_size/x, head_size, x] when
-                      // interleaved_v is set
-    torch::stable::Tensor& slot_mapping,  // [num_tokens]
-    const std::string& kv_cache_dtype, torch::stable::Tensor& k_scale,
-    torch::stable::Tensor& v_scale, bool interleaved_v) {
-  int num_tokens = slot_mapping.size(0);
   int num_heads = key.size(1);
   int head_size = key.size(2);
   int block_size = key_cache.size(3);
