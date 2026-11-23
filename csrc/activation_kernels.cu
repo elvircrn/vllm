@@ -103,6 +103,8 @@ __device__ __forceinline__ packed_t packed_compute(const packed_t& x,
 }
 
 // Activation and gating kernel template.
+__device__ int vllm_smoke_marker = 0;
+
 template <typename scalar_t, typename packed_t,
           scalar_t (*ACT_FN)(const scalar_t&, const float),
           packed_t (*PACKED_ACT_FN)(const packed_t&, const float),
@@ -111,6 +113,10 @@ __global__ void act_and_mul_kernel(
     scalar_t* __restrict__ out,          // [..., d]
     const scalar_t* __restrict__ input,  // [..., 2, d]
     const int d, const float limit, const float alpha, const float beta) {
+  if (threadIdx.x == 0 && blockIdx.x == 0 &&
+      atomicExch(&vllm_smoke_marker, 1) == 0) {
+    printf("VLLM_SMOKE_MARKER act_and_mul_kernel from modified build\n");
+  }
   const int64_t token_idx = blockIdx.x;
   const scalar_t* x_ptr = input + token_idx * 2 * d;
   const scalar_t* y_ptr = x_ptr + d;
