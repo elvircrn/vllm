@@ -45,6 +45,7 @@ import numpy as np
 
 from vllm.distributed.nixl_utils import NixlWrapper as _NixlAgent
 from vllm.distributed.nixl_utils import nixl_agent_config as _NixlAgentConfig
+from vllm.distributed.nixl_utils import nixl_thread_sync_t as _NixlThreadSyncT
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.tiering.p2p.data.base import (
     CancelMode,
@@ -197,6 +198,10 @@ class NixlTransport(DataTransport):
                 self._agent_name,
                 self._num_threads,
             )
+        if _NixlThreadSyncT is not None:
+            # NIXL only locks an agent given a sync mode; this agent shares
+            # the process with the connector's agent, which runs RW.
+            cfg.sync_mode = _NixlThreadSyncT.NIXL_THREAD_SYNC_RW
         self._agent = _NixlAgent(self._agent_name, cfg)
         if not non_ucx_backends:
             # The tier moves host memory only. UCX otherwise also wires up

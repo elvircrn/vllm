@@ -782,9 +782,20 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         """
         assert self.transfer_topo is not None
         notified_req_ids: set[str] = set()
-        for notifs in self.nixl_wrapper.get_new_notifs().values():
+        for remote_agent, notifs in self.nixl_wrapper.get_new_notifs().items():
             for notif in notifs:
-                msg = notif.decode("utf-8")
+                try:
+                    msg = notif.decode("utf-8")
+                except UnicodeDecodeError:
+                    # One garbled notif must not kill the engine; the request
+                    # it belonged to is reclaimed by lease expiry.
+                    logger.error(
+                        "Dropping malformed NIXL notification from %s: len=%d first_bytes=%s",
+                        remote_agent,
+                        len(notif),
+                        notif[:64].hex(),
+                    )
+                    continue
 
                 # Handle heartbeat messages from D-side.
                 if msg.startswith(HB_NOTIF_PREFIX):
