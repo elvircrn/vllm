@@ -853,7 +853,17 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             except queue.Empty:
                 break
 
-            msg = notif.decode("utf-8")
+            try:
+                msg = notif.decode("utf-8")
+            except UnicodeDecodeError:
+                # One garbled notif must not kill the engine; the request
+                # it belonged to is reclaimed by lease expiry.
+                logger.error(
+                    "Dropping malformed NIXL notification: len=%d first_bytes=%s",
+                    len(notif),
+                    notif[:64].hex(),
+                )
+                continue
             if msg.startswith(HB_NOTIF_PREFIX):
                 self._handle_heartbeat(msg[len(HB_NOTIF_PREFIX) :])
                 continue
